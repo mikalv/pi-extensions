@@ -1,0 +1,602 @@
+/**
+ * Type definitions for the subagent extension
+ *
+ * Key responsibilities:
+ * - define config contracts (ExtensionConfig, SuperpowersSettings, etc.)
+ * - define execution options (RunSyncOptions)
+ * - define result and artifact types
+ * - define display, error, and async types
+ *
+ * Important dependencies:
+ * - @earendil-works/pi-agent-core (ThinkingLevel type)
+ * - @earendil-works/pi-ai (Message type)
+ * - @earendil-works/pi-coding-agent (ExtensionContext)
+ * - ../superpowers/workflow-profile.ts (ResolvedSuperpowersRunProfile, type-only)
+ * - node:os, node:path, node:fs
+ */
+
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Message } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ResolvedSuperpowersRunProfile } from "../superpowers/workflow-profile.ts";
+
+// ============================================================================
+// Basic Types
+// ============================================================================
+
+export interface MaxOutputConfig {
+	bytes?: number;
+	lines?: number;
+}
+
+export interface TruncationResult {
+	text: string;
+	truncated: boolean;
+	originalBytes?: number;
+	originalLines?: number;
+	artifactPath?: string;
+}
+
+export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	turns: number;
+}
+
+export type WorkflowMode = "superpowers";
+
+export type { ThinkingLevel };
+
+export type SessionMode = "standalone" | "lineage-only" | "fork";
+
+export type TaskDeliveryMode = "direct" | "artifact";
+
+/**
+ * Model tier identifier.
+ *
+ * Built-in tiers: cheap, balanced, max
+ * Users can define custom tiers (e.g., "creative", "free") in config.json.
+ */
+export type ModelTier = string;
+
+export interface ModelTierConfig {
+	model: string;
+	thinking?: ThinkingLevel;
+}
+
+export type ModelTierSetting = string | ModelTierConfig;
+
+/**
+ * Scheduling mode for Superpowers task execution.
+ *
+ * - "sequential" executes tasks one at a time in dispatch order.
+ * - "parallel" executes tasks concurrently with bounded concurrency.
+ */
+export type TaskScheduling = "sequential" | "parallel";
+
+export type ExecutionRole = "root-planning" | "sp-recon" | "sp-research" | "sp-implementer" | "sp-review" | "sp-debug";
+
+// ============================================================================
+// Skills
+// ============================================================================
+
+export interface ResolvedSkill {
+	name: string;
+	path: string;
+	content: string;
+	source: "project" | "user";
+	scope?: "root" | "agent";
+}
+
+// ============================================================================
+// Progress Tracking
+// ============================================================================
+export interface AgentProgress {
+	index: number;
+	agent: string;
+	status: "pending" | "running" | "completed" | "failed";
+	task: string;
+	model?: string;
+	thinking?: ThinkingLevel;
+	skills?: string[];
+	currentTool?: string;
+	currentToolArgs?: string;
+	recentTools: Array<{ tool: string; args: string; endMs: number }>;
+	recentOutput: string[];
+	toolCount: number;
+	durationMs: number;
+	error?: string;
+	failedTool?: string;
+}
+
+export interface ProgressSummary {
+	toolCount: number;
+	durationMs: number;
+}
+// ============================================================================
+// Results
+// ============================================================================
+
+export interface SingleResult {
+	agent: string;
+	task: string;
+	exitCode: number;
+	sessionMode?: SessionMode;
+	messages: Message[];
+	usage: Usage;
+	model?: string;
+	thinking?: ThinkingLevel;
+	error?: string;
+	sessionFile?: string;
+	skills?: string[];
+	skillsWarning?: string;
+	progress?: AgentProgress;
+	progressSummary?: ProgressSummary;
+	artifactPaths?: ArtifactPaths;
+	truncation?: TruncationResult;
+	finalOutput?: string;
+	/** Subagent completion envelope (status, summary, body, etc.) */
+	completion?: SubagentCompletionEnvelope;
+	/** Lifecycle signal read result (done/ping status and content) */
+	lifecycle?: LifecycleReadResult;
+}
+
+export interface Details {
+	mode: "single" | "parallel";
+	sessionMode?: SessionMode;
+
+	results: SingleResult[];
+	progress?: AgentProgress[];
+	progressSummary?: ProgressSummary;
+	artifacts?: {
+		dir: string;
+		files: ArtifactPaths[];
+	};
+	truncation?: {
+		truncated: boolean;
+		originalBytes?: number;
+		originalLines?: number;
+		artifactPath?: string;
+	};
+}
+
+// ============================================================================
+// Subagent Completion
+// ============================================================================
+
+/**
+ * Possible completion statuses for a subagent run.
+ */
+export type SubagentCompletionStatus = "completed" | "blocked" | "needs_parent" | "failed" | "cancelled";
+
+/**
+ * Envelope containing subagent completion result details.
+ */
+export interface SubagentCompletionEnvelope {
+	status: SubagentCompletionStatus;
+	summary: string;
+	body: string;
+	parentRequest?: string;
+	artifacts?: string[];
+	notes?: Record<string, unknown>;
+}
+
+// ============================================================================
+// Lifecycle Signals
+// ============================================================================
+
+/**
+ * Type discriminator for lifecycle signals.
+ */
+export type LifecycleSignalType = "done" | "ping";
+
+/**
+ * Signal emitted when a subagent run completes successfully.
+ */
+export interface DoneLifecycleSignal {
+	type: "done";
+	outputTokens?: number;
+}
+
+/**
+ * Signal emitted as a heartbeat/ping during subagent execution.
+ */
+export interface PingLifecycleSignal {
+	type: "ping";
+	name?: string;
+	message: string;
+	outputTokens?: number;
+}
+
+/**
+ * Union of all lifecycle signal types.
+ */
+export type LifecycleSignal = DoneLifecycleSignal | PingLifecycleSignal;
+
+// ============================================================================
+// Lifecycle Read Results
+// ============================================================================
+
+/**
+ * Possible statuses when reading a lifecycle file.
+ */
+export type LifecycleReadStatus = "consumed" | "missing" | "malformed" | "unreadable" | "stale";
+
+/**
+ * Result of attempting to read a lifecycle signal file.
+ */
+export interface LifecycleReadResult {
+	status: LifecycleReadStatus;
+	signal?: LifecycleSignal;
+	path: string;
+	diagnostic?: string;
+}
+
+// ============================================================================
+// Result Delivery
+// ============================================================================
+
+/**
+ * State of result delivery for a subagent run.
+ */
+export type DeliveryState = "detached" | "awaited" | "joined";
+
+/**
+ * How parent steers when awaiting child results.
+ */
+export type CompletedDelivery = "steer" | "wait" | "join";
+
+/**
+ * Error codes for result delivery operations.
+ */
+export type ResultDeliveryErrorCode = "not_found" | "already_delivered" | "already_owned" | "not_owned" | "duplicate_id" | "empty_id_list" | "timeout" | "interrupted";
+
+/**
+ * Error returned when a result delivery operation fails.
+ */
+export interface ResultDeliveryError {
+	code: ResultDeliveryErrorCode;
+	message: string;
+	ids?: string[];
+}
+
+// ============================================================================
+// Planned Child Runs
+// ============================================================================
+
+/**
+ * Represents a planned child subagent run with all configuration.
+ */
+export interface PlannedChildRun {
+	id: string;
+	index: number;
+	agentName: string;
+	task: string;
+	runtimeCwd: string;
+	childCwd: string;
+	workflow: WorkflowMode;
+	sessionMode: SessionMode;
+	taskDelivery: TaskDeliveryMode;
+	sessionFile?: string;
+	taskText: string;
+	taskFilePath?: string;
+	packetFile?: string;
+	modelOverride?: string;
+	skills?: string[] | false;
+	useTestDrivenDevelopment: boolean;
+	maxSubagentDepth?: number;
+	artifactsDir?: string;
+	artifactConfig?: ArtifactConfig;
+	maxOutput?: MaxOutputConfig;
+	includeProgress: boolean;
+	config: ExtensionConfig;
+	cleanupLaunchArtifacts(): void;
+}
+
+// ============================================================================
+// Child Run Results
+// ============================================================================
+
+/**
+ * Result returned from a child subagent run.
+ */
+export interface ChildRunResult extends SingleResult {
+	completion?: SubagentCompletionEnvelope;
+	lifecycle?: LifecycleReadResult;
+}
+
+// ============================================================================
+// Artifacts
+// ============================================================================
+
+export interface ArtifactPaths {
+	inputPath: string;
+	outputPath: string;
+	jsonlPath: string;
+	metadataPath: string;
+}
+
+export interface ArtifactConfig {
+	enabled: boolean;
+	includeInput: boolean;
+	includeOutput: boolean;
+	includeJsonl: boolean;
+	includeMetadata: boolean;
+	cleanupDays: number;
+}
+
+export interface ConfigGateState {
+	blocked: boolean;
+	diagnostics: ConfigDiagnostic[];
+	message: string;
+	configPath?: string;
+	examplePath?: string;
+}
+
+export interface SubagentState {
+	baseCwd: string;
+	currentSessionId: string | null;
+	lastUiContext: ExtensionContext | null;
+	configGate: ConfigGateState;
+	/** Opt-in gate: true only after a Superpowers command has fired this session. */
+	superpowersActive: boolean;
+	/** Last compaction's sizing class, set by session_compact, read by context. Null when no compaction has occurred. */
+	compactionSizing: "full" | "trimmed" | "pointer" | null;
+	/** Root lifecycle skill names, captured at command fire for the trimmed/pointer reminder. */
+	rootLifecycleSkillNames: string[];
+	/** Resolved run profile, captured at command fire for full-sizing re-injection. Skill content is re-resolved at compaction time, not snapshotted. */
+	rootPromptProfile: ResolvedSuperpowersRunProfile | null;
+}
+
+// ============================================================================
+// Display
+// ============================================================================
+
+export type DisplayItem = { type: "text"; text: string } | { type: "tool"; name: string; args: Record<string, unknown> };
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+export interface ErrorInfo {
+	hasError: boolean;
+	exitCode?: number;
+	errorType?: string;
+	details?: string;
+}
+
+// ============================================================================
+// Execution Options
+// ============================================================================
+
+export interface RunSyncOptions {
+	cwd?: string;
+	signal?: AbortSignal;
+	onUpdate?: (r: import("@earendil-works/pi-agent-core").AgentToolResult<Details>) => void;
+	maxOutput?: MaxOutputConfig;
+	artifactsDir?: string;
+	artifactConfig?: ArtifactConfig;
+	runId: string;
+	index?: number;
+	sessionFile?: string;
+	sessionMode?: SessionMode;
+	taskDelivery?: TaskDeliveryMode;
+	taskFilePath?: string;
+	maxSubagentDepth?: number;
+	/** Override the agent's default model (format: "provider/id" or just "id") */
+	modelOverride?: string;
+	/** Skills to inject; `false` disables all configured skills for this run. */
+	skills?: string[] | false;
+	/** Extension config for command-scoped execution policy resolution. */
+	config?: ExtensionConfig;
+	/** Execution workflow mode. */
+	workflow?: WorkflowMode;
+	/** Whether to use test-driven development for implementer runs. */
+	useTestDrivenDevelopment?: boolean;
+	/** Absolute path to this extension entrypoint for child lifecycle tool injection. */
+	lifecycleExtensionEntry?: string;
+	/** Mirrors parent project-trust decision; gates project-local skill inputs in child resolution. */
+	projectTrusted?: boolean;
+}
+
+export type ConfigDiagnosticLevel = "warning" | "error";
+
+export interface ConfigDiagnostic {
+	level: ConfigDiagnosticLevel;
+	code: string;
+	path: string;
+	message: string;
+	action?: string;
+}
+
+/**
+ * Behavior flags for a named Superpowers entrypoint command.
+ */
+export interface SuperpowersCommandPreset {
+	useBranches?: boolean;
+	useSubagents?: boolean;
+	useTestDrivenDevelopment?: boolean;
+	usePlannotator?: boolean;
+	taskScheduling?: TaskScheduling;
+	worktrees?: SuperpowersCommandWorktreeSettings;
+}
+
+/** Worktree settings allowed inside command behavior presets. */
+export interface SuperpowersCommandWorktreeSettings {
+	enabled?: boolean;
+	root?: string | null;
+}
+
+/** Worktree settings for superagents parallel execution. */
+export interface SuperpowersWorktreeSettings {
+	enabled?: boolean;
+	root?: string | null;
+}
+
+export interface SuperpowersSettings {
+	commands?: Record<string, SuperpowersCommandPreset>;
+	modelTiers?: Record<string, ModelTierSetting>;
+	interceptSkillCommands?: string[];
+	/** Require explicit `/sp-*` or `/skill:*` activation instead of automatic using-superpowers bootstrap. */
+	makeSuperpowersSkillsOptInOnly?: boolean;
+	superpowersSkills?: string[];
+	/** Global extensions applied to all subagent runs before agent-specific extensions. */
+	extensions?: string[];
+	/** Global tools appended to every subagent after role-specific tool policy. */
+	tools?: string[];
+}
+
+export interface ExtensionConfig {
+	superagents?: SuperpowersSettings;
+	maxSubagentDepth?: number;
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+export const DEFAULT_MAX_OUTPUT: Required<MaxOutputConfig> = {
+	bytes: 200 * 1024,
+	lines: 5000,
+};
+
+export const DEFAULT_ARTIFACT_CONFIG: ArtifactConfig = {
+	enabled: true,
+	includeInput: true,
+	includeOutput: true,
+	includeJsonl: false,
+	includeMetadata: true,
+	cleanupDays: 7,
+};
+
+export const MAX_PARALLEL = 8;
+const MAX_CONCURRENCY = 4;
+export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
+
+export const DEFAULT_FORK_PREAMBLE =
+	"You are a delegated subagent with access to the parent session's context for reference. " +
+	"Your sole job is to execute the task below. Do not continue or respond to the prior conversation " +
+	"— focus exclusively on completing this task using your tools.";
+
+export function wrapForkTask(task: string, preamble?: string | false): string {
+	if (preamble === false) return task;
+	const effectivePreamble = preamble ?? DEFAULT_FORK_PREAMBLE;
+	const wrappedPrefix = `${effectivePreamble}\n\nTask:\n`;
+	if (task.startsWith(wrappedPrefix)) return task;
+	return `${wrappedPrefix}${task}`;
+}
+
+// ============================================================================
+// Recursion Depth Guard
+// ============================================================================
+
+export function normalizeMaxSubagentDepth(value: unknown): number | undefined {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	if (!Number.isInteger(parsed) || parsed < 0) return undefined;
+	return parsed;
+}
+
+export function resolveCurrentMaxSubagentDepth(configMaxDepth?: number): number {
+	return normalizeMaxSubagentDepth(process.env.PI_SUBAGENT_MAX_DEPTH) ?? normalizeMaxSubagentDepth(configMaxDepth) ?? DEFAULT_SUBAGENT_MAX_DEPTH;
+}
+
+export function resolveChildMaxSubagentDepth(parentMaxDepth: number, agentMaxDepth?: number): number {
+	const normalizedParent = normalizeMaxSubagentDepth(parentMaxDepth) ?? DEFAULT_SUBAGENT_MAX_DEPTH;
+	const normalizedAgent = normalizeMaxSubagentDepth(agentMaxDepth);
+	return normalizedAgent === undefined ? normalizedParent : Math.min(normalizedParent, normalizedAgent);
+}
+
+export function checkSubagentDepth(configMaxDepth?: number): { blocked: boolean; depth: number; maxDepth: number } {
+	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+	const maxDepth = resolveCurrentMaxSubagentDepth(configMaxDepth);
+	const blocked = Number.isFinite(depth) && depth >= maxDepth;
+	return { blocked, depth, maxDepth };
+}
+
+export function getSubagentDepthEnv(maxDepth?: number): Record<string, string> {
+	const parentDepth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
+	const nextDepth = Number.isFinite(parentDepth) ? parentDepth + 1 : 1;
+	return {
+		PI_SUBAGENT_DEPTH: String(nextDepth),
+		PI_SUBAGENT_MAX_DEPTH: String(normalizeMaxSubagentDepth(maxDepth) ?? resolveCurrentMaxSubagentDepth()),
+	};
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+export function truncateOutput(output: string, config: Required<MaxOutputConfig>, artifactPath?: string): TruncationResult {
+	const lines = output.split("\n");
+	const bytes = Buffer.byteLength(output, "utf-8");
+
+	if (bytes <= config.bytes && lines.length <= config.lines) {
+		return { text: output, truncated: false };
+	}
+
+	let truncatedLines = lines;
+	if (lines.length > config.lines) {
+		truncatedLines = lines.slice(0, config.lines);
+	}
+
+	let result = truncatedLines.join("\n");
+	if (Buffer.byteLength(result, "utf-8") > config.bytes) {
+		let low = 0;
+		let high = result.length;
+		while (low < high) {
+			const mid = Math.floor((low + high + 1) / 2);
+			if (Buffer.byteLength(result.slice(0, mid), "utf-8") <= config.bytes) {
+				low = mid;
+			} else {
+				high = mid - 1;
+			}
+		}
+		result = result.slice(0, low);
+	}
+
+	const keptLines = result.split("\n").length;
+	const marker = `[TRUNCATED: showing first ${keptLines} of ${lines.length} lines, ${formatBytes(Buffer.byteLength(result))} of ${formatBytes(bytes)}${artifactPath ? ` - full output at ${artifactPath}` : ""}]\n`;
+
+	return {
+		text: marker + result,
+		truncated: true,
+		originalBytes: bytes,
+		originalLines: lines.length,
+		artifactPath,
+	};
+}
+
+export interface TaskParam {
+	agent: string;
+	task: string;
+	cwd?: string;
+	model?: string;
+	skill?: string | string[] | boolean;
+	resumeSession?: string;
+}
+
+export interface SubagentParamsLike {
+	agent?: string;
+	task?: string;
+	tasks?: TaskParam[];
+	workflow?: WorkflowMode;
+	useTestDrivenDevelopment?: boolean;
+	worktree?: boolean;
+	sessionMode?: SessionMode;
+	resumeSession?: string;
+	cwd?: string;
+	maxOutput?: MaxOutputConfig;
+	artifacts?: boolean;
+	includeProgress?: boolean;
+	model?: string;
+	skill?: string | string[] | boolean;
+}

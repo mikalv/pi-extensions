@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Git Worktrees
+.worktrees/
+
+# Node and package managers
+node_modules/
+
+# Planning
+/docs/todos.md
+
+.scratch/
+
+# Agent packet scratch files
+task-brief.md
+implementer-report.md
+spec-review.md
+code-review.md
+debug-brief.md
+
+
+# old specs and plans
+.archive/
+.grepai/
+
+# agent config
+.agents/
+skills-lock.json
+
+# Tasks
+.pi/tasks/

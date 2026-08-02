@@ -1,0 +1,102 @@
+# CI workflow for pi-superagents.
+#
+# Responsibilities:
+# - run install, type, lint, test, documentation, and package-content checks
+# - keep pull requests and main branch changes release-ready across supported OSes
+# - avoid write permissions because the workflow only validates repository contents
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint and format check
+        run: pnpm exec biome check .
+
+      - name: Unit tests
+        run: pnpm run test:unit
+
+      - name: Integration tests
+        run: pnpm run test:integration
+
+      - name: E2E tests
+        run: pnpm run test:e2e
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run --json
+
+      - name: Verify docs relative links
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          root = Path(".")
+          files = [
+              p for p in root.rglob("*.md")
+              if ".git" not in p.parts
+              and "node_modules" not in p.parts
+              and not ("docs" in p.parts and "superpowers" in p.parts)
+              and not (".pi" in p.parts and "local" in p.parts)
+          ]
+
+          pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+          missing = []
+
+          for file in files:
+              text = file.read_text(encoding="utf-8", errors="ignore")
+              for link in pattern.findall(text):
+                  if link.startswith(("http://", "https://", "mailto:", "#")):
+                      continue
+                  target_text = link.split("#", 1)[0].split("?", 1)[0]
+                  if not target_text:
+                      continue
+                  target = (file.parent / target_text).resolve()
+                  if not target.exists():
+                      missing.append((file.as_posix(), link))
+
+          if missing:
+              print(f"Missing links: {len(missing)}")
+              for file, link in missing:
+                  print(f"{file} -> {link}")
+              raise SystemExit(1)
+
+          print("No missing relative links.")
+          PY

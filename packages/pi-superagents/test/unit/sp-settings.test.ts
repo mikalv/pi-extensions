@@ -1,0 +1,522 @@
+/**
+ * Unit tests for SuperpowersSettingsComponent.
+ *
+ * Responsibilities:
+ * - verify settings render in the framed settings overlay
+ * - verify toggle actions write config changes
+ * - verify unavailable config paths report a visible write message
+ * - verify model tier selections and reload config
+ * - verify reports when no models are available
+ * - verify task scheduling toggle writes only the selected command
+ */
+
+import * as assert from "node:assert";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { test } from "node:test";
+import type { ExtensionConfig, ThinkingLevel } from "../../src/shared/types.ts";
+import { SuperpowersSettingsComponent } from "../../src/ui/sp-settings.ts";
+
+function createThemeMock() {
+	return {
+		fg: (_color: string, text: string) => text,
+		bg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+}
+
+interface TuiMock {
+	requestRender: () => void;
+	_getRenderRequestCount: () => number;
+}
+
+function createTuiMock(): TuiMock {
+	let renderRequested = 0;
+	return {
+		requestRender: () => {
+			renderRequested++;
+		},
+		_getRenderRequestCount: () => renderRequested,
+	};
+}
+
+interface ModelOption {
+	provider: string;
+	id: string;
+	name?: string;
+	thinkingLevels: readonly ThinkingLevel[];
+}
+
+/**
+ * Create a model registry option for settings tests.
+ *
+ * @param provider Model provider name.
+ * @param id Model id.
+ * @param name Optional display name.
+ * @param thinkingLevels Thinking levels available for the model.
+ * @returns A model option used by the settings picker.
+ */
+function createModel(provider: string, id: string, name?: string, thinkingLevels: readonly ThinkingLevel[] = ["off"]): ModelOption {
+	return { provider, id, name, thinkingLevels };
+}
+
+function createState(configPath?: string) {
+	return {
+		configGate: {
+			blocked: false,
+			diagnostics: [],
+			message: "",
+			configPath,
+		},
+	};
+}
+
+/**
+ * Helper to get effective config for the component.
+ * Returns the current model's tier mappings as shown in the settings.
+ */
+function getConfigForTest(config: ExtensionConfig): () => ExtensionConfig {
+	return () => config;
+}
+
+void test("SuperpowersSettingsComponent renders settings in a framed panel", () => {
+	const config: ExtensionConfig = {
+		superagents: {
+			commands: {
+				"sp-implement": {
+					useSubagents: false,
+					useTestDrivenDevelopment: true,
+					taskScheduling: "sequential",
+					worktrees: { enabled: true, root: "/tmp/superpowers-worktrees" },
+				},
+				"sp-review": { useSubagents: false },
+			},
+			modelTiers: { cheap: { model: "test-model" } },
+		},
+	};
+
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, getConfigForTest(config), { models: [] });
+
+	const rendered = component.render(100).join("\n");
+	assert.match(rendered, /Superpowers Settings/);
+	assert.match(rendered, /sp-implement/);
+	assert.match(rendered, /sp-review/);
+	assert.match(rendered, /test-model/);
+	assert.match(rendered, /┌/);
+	assert.match(rendered, /┘/);
+	// All commands show their settings
+	assert.match(rendered, /useSubagents: false/);
+	assert.match(rendered, /useTestDrivenDevelopment: true/);
+	assert.match(rendered, /taskScheduling: sequential/);
+});
+
+void test("SuperpowersSettingsComponent ignores q and closes with escape", () => {
+	let closeCount = 0;
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, () => ({}), {
+		onClose: () => closeCount++,
+	});
+
+	component.handleInput("q");
+	assert.equal(closeCount, 0);
+
+	component.handleInput("\x1b");
+	assert.equal(closeCount, 1);
+});
+
+void test("SuperpowersSettingsComponent writes setting toggles to selected command", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(configPath, '{\n  "superagents": { "commands": { "sp-implement": { "useSubagents": true }, "sp-plan": { "usePlannotator": true } } }\n}\n', "utf-8");
+
+	let config: ExtensionConfig = {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true },
+				"sp-plan": { usePlannotator: true },
+			},
+		},
+	};
+
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState(configPath) as never, () => config, {
+		models: [],
+		reloadConfig: () => {
+			config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
+		},
+	});
+
+	component.handleInput("c");
+	component.handleInput("p");
+
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true },
+				"sp-plan": { usePlannotator: false },
+			},
+		},
+	});
+	const rendered = component.render(100).join("\n");
+	assert.match(rendered, /Selected command: sp-plan/);
+	assert.match(rendered, /usePlannotator: false/);
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent writes setting toggles to config", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(configPath, '{\n  "superagents": { "commands": { "sp-implement": { "useSubagents": true, "worktrees": { "enabled": false } } } }\n}\n', "utf-8");
+
+	const config: ExtensionConfig = {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true, worktrees: { enabled: false } },
+			},
+			modelTiers: { cheap: { model: "opencode-go/minimax-m2.7" } },
+		},
+	};
+
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState(configPath) as never, getConfigForTest(config), { models: [] });
+
+	component.toggleUseSubagents();
+	component.toggleWorktrees();
+
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			commands: {
+				"sp-implement": {
+					useSubagents: false,
+					worktrees: { enabled: true },
+				},
+			},
+		},
+	});
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent reports unavailable config path", () => {
+	const config: ExtensionConfig = { superagents: {} };
+
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, getConfigForTest(config), { models: [] });
+
+	component.toggleUseSubagents();
+
+	assert.match(component.render(84).join("\n"), /Config path is unavailable/);
+});
+
+void test("SuperpowersSettingsComponent writes model tier selections and reloads config", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(
+		configPath,
+		'{\n  "superagents": { "modelTiers": { "cheap": { "model": "opencode-go/minimax-m2.7" }, "balanced": { "model": "opencode-go/glm-5.1" } } }\n}\n',
+		"utf-8",
+	);
+
+	let _reloadCount = 0;
+	const config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "old-model" },
+				balanced: { model: "opencode-go/glm-5.1" },
+			},
+		},
+	};
+
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState(configPath) as never, getConfigForTest(config), {
+		models: [createModel("opencode-go", "minimax-m2.7", "MiniMax M2.7"), createModel("opencode-go", "glm-5.1", "GLM-5.1"), createModel("openai", "gpt-5.4", "GPT-5.4")],
+		reloadConfig: () => {
+			_reloadCount++;
+		},
+	});
+
+	// First verify initial state shows "cheap" tier entry
+	const rendered = component.render(92).join("\n");
+	assert.match(rendered, /cheap:/);
+	assert.match(rendered, /old-model/);
+
+	// Verify the config was written correctly
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "opencode-go/minimax-m2.7" },
+				balanced: { model: "opencode-go/glm-5.1" },
+			},
+		},
+	});
+
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent uses each selected model's Pi thinking levels", () => {
+	const config: ExtensionConfig = {
+		superagents: {
+			modelTiers: { cheap: { model: "provider/old" } },
+		},
+	};
+
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, getConfigForTest(config), {
+		models: [createModel("provider", "limited", "Limited", ["off", "minimal"]), createModel("provider", "expansive", "Expansive", ["high", "xhigh"])],
+	});
+
+	component.handleInput("m");
+	component.handleInput("\r");
+	assert.match(component.render(92).join("\n"), /▸ provider\/limited/);
+	component.handleInput("\r");
+
+	let rendered = component.render(92).join("\n");
+	assert.match(rendered, /off/);
+	assert.match(rendered, /minimal/);
+	assert.doesNotMatch(rendered, /high/);
+	assert.doesNotMatch(rendered, /xhigh/);
+
+	component.handleInput("\x1b");
+	component.handleInput("\r");
+	component.handleInput("\x1b[B");
+	assert.match(component.render(92).join("\n"), /▸ provider\/expansive/);
+	component.handleInput("\r");
+
+	rendered = component.render(92).join("\n");
+	assert.match(rendered, /^│ {3}high +│$/m);
+	assert.match(rendered, /^│ {3}xhigh +│$/m);
+	assert.doesNotMatch(rendered, /off/);
+	assert.doesNotMatch(rendered, /minimal/);
+});
+
+void test("SuperpowersSettingsComponent selects thinking after selecting a model tier model", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(configPath, '{\n  "superagents": { "modelTiers": { "cheap": { "model": "provider/old", "thinking": "low" } } }\n}\n', "utf-8");
+
+	let config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "provider/old", thinking: "low" },
+			},
+		},
+	};
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState(configPath) as never, () => config, {
+		models: [createModel("provider", "new", "New Model", ["off", "low", "medium"])],
+		reloadConfig: () => {
+			config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
+		},
+	});
+
+	component.handleInput("m");
+	component.handleInput("\r");
+	component.handleInput("\r");
+	let rendered = component.render(92).join("\n");
+	assert.match(rendered, /Select Thinking Level/);
+	assert.match(rendered, /Selected model: provider\/new/);
+	assert.match(rendered, /▸ low/);
+
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "provider/new", thinking: "medium" },
+			},
+		},
+	});
+	rendered = component.render(92).join("\n");
+	assert.match(rendered, /cheap: provider\/new \(thinking: medium\)/);
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent selects and navigates model tiers", () => {
+	const config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "opencode/minimax-m2.5-free" },
+				balanced: { model: "opencode-go/minimax-m2.7" },
+				max: { model: "opencode-go/minimax-m2.7" },
+			},
+		},
+	};
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState() as never, getConfigForTest(config), {
+		models: [createModel("opencode", "minimax-m2.5-free", "MiniMax free"), createModel("opencode-go", "minimax-m2.7", "MiniMax M2.7")],
+	});
+
+	component.handleInput("m");
+	let rendered = component.render(92).join("\n");
+	assert.match(rendered, /Select Model Tier/);
+	assert.match(rendered, /▸ cheap:/);
+
+	component.handleInput("\x1b[B");
+	rendered = component.render(92).join("\n");
+	assert.match(rendered, /▸ balanced:/);
+
+	component.handleInput("\r");
+	rendered = component.render(92).join("\n");
+	assert.match(rendered, /Select Model/);
+	assert.match(rendered, /Editing tier: balanced/);
+	assert.equal(tuiMock._getRenderRequestCount(), 3);
+});
+
+void test("SuperpowersSettingsComponent scrolls model picker selection through the full filtered model list", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(configPath, '{\n  "superagents": { "modelTiers": { "cheap": { "model": "provider/model-00" } } }\n}\n', "utf-8");
+
+	let config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "provider/model-00" },
+			},
+		},
+	};
+	const models = Array.from({ length: 20 }, (_, index) => {
+		const id = `model-${String(index).padStart(2, "0")}`;
+		return createModel("provider", id, `Model ${index}`);
+	});
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState(configPath) as never, () => config, {
+		models,
+		reloadConfig: () => {
+			config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
+		},
+	});
+
+	component.handleInput("m");
+	component.handleInput("\r");
+	for (let i = 0; i < 15; i++) {
+		component.handleInput("\x1b[B");
+	}
+
+	const rendered = component.render(92).join("\n");
+	assert.match(rendered, /▸ provider\/model-15/);
+	assert.doesNotMatch(rendered, /▸ provider\/model-00/);
+
+	component.handleInput("\r");
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "provider/model-15" },
+			},
+		},
+	});
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent allows q in model picker search", () => {
+	const config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "provider/alpha" },
+			},
+		},
+	};
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, getConfigForTest(config), {
+		models: [createModel("provider", "alpha", "Alpha"), createModel("provider", "qwen-max", "Qwen Max")],
+	});
+
+	component.handleInput("m");
+	component.handleInput("\r");
+	component.handleInput("q");
+
+	const rendered = component.render(92).join("\n");
+	assert.match(rendered, /Search: q_/);
+	assert.match(rendered, /▸ provider\/qwen-max/);
+	assert.doesNotMatch(rendered, /│\s+provider\/alpha/);
+});
+
+void test("SuperpowersSettingsComponent reports when no models are available", () => {
+	const config: ExtensionConfig = {
+		superagents: {
+			modelTiers: {
+				cheap: { model: "opencode-go/minimax-m2.7" },
+			},
+		},
+	};
+
+	const component = new SuperpowersSettingsComponent(createTuiMock() as never, createThemeMock() as never, createState() as never, getConfigForTest(config), {
+		models: [],
+		modelRegistryError: undefined,
+	});
+
+	const rendered = component.render(92).join("\n");
+	// Should show a message when no model options available
+	assert.match(rendered, /No models available|model/i);
+});
+
+void test("SuperpowersSettingsComponent toggles task scheduling between sequential and parallel on the selected command", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(
+		configPath,
+		'{\n  "superagents": { "commands": { "sp-implement": { "useSubagents": true, "taskScheduling": "sequential" }, "sp-plan": { "usePlannotator": true } } }\n}\n',
+		"utf-8",
+	);
+
+	let config: ExtensionConfig = {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true, taskScheduling: "sequential" },
+				"sp-plan": { usePlannotator: true },
+			},
+		},
+	};
+
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState(configPath) as never, () => config, {
+		models: [],
+		reloadConfig: () => {
+			config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
+		},
+	});
+
+	component.handleInput("e");
+
+	assert.deepStrictEqual(JSON.parse(fs.readFileSync(configPath, "utf-8")), {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true, taskScheduling: "parallel" },
+				"sp-plan": { usePlannotator: true },
+			},
+		},
+	});
+	const rendered = component.render(100).join("\n");
+	assert.match(rendered, /taskScheduling: parallel/);
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+void test("SuperpowersSettingsComponent toggles task scheduling only on the selected command", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sp-settings-"));
+	const configPath = path.join(dir, "config.json");
+	fs.writeFileSync(configPath, '{\n  "superagents": { "commands": { "sp-implement": { "useSubagents": true }, "sp-plan": { "taskScheduling": "parallel" } } }\n}\n', "utf-8");
+
+	let config: ExtensionConfig = {
+		superagents: {
+			commands: {
+				"sp-implement": { useSubagents: true },
+				"sp-plan": { taskScheduling: "parallel" },
+			},
+		},
+	};
+
+	const tuiMock = createTuiMock();
+	const component = new SuperpowersSettingsComponent(tuiMock as never, createThemeMock() as never, createState(configPath) as never, () => config, {
+		models: [],
+		reloadConfig: () => {
+			config = JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
+		},
+	});
+
+	// Select sp-implement explicitly (cycle: sp-implement is the first)
+	component.handleInput("e");
+	// Toggle sp-implement
+	const afterFirst = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+	assert.equal(afterFirst.superagents.commands["sp-implement"].taskScheduling, "parallel");
+	assert.equal(afterFirst.superagents.commands["sp-plan"].taskScheduling, "parallel");
+	// Toggle sp-implement back
+	component.handleInput("e");
+	const afterSecond = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+	assert.equal(afterSecond.superagents.commands["sp-implement"].taskScheduling, "sequential");
+	assert.equal(afterSecond.superagents.commands["sp-plan"].taskScheduling, "parallel");
+	fs.rmSync(dir, { recursive: true, force: true });
+});

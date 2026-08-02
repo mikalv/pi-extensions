@@ -1,0 +1,189 @@
+# Skills Reference
+
+Skills are specialized instructions loaded from `SKILL.md` files and injected into the agent's system prompt.
+
+This reference targets Pi `^0.82.1`.
+
+Maintenance note: skill discovery helpers are exercised through dynamic tests and plugin entrypoints. `.fallowrc.json` documents the small export surface that remains intentionally available for those dynamic paths.
+
+## Skill Locations (project-first precedence)
+
+- **Project, only when Pi project trust is active:** `.pi/skills/{name}/SKILL.md` and `.agents/skills/{name}/SKILL.md`
+- **Project packages, only when Pi project trust is active:** `.pi/npm/node_modules/*` via `package.json -> pi.skills`
+- **Project settings, only when Pi project trust is active:** `.pi/settings.json -> skills`
+- **User:** `~/.pi/agent/skills/{name}/SKILL.md` and `~/.agents/skills/{name}/SKILL.md`
+- **User packages:** `~/.pi/agent/npm/node_modules/*` via `package.json -> pi.skills`
+- **User settings:** `~/.pi/agent/settings.json -> skills`
+- **Global packages:** global npm packages with `package.json -> pi.skills`
+
+## Usage
+
+```typescript
+// Role agent with skills from its default policy/frontmatter
+{ agent: "sp-recon", task: "Inspect the auth flow" }
+
+// Override skills at runtime
+{ agent: "sp-implementer", task: "Implement auth", skill: "test-driven-development" }
+
+// Disable all skills (including agent defaults)
+{ agent: "sp-research", task: "Check the SDK docs", skill: false }
+
+// Parallel tasks can override skills per task
+{ tasks: [
+  { agent: "sp-research", task: "Check config", skill: "openai-docs" },
+  { agent: "sp-review", task: "Review the diff", skill: false }
+] }
+```
+
+## Injection Format
+
+```xml
+<skill name="safe-bash">
+[skill content from SKILL.md, frontmatter stripped]
+</skill>
+```
+
+## Skill Frontmatter
+
+Skills declare metadata in YAML frontmatter at the top of their `SKILL.md` file:
+
+```yaml
+---
+name: my-skill
+description: When to use this skill
+scope: root   # optional
+---
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique skill identifier |
+| `description` | Yes | Short description of when to use the skill |
+| `scope` | No | `root` restricts the skill to root-planning agents only; omit or use `agent` for skills available to all roles |
+
+Skills with `scope: root` are orchestration-level skills that should never be delegated to bounded role agents (e.g., `sp-recon`, `sp-implementer`). The runtime enforces this restriction automatically.
+
+## Agent Frontmatter
+
+Agent definitions (`agents/sp-*.md`) declare metadata in YAML frontmatter. Bounded role agents use `kind: role` or omit `kind`; interactive root commands use `kind: entrypoint` with `execution: interactive`.
+
+### Entrypoint Agent Fields
+
+Interactive entrypoint agents (used for slash command registration) support these frontmatter fields:
+
+```yaml
+---
+name: sp-example
+description: Example Superpowers entrypoint
+kind: entrypoint
+execution: interactive
+command: sp-example
+entrySkill: using-superpowers
+skills: verification-before-completion
+---
+```
+
+The `subagent` tool is the one the upstream Superpowers skills reference as "subagent from pi-subagents". Pi-superagents is the pi-subagents-compatible fork; the tool description states this and its actual capabilities (synchronous single, parallel, and forked-context dispatch — no async, chain, or resume/status) so models connect the skill reference to this tool.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Agent identifier used by the `subagent` tool or matching entrypoint name |
+| `description` | Yes | Short description of the agent's purpose |
+| `kind` | Yes | `entrypoint` for interactive root command agents |
+| `execution` | Yes | `interactive` for root entrypoints |
+| `command` | Yes | Slash command name (e.g., `sp-example`) |
+| `entrySkill` | Yes | Entry skill for the workflow (e.g., `using-superpowers`, `brainstorming`, `writing-plans`) |
+| `skills` | No | Comma-separated root lifecycle skills. For root entrypoints, these are lifecycle/root skills with explicit trigger points, not overlay replacements. |
+
+### Bounded Role Agent Fields
+
+Bounded role agents (delegated to subagents) support:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Agent identifier |
+| `description` | No | Short description |
+| `kind` | No | `role` for bounded delegated roles; omit for legacy behavior |
+| `execution` | No | `headless` for bounded delegated roles |
+| `skills` | No | Comma-separated skills injected into delegated subagent prompts |
+| `extensions` | No | Comma-separated Pi extension entrypoints to append for this agent |
+| `model` | No | Default model tier or concrete model ID |
+| `tools` | No | Comma-separated list of baseline tool names available to this agent. Global `superagents.tools` entries are appended at launch time. |
+| `maxSubagentDepth` | No | Maximum subagent delegation depth (0 disables delegation) |
+| `session-mode` | No | `standalone`, `lineage-only`, or `fork`. Built-in bounded roles default to `lineage-only`. |
+
+## Entrypoint Lifecycle Skills
+
+The `skills` field in entrypoint agents is reserved for root lifecycle skills. These are skills with explicit trigger points (e.g., `verification-before-completion`, `receiving-code-review`, `finishing-a-development-branch`) that apply to the root session only.
+
+Superpowers skill selection inside an explicit workflow is trigger-driven via `using-superpowers`. With the default `superagents.makeSuperpowersSkillsOptInOnly: true`, ordinary prompts do not advertise that bootstrap skill and the obra/superpowers Pi package's automatic bootstrap hook is neutralized. `/sp-*` and explicit `/skill:*` commands still resolve the installed upstream skills. Do not preload domain skills through command config. Entrypoint `skills` are not overlay replacements — they are lifecycle/root skills with explicit trigger points.
+
+Command-scoped workflow toggles can be changed through `/sp-settings`; model tier edits in the same overlay use a type-to-search picker backed by PI's authenticated model registry. The picker accepts `q` as search text, scrolls through all filtered results rather than only the visible page, and is followed by a thinking-level picker for the tier.
+
+Bundled entrypoint assignments:
+
+- `agents/sp-implement.md` and `agents/sp-implement-parallel.md` assign `verification-before-completion`, `receiving-code-review`, and `finishing-a-development-branch` as root lifecycle skills.
+- `agents/sp-brainstorm.md` and `agents/sp-plan.md` assign their respective entry skills.
+
+Bundled role assignments:
+
+- `agents/sp-debug.md` assigns `systematic-debugging` to the bounded debug role.
+- `agents/sp-implementer.md` ships on the `cheap` model tier and reads/writes implementer reports by path; its `maxSubagentDepth: 0` keeps it from delegating further.
+- `agents/sp-review.md` is the only Superpowers reviewer; it ships on the `max` tier and supports two scopes, declared explicitly in the dispatch:
+  - `Review scope: task` — review one Task (brief, implementer report, review-package diff).
+  - `Review scope: branch` — review the integrated branch (design/spec, plan, branch review package, verification evidence, Minor-findings ledger).
+  The reviewer returns one of `DONE`, `DONE_WITH_CONCERNS`, `NEEDS_CONTEXT`, or `BLOCKED`, and Critical/Important findings block approval.
+
+Install upgrades rename user-level `sp-spec-review.md` and
+`sp-code-review.md` files to timestamped backups. This prevents stale user
+agents from surviving beside the consolidated bundled `sp-review` role.
+
+### Re-arming after compaction
+
+When pi compacts the session context mid-Superpowers-run, the extension
+re-injects the lifecycle-skill trigger points so the model can continue
+invoking `verification-before-completion`, `receiving-code-review`, and
+`finishing-a-development-branch` at their trigger points without re-running
+the original command. The re-injection is sized by the compaction reason
+(threshold = full, overflow = trimmed, manual = pointer) and only occurs
+in sessions where a Superpowers command has been explicitly activated.
+
+## Parallel SDD Task Scheduling
+
+When `/sp-implement-parallel` runs—or another implementation command resolves `taskScheduling: "parallel"`, `useSubagents: true`, and `worktrees.enabled: true`—the root session controller drives the implementation plan in waves. The controller composes the three existing upstream Superpowers skills — `subagent-driven-development`, `dispatching-parallel-agents`, and `using-git-worktrees` — **without forking or editing them**:
+
+- `subagent-driven-development` provides the file-handoff convention (brief/report/diff by path under `.superpowers/sdd/`).
+- `dispatching-parallel-agents` provides the wave-building and dependency-ready heuristics.
+- `using-git-worktrees` provides the directory convention and safety rules for the per-Task worktrees.
+
+A **Task** is the whole numbered block of Steps from the implementation plan. The controller dispatches all Steps of one Task together to a single `sp-implementer` session — it never dispatches or reviews individual Steps. After the implementer reports, the controller runs exactly one `sp-review` against the Task (dispatch MUST state `Review scope: task`). If the review returns Critical or Important findings, the controller resumes the same `sp-implementer` session through `resumeSession` for a synchronous fix, then runs the per-Task `sp-review` again. The Task commit is integrated in Task-number order, and after every Task is integrated the controller runs one final branch-scope `sp-review` (dispatch MUST state `Review scope: branch`).
+
+Sequential scheduling keeps the same dispatch cadence: one Task at a time, one `sp-review` per Task, with no parallel writers, no persistent worktrees, and no `resumeSession` use. The Task-includes-all-Steps rule still holds.
+
+Worktree lifecycle for parallel SDD waves is described in the [Worktree Isolation reference](worktrees.md#two-kinds-of-parallel-worktree): the controller pre-creates one persistent worktree per Task under the configured worktree root and reuses it across implement → review → fix → re-review; ordinary parallel calls (the extension's generic `tasks: [...]` path) still get ephemeral, extension-owned worktrees.
+
+## Child Lifecycle Tools
+
+Child lifecycle tools (`subagent_done`, `caller_ping`) may be available to bounded roles through the tool policy for semantic completion signaling and parent request handling. These are internal child-only tools; they are not general-purpose delegation tools and are not listed in the parameters API.
+
+Shared tool names or tool extension paths can be configured once with `superagents.tools`. The bundled default config uses this for the common read-only baseline (`read`, `grep`, `find`, `ls`). The runtime appends those entries to each agent's resolved baseline tools after role policy and removes duplicates, so common tools do not need to be repeated in every `agents/*.md` frontmatter block.
+
+## Missing Skills
+
+For delegated subagent runs, missing skills are reported in the result summary and execution continues with the skills that were found. For root Superpowers entry-skill flows, missing required entry or entrypoint lifecycle skills block prompt dispatch so the user can fix the configuration.
+
+## Status Visibility
+
+Inline subagent result rows show each run's compact runtime-confirmed model label. Open `/subagents-status` and select an active or recent subagent run to see the runtime-confirmed model, effective thinking level when available, and resolved skill names injected for that run. Skill details include default agent skills, runtime `skill` overrides, and TDD skill injection from the explicit `useTestDrivenDevelopment` tool parameter. Missing skills are shown as warnings in the selected run details.
+
+## Role Output
+
+Skills and role prompts should return findings in the assistant response. Pi Superagents forwards that response through the `subagent` tool result and preserves optional debug artifacts outside the repository. The bounded SDD role agents (`sp-implementer`, `sp-review`) use the `subagent-driven-development` skill's file handoff: the controller runs the skill's `scripts/task-brief` and `scripts/review-package`, hands the resulting brief/report/diff paths to the agent by path in the dispatch, and the implementer writes its report by path under the gitignored `.superpowers/sdd/` workspace. The controller cleans those files up with `rm -f` after a `DONE` review; `progress.md` (the SDD ledger) is preserved until `finishing-a-development-branch`. `sp-debug`, `sp-recon`, and `sp-research` keep inline delivery. The extension injects no `[Read from:]`/`[Write to:]` references and performs no cleanup itself.
+
+Subagent results are rendered as compact inline lines in the Pi conversation. Collapsed view shows the agent name, compact runtime-confirmed model label, task, status, and current tool activity. Expanded view reveals model, thinking level when available, skills, recent tools, output preview, errors, and artifact paths. This keeps long-running Superpowers workflows readable without scrolling through verbose output.
+
+## Release Notes
+
+Skill discovery and injection behavior are part of the public extension contract. Before publishing changes to skill paths, frontmatter handling, scope enforcement, or missing-skill behavior, update this reference, `README.md`, and `CHANGELOG.md`, then follow the [Release Process](releases.md).
+
+The extension passes explicit project and Pi agent directories to Pi's skill loader so discovery remains stable across Pi 0.67 and 0.68 runtimes.

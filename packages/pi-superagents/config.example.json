@@ -1,0 +1,41 @@
+{
+  "superagents": {
+    "commands": {
+      "sp-implement-parallel": {
+        "taskScheduling": "parallel",
+        "useSubagents": true,
+        "useTestDrivenDevelopment": true,
+        "worktrees": { "enabled": true, "root": null }
+      },
+      "sp-brainstorm": {
+        "usePlannotator": true
+      },
+      "sp-plan": {
+        "usePlannotator": true
+      }
+    },
+    "extensions": [
+      "npm:@sting8k/pi-vcc"
+    ],
+    "tools": ["read", "grep", "find", "ls"],
+    "modelTiers": {
+      "cheap": {
+        "model": "opencode-go/minimax-m3"
+      },
+      "balanced": {
+        "model": "opencode-go/glm-5.2",
+        "thinking": "high"
+      },
+      "max": {
+        "model": "openai/gpt-5.6-sol",
+        "thinking": "high"
+      },
+      "creative": {
+        "model": "anthropic/claude-opus-4.8",
+        "thinking": "high"
+      }
+    },
+    "interceptSkillCommands": [],
+    "makeSuperpowersSkillsOptInOnly": true
+  }
+}

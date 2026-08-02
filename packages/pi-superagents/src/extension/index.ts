@@ -1,0 +1,629 @@
+/**
+ * Subagent Tool
+ *
+ *
+ * Config file: ~/.pi/agent/extensions/subagent/config.json
+ *   { "maxSubagentDepth": 1, "superagents": { "worktrees": { "enabled": true } } }
+ */
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { discoverAgents } from "../agents/agents.ts";
+import { writeLifecycleSignalAtomic } from "../execution/lifecycle-signals.ts";
+import { createSubagentExecutor } from "../execution/subagent-executor.ts";
+import { requestPlannotatorPlanReview } from "../integrations/plannotator.ts";
+import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
+import { SubagentParams } from "../shared/schemas.ts";
+import { resolveAvailableSkill, resolveSkills } from "../shared/skills.ts";
+import type { SubagentParamsLike } from "../shared/types.ts";
+import { DEFAULT_ARTIFACT_CONFIG, type Details, type SubagentState } from "../shared/types.ts";
+import { registerSlashCommands } from "../slash/slash-commands.ts";
+import { createSuperpowersPromptDispatcher } from "../superpowers/prompt-dispatch.ts";
+import { buildSuperpowersVisiblePromptSummary } from "../superpowers/root-prompt.ts";
+import { buildResolvedSkillEntryPrompt, parseSkillCommandInput, shouldInterceptSkillCommand } from "../superpowers/skill-entry.ts";
+import { parseSuperpowersWorkflowArgs, resolveSuperpowersRunProfile } from "../superpowers/workflow-profile.ts";
+import { renderSubagentResult } from "../ui/render.ts";
+import { registerCompactionDurabilityHandlers } from "./compaction-durability.ts";
+import { createRuntimeConfigStore } from "./config-store.ts";
+import { registerSuperpowersOptInGuard } from "./superpowers-opt-in.ts";
+
+/**
+ * Derive subagent session base directory from parent session file.
+ * If parent session is ~/.pi/agent/sessions/abc123.jsonl,
+ * returns ~/.pi/agent/sessions/abc123/ as the base.
+ * Callers add runId to create the actual session root: abc123/{runId}/
+ * Falls back to a unique temp directory if no parent session.
+ */
+function getSubagentSessionRoot(parentSessionFile: string | null): string {
+	if (parentSessionFile) {
+		const baseName = path.basename(parentSessionFile, ".jsonl");
+		const sessionsDir = path.dirname(parentSessionFile);
+		return path.join(sessionsDir, baseName);
+	}
+	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-session-"));
+}
+
+/**
+ * Read one JSON config file from disk.
+ *
+ * @param filePath Absolute path to the JSON file.
+ * @returns Parsed JSON value or `undefined` when the file is absent.
+ */
+function _readJsonConfig(filePath: string): unknown {
+	if (!fs.existsSync(filePath)) return undefined;
+	return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+}
+
+/**
+ * Locate the package root from the extension entry directory.
+ *
+ * Inputs/outputs:
+ * - walks upward from `entryDir`
+ * - returns the first ancestor containing `default-config.json`
+ *
+ * Invariants/failures:
+ * - falls back to `entryDir` when no package root marker is found
+ * - performs only synchronous filesystem metadata checks during extension startup
+ *
+ * @param entryDir Directory containing the loaded extension entry module.
+ * @returns Package root directory for bundled extension assets.
+ */
+function resolvePackageRoot(entryDir: string): string {
+	let current = entryDir;
+	while (true) {
+		if (fs.existsSync(path.join(current, "default-config.json"))) return current;
+		const parent = path.dirname(current);
+		if (parent === current) return entryDir;
+		current = parent;
+	}
+}
+
+/**
+ * Resolve the user-owned extension config directory.
+ *
+ * Inputs/outputs:
+ * - reads the current OS home directory
+ * - returns the documented Pi extension config directory
+ *
+ * Invariants:
+ * - this path is user-owned; package defaults remain loaded from the package root
+ *
+ * @returns Absolute path to the user config directory.
+ */
+function resolveUserConfigDir(): string {
+	return path.join(os.homedir(), ".pi", "agent", "extensions", "subagent");
+}
+
+/**
+ * Create a directory and verify it is actually accessible.
+ * On Windows with Azure AD/Entra ID, directories created shortly after
+ * wake-from-sleep can end up with broken NTFS ACLs (null DACL) when the
+ * cloud SID cannot be resolved without network connectivity. This leaves
+ * the directory completely inaccessible to the creating user.
+ */
+function _ensureAccessibleDir(dirPath: string): void {
+	fs.mkdirSync(dirPath, { recursive: true });
+	try {
+		fs.accessSync(dirPath, fs.constants.R_OK | fs.constants.W_OK);
+	} catch {
+		try {
+			fs.rmSync(dirPath, { recursive: true, force: true });
+		} catch {
+			// Best effort: retry mkdir/access even if cleanup fails.
+		}
+		fs.mkdirSync(dirPath, { recursive: true });
+		fs.accessSync(dirPath, fs.constants.R_OK | fs.constants.W_OK);
+	}
+}
+
+/**
+ * Discover interactive entrypoint command names from agent markdown files.
+ *
+ * Inputs/outputs:
+ * - discovers agents via discoverAgents(cwd, { includeProject })
+ * - filters for kind=entrypoint, execution=interactive
+ * - extracts command name from agent.command ?? agent.name
+ *
+ * Invariants:
+ * - only returns command names for agents that have a command field
+ * - when includeProject is false, project-local entrypoint agents are not returned
+ *
+ * @param cwd Current working directory for agent discovery.
+ * @param includeProject Whether to include project-local entrypoint agents.
+ * @returns Array of discovered interactive entrypoint command names.
+ */
+function discoverEntrypointCommandNames(cwd: string, includeProject: boolean): string[] {
+	return discoverAgents(cwd, { includeProject })
+		.agents.filter((agent) => agent.kind === "entrypoint" && agent.execution === "interactive")
+		.map((agent) => agent.command ?? agent.name)
+		.filter((commandName): commandName is string => Boolean(commandName));
+}
+
+const SuperpowersPlanReviewParams = Type.Object({
+	planContent: Type.String({ description: "Final Superpowers implementation plan content to review." }),
+	planFilePath: Type.Optional(Type.String({ description: "Saved plan file path for the final Superpowers plan when available." })),
+});
+
+/**
+ * Type definition for the saved-spec review tool parameters.
+ *
+ * Used by the Superpowers brainstorming entry flow to send the final saved spec
+ * through the Plannotator browser review bridge.
+ */
+const SuperpowersSpecReviewParams = Type.Object({
+	specContent: Type.String({ description: "Final saved Superpowers brainstorming spec content to review." }),
+	specFilePath: Type.Optional(Type.String({ description: "Saved Superpowers brainstorming spec file path when available." })),
+});
+
+/**
+ * Parameter schema for the child subagent_done lifecycle tool.
+ *
+ * Allows child processes to record intentional completion with an optional
+ * output-token count for parent-side usage accounting.
+ */
+const SubagentDoneParams = Type.Object({
+	outputTokens: Type.Optional(Type.Number({ description: "Optional output-token count reported by the child runtime." })),
+});
+
+/**
+ * Parameter schema for the child caller_ping lifecycle tool.
+ *
+ * Allows child processes to record a concise parent-help request that is
+ * surfaced to the parent agent as a `needs_parent` completion envelope.
+ */
+const CallerPingParams = Type.Object({
+	message: Type.String({ description: "Concise question or blocked-state message for the parent agent." }),
+	outputTokens: Type.Optional(Type.Number({ description: "Optional output-token count reported by the child runtime." })),
+});
+
+/**
+ * Build a text-only tool result for root-session review calls.
+ *
+ * @param text User-facing tool response text.
+ * @returns Minimal tool result payload with no delegated subagent details.
+ */
+function createTextToolResult(text: string): AgentToolResult<Details> {
+	return {
+		content: [{ type: "text", text }],
+		details: { mode: "single", results: [] },
+	};
+}
+
+/**
+ * Resolve the child session file path required for lifecycle sidecar writes.
+ *
+ * @returns The PI_SUBAGENT_SESSION environment variable value.
+ * @throws When PI_SUBAGENT_SESSION is not set (lifecycle tools only work inside parent-launched subagents).
+ */
+function getRequiredChildSessionFile(): string {
+	const sessionFile = process.env.PI_SUBAGENT_SESSION;
+	if (!sessionFile) {
+		throw new Error("PI_SUBAGENT_SESSION is not set; lifecycle tools only work inside parent-launched subagents.");
+	}
+	return sessionFile;
+}
+
+/**
+ * Resolve the built-in command that owns a supported direct skill entry.
+ *
+ * Inputs/outputs:
+ * - accepts a Superpowers entry skill name from direct skill interception
+ * - returns the matching built-in command preset name, when one exists
+ *
+ * Invariants:
+ * - intercepted brainstorming uses the same policy as `/sp-brainstorm`
+ * - intercepted writing-plans uses the same policy as `/sp-plan`
+ *
+ * @param skillName Supported Superpowers entry skill name.
+ * @returns Matching built-in slash command name or undefined.
+ */
+function commandNameForInterceptedSkill(skillName: string): string | undefined {
+	if (skillName === "brainstorming") return "sp-brainstorm";
+	if (skillName === "writing-plans") return "sp-plan";
+	return undefined;
+}
+
+/**
+ * Register the Superpowers extension surface with Pi.
+ *
+ * @param pi Extension API used to register tools, commands, and lifecycle hooks.
+ * @returns Nothing. Registration mutates Pi's runtime extension registry.
+ */
+export default function registerSubagentExtension(pi: ExtensionAPI): void {
+	const extensionEntryDir = path.dirname(fileURLToPath(import.meta.url));
+
+	// Create state first so config store can reference live session cwd
+	const state: SubagentState = {
+		baseCwd: process.cwd(),
+		currentSessionId: null,
+		lastUiContext: null,
+		configGate: { blocked: false, diagnostics: [], message: "", configPath: undefined, examplePath: undefined },
+		superpowersActive: false,
+		compactionSizing: null,
+		rootLifecycleSkillNames: [],
+		rootPromptProfile: null,
+	};
+
+	// Create runtime config store with callback that uses live session baseCwd
+	// for stale command detection (avoids reliance on process.cwd() which may be wrong)
+	const configStore = createRuntimeConfigStore(resolvePackageRoot(extensionEntryDir), resolveUserConfigDir(), () => discoverEntrypointCommandNames(state.baseCwd, false));
+
+	// Trigger initial load so gate state reflects the session cwd
+	configStore.reloadConfig();
+	state.configGate = configStore.getGateState();
+
+	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
+
+	const executor = createSubagentExecutor({
+		state,
+		getConfig: () => configStore.getConfig(),
+		getSubagentSessionRoot,
+		discoverAgents,
+		lifecycleExtensionEntry: fileURLToPath(import.meta.url),
+	});
+
+	/**
+	 * Count the effective number of parallel subagent tasks for status rendering.
+	 *
+	 * @param tasks Parallel task definitions that may include explicit `count` fan-out.
+	 * @returns Total number of concrete task slots implied by the request.
+	 */
+	function effectiveParallelTaskCount(tasks: Array<{ count?: unknown }> | undefined): number {
+		if (!tasks || tasks.length === 0) return 0;
+		return tasks.reduce((total, task) => {
+			const count = typeof task.count === "number" && Number.isInteger(task.count) && task.count >= 1 ? task.count : 1;
+			return total + count;
+		}, 0);
+	}
+
+	/**
+	 * Build a blocking tool result for invalid config.
+	 *
+	 * @param message User-facing config diagnostic message.
+	 * @returns Tool result that refuses execution.
+	 */
+	function configBlockedResult(message: string): AgentToolResult<Details> {
+		return createTextToolResult(message);
+	}
+
+	/**
+	 * Execute the root-session Plannotator plan review bridge.
+	 *
+	 * @param params Final plan content plus optional saved plan path.
+	 * @param ctx Extension context for optional UI notifications.
+	 * @returns Fail-soft review status text for the Superpowers root prompt contract.
+	 */
+	async function executeSuperpowersPlanReview(params: { planContent: string; planFilePath?: string }, ctx: ExtensionContext): Promise<AgentToolResult<Details>> {
+		// Read live config at execution time to respect runtime changes
+		if (configStore.getConfig().superagents?.commands?.["sp-plan"]?.usePlannotator !== true) {
+			return createTextToolResult("Plannotator review is disabled in config. Continue with the normal text-based Superpowers approval flow.");
+		}
+
+		try {
+			const result = await requestPlannotatorPlanReview({
+				events: pi.events,
+				planContent: params.planContent,
+				planFilePath: params.planFilePath,
+			});
+
+			if (result.status === "approved") {
+				return createTextToolResult("Plannotator approved the plan review. Continue the Superpowers workflow.");
+			}
+
+			if (result.status === "rejected") {
+				return createTextToolResult(`Plannotator requested plan changes:\n${result.feedback}`);
+			}
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Plannotator unavailable: ${result.reason}. Falling back to text-based approval.`, "warning");
+			}
+			return createTextToolResult(`Plannotator unavailable: ${result.reason}\nContinue with the normal text-based Superpowers approval flow.`);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Plannotator unavailable: ${reason}. Falling back to text-based approval.`, "warning");
+			}
+			return createTextToolResult(`Plannotator unavailable: ${reason}\nContinue with the normal text-based Superpowers approval flow.`);
+		}
+	}
+
+	/**
+	 * Execute the root-session Plannotator saved-spec review bridge.
+	 *
+	 * Reuses the existing `requestPlannotatorPlanReview` bridge internally,
+	 * mapping specContent/planContent for compatibility with the Plannotator event contract.
+	 * Emits the same "plan-review" action as plan review to maintain bridge compatibility.
+	 *
+	 * @param params Final spec content plus optional saved spec path.
+	 * @param ctx Extension context for optional UI notifications.
+	 * @returns Fail-soft saved-spec review status text.
+	 */
+	async function executeSuperpowersSpecReview(params: { specContent: string; specFilePath?: string }, ctx: ExtensionContext): Promise<AgentToolResult<Details>> {
+		// Read live config at execution time to respect runtime changes
+		if (configStore.getConfig().superagents?.commands?.["sp-brainstorm"]?.usePlannotator !== true) {
+			return createTextToolResult("Plannotator saved spec review is disabled in config. Continue with the normal text-based Superpowers review flow.");
+		}
+
+		try {
+			// Reuse the plan-review bridge internally; map specContent to planContent
+			const result = await requestPlannotatorPlanReview({
+				events: pi.events,
+				planContent: params.specContent,
+				planFilePath: params.specFilePath,
+			});
+
+			if (result.status === "approved") {
+				return createTextToolResult("Plannotator approved the saved spec review. Continue the Superpowers workflow.");
+			}
+
+			if (result.status === "rejected") {
+				return createTextToolResult(`Plannotator requested saved spec changes:\n${result.feedback}`);
+			}
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Plannotator unavailable: ${result.reason}. Falling back to text-based spec review.`, "warning");
+			}
+			return createTextToolResult(`Plannotator unavailable: ${result.reason}\nContinue with the normal text-based Superpowers review flow.`);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Plannotator unavailable: ${reason}. Falling back to text-based spec review.`, "warning");
+			}
+			return createTextToolResult(`Plannotator unavailable: ${reason}\nContinue with the normal text-based Superpowers review flow.`);
+		}
+	}
+
+	const planReviewTool: ToolDefinition<typeof SuperpowersPlanReviewParams, Details> = {
+		name: "superpowers_plan_review",
+		label: "Superpowers Plan Review",
+		description: "Send the final Superpowers implementation plan through the optional Plannotator browser review bridge. Use only at the normal plan approval point.",
+		parameters: SuperpowersPlanReviewParams,
+		execute(_id, params, _signal, _onUpdate, ctx) {
+			return executeSuperpowersPlanReview(params as { planContent: string; planFilePath?: string }, ctx);
+		},
+	};
+
+	const specReviewTool: ToolDefinition<typeof SuperpowersSpecReviewParams, Details> = {
+		name: "superpowers_spec_review",
+		label: "Superpowers Spec Review",
+		description: "Send the final saved Superpowers brainstorming spec through the optional Plannotator browser review bridge. Use only after the saved brainstorming spec exists.",
+		parameters: SuperpowersSpecReviewParams,
+		execute(_id, params, _signal, _onUpdate, ctx) {
+			return executeSuperpowersSpecReview(params as { specContent: string; specFilePath?: string }, ctx);
+		},
+	};
+
+	/**
+	 * Child lifecycle tool: subagent_done
+	 *
+	 * Records intentional subagent completion and exits the child run into normal
+	 * process shutdown. Writes an atomic `.exit` sidecar consumed by the parent.
+	 */
+	const subagentDoneTool: ToolDefinition<typeof SubagentDoneParams, Details> = {
+		name: "subagent_done",
+		label: "Subagent Done",
+		description: "Child-only lifecycle tool. Records intentional subagent completion and exits the child run into normal process shutdown.",
+		parameters: SubagentDoneParams,
+		execute(_id, params) {
+			try {
+				writeLifecycleSignalAtomic(getRequiredChildSessionFile(), {
+					type: "done",
+					...(typeof params.outputTokens === "number" ? { outputTokens: params.outputTokens } : {}),
+				});
+				return Promise.resolve(createTextToolResult("Subagent completion signal recorded. Finish your final response now."));
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return Promise.resolve(createTextToolResult(`Lifecycle tool error: ${message}`));
+			}
+		},
+	};
+
+	/**
+	 * Child lifecycle tool: caller_ping
+	 *
+	 * Asks the parent for clarification and records a needs_parent sidecar consumed
+	 * by the parent result-delivery store. Does not enable further subagent delegation.
+	 */
+	const callerPingTool: ToolDefinition<typeof CallerPingParams, Details> = {
+		name: "caller_ping",
+		label: "Caller Ping",
+		description: "Child-only lifecycle tool. Asks the parent for clarification and records a needs_parent sidecar.",
+		parameters: CallerPingParams,
+		execute(_id, params) {
+			try {
+				writeLifecycleSignalAtomic(getRequiredChildSessionFile(), {
+					type: "ping",
+					name: process.env.PI_SUBAGENT_NAME ?? process.env.PI_SUBAGENT_AGENT,
+					message: params.message,
+					...(typeof params.outputTokens === "number" ? { outputTokens: params.outputTokens } : {}),
+				});
+				return Promise.resolve(createTextToolResult(`Parent help requested: ${params.message}`));
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return Promise.resolve(createTextToolResult(`Lifecycle tool error: ${message}`));
+			}
+		},
+	};
+
+	const tool: ToolDefinition<typeof SubagentParams, Details> = {
+		name: "subagent",
+		label: "Subagent",
+		description: `Delegate bounded work to Superpowers role subagents.
+
+This is the \`subagent\` tool the Superpowers skills reference (provided by pi-superagents, the pi-subagents-compatible fork). Supports synchronous single, parallel, and forked-context dispatch only — no async, chain, or resume/status workflows.
+
+Use this tool only inside a Superpowers workflow when selected skills call for delegation.
+
+SINGLE: { agent: "sp-recon", task: "Inspect the auth flow" }
+PARALLEL: { tasks: [{ agent: "sp-research", task: "Check config" }, { agent: "sp-review", task: "Review the diff" }] }
+
+Allowed role agents: sp-recon, sp-research, sp-implementer, sp-review, sp-debug.
+For sp-implementer fix loops, pass \`resumeSession: "<prior-implementer-session-file>"\` to continue a prior implementation synchronously; the reviewer dispatches against that existing session.
+Bounded role agents are not allowed to call subagents.`,
+		parameters: SubagentParams,
+
+		execute(id, params, signal, onUpdate, ctx) {
+			if (state.configGate.blocked) {
+				return Promise.resolve(configBlockedResult(state.configGate.message));
+			}
+			return executor.execute(id, params as unknown as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx);
+		},
+
+		renderCall(args, theme) {
+			const isParallel = (args.tasks?.length ?? 0) > 0;
+			const parallelCount = effectiveParallelTaskCount(args.tasks as Array<{ count?: unknown }> | undefined);
+			if (isParallel) return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}parallel (${parallelCount})`, 0, 0);
+			return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent || "?")}`, 0, 0);
+		},
+
+		renderResult(result, options, theme) {
+			return renderSubagentResult(result, options, theme);
+		},
+	};
+
+	// Register lifecycle tools before subagent so lifecycle tools appear earlier in the tool list
+	pi.registerTool(subagentDoneTool);
+	pi.registerTool(callerPingTool);
+	pi.registerTool(planReviewTool);
+	pi.registerTool(specReviewTool);
+	pi.registerTool(tool);
+	registerSlashCommands(
+		pi,
+		state,
+		() => configStore.getConfig(),
+		() => configStore.reloadConfig(),
+		false,
+	);
+	// Register compaction-durability handlers (session_compact, context, agent_settled)
+	// so Superpowers opt-in survives context compaction.
+	registerCompactionDurabilityHandlers(pi, state, { cwd: () => state.baseCwd });
+	const skillCommandPromptDispatcher = createSuperpowersPromptDispatcher(pi);
+	registerSuperpowersOptInGuard(pi, () => configStore.getConfig());
+
+	/**
+	 * Intercept opted-in skill commands before native Pi skill expansion.
+	 *
+	 * Handles `/skill:brainstorming <task>` when `interceptSkillCommands` includes "brainstorming".
+	 * Uses the same prompt builder as /sp-brainstorm so command and interception paths stay identical.
+	 *
+	 * @param event Input event with text and source.
+	 * @param ctx Extension context for cwd and UI.
+	 * @returns Continue for non-intercepted input, handled for intercepted skill commands.
+	 */
+	pi.on("input", (event, ctx) => {
+		// Never intercept extension-injected messages to prevent loops
+		if (event.source === "extension") return { action: "continue" as const };
+		// Allow config-blocked execution to fall through to other handlers
+		if (state.configGate.blocked) return { action: "continue" as const };
+
+		// Parse skill command from raw input
+		const parsedSkillCommand = parseSkillCommandInput(event.text);
+		if (!parsedSkillCommand) return { action: "continue" as const };
+
+		// Check if this skill is opted-in for interception (read live config at execution time)
+		if (!shouldInterceptSkillCommand(parsedSkillCommand.skillName, configStore.getConfig())) {
+			return { action: "continue" as const };
+		}
+
+		// Parse workflow arguments from the task portion
+		const parsedWorkflowArgs = parseSuperpowersWorkflowArgs(parsedSkillCommand.task);
+		if (!parsedWorkflowArgs) {
+			if (ctx.hasUI) ctx.ui.notify(`Usage: /skill:${parsedSkillCommand.skillName} <task>`, "error");
+			return { action: "handled" as const };
+		}
+
+		// Resolve the Superpowers run profile with intercepted-skill entry
+		const profile = resolveSuperpowersRunProfile({
+			config: configStore.getConfig(),
+			commandName: commandNameForInterceptedSkill(parsedSkillCommand.skillName) ?? `skill:${parsedSkillCommand.skillName}`,
+			parsed: parsedWorkflowArgs,
+			entrySkill: parsedSkillCommand.skillName,
+		});
+
+		// Build the prompt using the shared skill-entry helper
+		const promptResult = buildResolvedSkillEntryPrompt({
+			cwd: ctx.cwd,
+			profile,
+			resolveSkill: resolveAvailableSkill,
+			resolveSkillNames: resolveSkills,
+		});
+
+		if ("error" in promptResult) {
+			if (ctx.hasUI) ctx.ui.notify(promptResult.error, "error");
+			return { action: "handled" as const };
+		}
+
+		// Arm the compaction-durability opt-in flag at dispatch time so the
+		// session_compact/context re-injection handlers can re-arm the root
+		// contract after compaction.
+		state.superpowersActive = true;
+		state.compactionSizing = null;
+		state.rootLifecycleSkillNames = profile.rootLifecycleSkillNames ?? [];
+		state.rootPromptProfile = profile;
+
+		// Send the prompt to the agent with only flags visible in chat.
+		skillCommandPromptDispatcher.send(
+			buildSuperpowersVisiblePromptSummary({
+				task: profile.task,
+				useBranches: profile.useBranches,
+				useSubagents: profile.useSubagents,
+				useTestDrivenDevelopment: profile.useTestDrivenDevelopment,
+				usePlannotatorReview: profile.usePlannotatorReview,
+				worktrees: profile.worktrees,
+				fork: profile.fork,
+			}),
+			promptResult.prompt,
+			ctx,
+		);
+		return { action: "handled" as const };
+	});
+
+	pi.on("tool_result", (event, ctx) => {
+		if (event.toolName !== "subagent") return;
+		if (!ctx.hasUI) return;
+		state.lastUiContext = ctx;
+	});
+
+	const cleanupSessionArtifacts = (ctx: ExtensionContext) => {
+		try {
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (sessionFile) {
+				cleanupOldArtifacts(getArtifactsDir(sessionFile), DEFAULT_ARTIFACT_CONFIG.cleanupDays);
+			}
+		} catch {
+			// Cleanup failures should not block session lifecycle events.
+		}
+	};
+
+	const resetSessionState = (ctx: ExtensionContext) => {
+		state.baseCwd = ctx.cwd;
+		state.currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		state.lastUiContext = ctx;
+		cleanupSessionArtifacts(ctx);
+	};
+
+	let configDiagnosticNotifiedForSession: string | null = null;
+
+	pi.on("session_start", (_event, ctx) => {
+		resetSessionState(ctx);
+		// Reset the compaction-durability opt-in flag at session start so
+		// Superpowers state is never carried across sessions.
+		state.superpowersActive = false;
+		state.compactionSizing = null;
+		state.rootLifecycleSkillNames = [];
+		state.rootPromptProfile = null;
+		if (state.configGate.message && ctx.hasUI && configDiagnosticNotifiedForSession !== state.currentSessionId) {
+			configDiagnosticNotifiedForSession = state.currentSessionId;
+			ctx.ui.notify(state.configGate.message, state.configGate.blocked ? "error" : "warning");
+		}
+	});
+	pi.on("session_shutdown", () => {
+		// Nothing to clean up anymore
+	});
+}

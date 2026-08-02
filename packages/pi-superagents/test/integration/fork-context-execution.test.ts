@@ -1,0 +1,520 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { seedLineageOnlySessionFile } from "../../src/execution/session-mode.ts";
+import type { ExtensionConfig } from "../../src/shared/types.ts";
+import type { MockPi } from "../support/helpers.ts";
+import { createMockPi, createTempDir, removeTempDir, tryImport } from "../support/helpers.ts";
+
+/**
+ * Local view of the subagent executor module under test.
+ *
+ * `isError` was removed from AgentToolResult; error paths are now
+ * distinguished solely by content text (and by empty details.results).
+ */
+interface ExecutorModule {
+	createSubagentExecutor?: (...args: unknown[]) => {
+		execute: (
+			id: string,
+			params: Record<string, unknown>,
+			signal: AbortSignal,
+			onUpdate: ((result: unknown) => void) | undefined,
+			ctx: unknown,
+		) => Promise<{ content: Array<{ text?: string }>; details?: any }>;
+	};
+}
+
+interface AgentDiscoveryModule {
+	discoverAgents?: (cwd: string) => {
+		agents: Array<{ name: string; description: string; sessionMode?: "standalone" | "lineage-only" | "fork" }>;
+	};
+}
+
+const executorMod = await tryImport<ExecutorModule>("./src/execution/subagent-executor.ts");
+const available = !!executorMod;
+const createSubagentExecutor = executorMod?.createSubagentExecutor;
+const agentDiscoveryMod = await tryImport<AgentDiscoveryModule>("./src/agents/agents.ts");
+const discoverAgents = agentDiscoveryMod?.discoverAgents;
+
+/**
+ * Run a git command without shell quoting so fixtures work on Windows and POSIX.
+ *
+ * @param cwd Git repository or working directory.
+ * @param args Git CLI arguments.
+ */
+function git(cwd: string, args: string[]): void {
+	const result = spawnSync("git", args, { cwd, encoding: "utf-8" });
+	if (result.status !== 0) {
+		const details = result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} failed`;
+		throw new Error(details);
+	}
+}
+
+interface SessionStubOptions {
+	sessionFile?: string;
+	leafId?: string | null;
+}
+
+interface SessionManagerStub {
+	getSessionFile(): string | undefined;
+	getLeafId(): string | null;
+	createBranchedSession(leafId: string): string;
+}
+
+/**
+ * Recursively collect child session files created under a fixture root.
+ *
+ * @param root Directory tree to scan.
+ * @returns Matching child session files.
+ */
+function findChildSessionFiles(root: string): string[] {
+	const matches: string[] = [];
+	for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+		const entryPath = path.join(root, entry.name);
+		if (entry.isDirectory()) {
+			matches.push(...findChildSessionFiles(entryPath));
+			continue;
+		}
+		if (entry.isFile() && entry.name.startsWith("child-") && entry.name.endsWith(".jsonl")) {
+			matches.push(entryPath);
+		}
+	}
+	return matches;
+}
+
+function makeSessionManagerRecorder(options: SessionStubOptions = {}) {
+	const calls: string[] = [];
+	let counter = 0;
+	const manager: SessionManagerStub = {
+		getSessionFile: () => options.sessionFile,
+		getLeafId: () => (options.leafId === undefined ? "leaf-current" : options.leafId),
+		createBranchedSession: (leafId: string) => {
+			calls.push(leafId);
+			counter++;
+			return `/tmp/subagent-fork-${counter}.jsonl`;
+		},
+	};
+	return { manager, calls };
+}
+
+/**
+ * Read the seeded child-session header written by lineage-only launches.
+ *
+ * @param sessionFile Absolute child session path.
+ * @returns Parsed JSON header from the first line of the JSONL file.
+ */
+function readSessionHeader(sessionFile: string): Record<string, unknown> {
+	const firstLine = fs.readFileSync(sessionFile, "utf-8").trim().split("\n")[0];
+	return JSON.parse(firstLine);
+}
+
+function makeState(cwd: string) {
+	return {
+		baseCwd: cwd,
+		currentSessionId: null,
+		asyncJobs: new Map(),
+		cleanupTimers: new Map(),
+		lastUiContext: null,
+		poller: null,
+		completionSeen: new Map(),
+		watcher: null,
+		watcherRestartTimer: null,
+		resultFileCoalescer: {
+			schedule: () => false,
+			clear: () => {},
+		},
+		configGate: {
+			blocked: false,
+			diagnostics: [],
+			message: "",
+		},
+	};
+}
+
+void describe("fork context execution wiring", { skip: !available ? "subagent executor not importable" : undefined }, () => {
+	let tempDir: string;
+	let mockPi: MockPi;
+
+	/** Saved env vars — restored after every test to keep runs hermetic. */
+	let savedDepth: string | undefined;
+	let savedMaxDepth: string | undefined;
+
+	before(() => {
+		mockPi = createMockPi();
+		mockPi.install();
+	});
+
+	after(() => {
+		mockPi.uninstall();
+	});
+
+	beforeEach(() => {
+		// Save and clear PI_SUBAGENT_DEPTH / PI_SUBAGENT_MAX_DEPTH so tests are
+		// hermetic regardless of whether they run inside a pi session or CI
+		// environment that already has these variables set.
+		savedDepth = process.env.PI_SUBAGENT_DEPTH;
+		savedMaxDepth = process.env.PI_SUBAGENT_MAX_DEPTH;
+		delete process.env.PI_SUBAGENT_DEPTH;
+		delete process.env.PI_SUBAGENT_MAX_DEPTH;
+
+		tempDir = createTempDir("pi-subagent-fork-test-");
+		// Init git repo for worktree support
+		git(tempDir, ["init"]);
+		git(tempDir, ["config", "user.email", "test@example.com"]);
+		git(tempDir, ["config", "user.name", "Test User"]);
+		git(tempDir, ["commit", "--allow-empty", "-m", "initial commit"]);
+
+		mockPi.reset();
+		mockPi.onCall({ output: "ok" });
+	});
+
+	afterEach(() => {
+		// Restore PI_SUBAGENT_DEPTH / PI_SUBAGENT_MAX_DEPTH to their pre-test values.
+		if (savedDepth !== undefined) {
+			process.env.PI_SUBAGENT_DEPTH = savedDepth;
+		} else {
+			delete process.env.PI_SUBAGENT_DEPTH;
+		}
+		if (savedMaxDepth !== undefined) {
+			process.env.PI_SUBAGENT_MAX_DEPTH = savedMaxDepth;
+		} else {
+			delete process.env.PI_SUBAGENT_MAX_DEPTH;
+		}
+
+		removeTempDir(tempDir);
+	});
+
+	function makeExecutor(
+		config: ExtensionConfig = { superagents: { commands: { "sp-implement": { worktrees: { enabled: false } } } } },
+		agents: Array<{ name: string; description: string; sessionMode?: "standalone" | "lineage-only" | "fork" }> = [
+			{ name: "echo", description: "Echo test agent" },
+			{ name: "second", description: "Second test agent" },
+		],
+		discoverAgentsImpl?: (cwd: string) => {
+			agents: Array<{ name: string; description: string; sessionMode?: "standalone" | "lineage-only" | "fork" }>;
+		},
+	) {
+		return createSubagentExecutor!({
+			state: makeState(tempDir),
+			getConfig: () => config,
+			getSubagentSessionRoot: () => tempDir,
+			discoverAgents: discoverAgentsImpl ?? (() => ({ agents })),
+		});
+	}
+
+	/**
+	 * Create an executor that knows the bounded `sp-implementer` agent (so
+	 * `sessionMode` defaults to `lineage-only` like the built-in entrypoint).
+	 *
+	 * The agent is read from the real `discoverAgents` at construction time so
+	 * the test setup runs after the tempDir is initialized in beforeEach.
+	 */
+	function makeImplementerExecutor(config: ExtensionConfig = { superagents: { commands: { "sp-implement": { worktrees: { enabled: false } } } } }) {
+		const builtinAgents = discoverAgents ? discoverAgents(tempDir).agents : [];
+		return makeExecutor(config, builtinAgents, (cwd) => ({ agents: discoverAgents ? discoverAgents(cwd).agents : [] }));
+	}
+
+	function makeCtx(sessionManager: SessionManagerStub) {
+		return {
+			cwd: tempDir,
+			hasUI: false,
+			ui: {},
+			modelRegistry: { getAvailable: () => [] },
+			sessionManager,
+		};
+	}
+
+	void it("fails fast when sessionMode=fork and parent session is missing", async () => {
+		const { manager } = makeSessionManagerRecorder({ sessionFile: undefined, leafId: "leaf-current" });
+		const executor = makeExecutor();
+
+		const result = await executor.execute("id", { agent: "echo", task: "test", sessionMode: "fork" }, new AbortController().signal, undefined, makeCtx(manager));
+
+		// No isError field — verify the error message is present and no results returned.
+		assert.match(result.content[0]?.text ?? "", /persisted parent session/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("fails fast when sessionMode=fork and leaf is missing", async () => {
+		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: null });
+		const executor = makeExecutor();
+
+		const result = await executor.execute("id", { agent: "echo", task: "test", sessionMode: "fork" }, new AbortController().signal, undefined, makeCtx(manager));
+
+		// No isError field — verify the error message is present and no results returned.
+		assert.match(result.content[0]?.text ?? "", /current leaf/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("returns a tool error (instead of throwing) when branch creation fails", async () => {
+		const executor = makeExecutor();
+		const manager = {
+			getSessionFile: () => "/tmp/parent.jsonl",
+			getLeafId: () => "leaf-fail",
+			createBranchedSession: () => {
+				throw new Error("branch write failed");
+			},
+		};
+
+		const result = await executor.execute("id", { agent: "echo", task: "test", sessionMode: "fork" }, new AbortController().signal, undefined, makeCtx(manager));
+
+		// No isError field — verify the error message is present and no results returned.
+		assert.match(result.content[0]?.text ?? "", /Failed to create forked subagent session/);
+		assert.match(result.content[0]?.text ?? "", /branch write failed/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("creates one forked session for single mode", async () => {
+		const { manager, calls } = makeSessionManagerRecorder({
+			sessionFile: "/tmp/parent.jsonl",
+			leafId: "leaf-123",
+		});
+		const executor = makeExecutor();
+
+		const result = await executor.execute("id", { agent: "echo", task: "single task", sessionMode: "fork" }, new AbortController().signal, undefined, makeCtx(manager));
+
+		// Success path — one branched session must have been created.
+		assert.ok(result.content[0]?.text, "expected non-empty response content");
+		assert.equal(calls.length, 1);
+		assert.deepEqual(calls, ["leaf-123"]);
+	});
+
+	void it("treats sessionMode=standalone explicitly even when the agent default is lineage-only", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager, calls } = makeSessionManagerRecorder({
+			sessionFile: parentSessionFile,
+			leafId: "leaf-unused",
+		});
+		const executor = makeExecutor({ superagents: { commands: { "sp-implement": { worktrees: { enabled: false } } } } }, [
+			{ name: "echo", description: "Echo test agent", sessionMode: "lineage-only" },
+		]);
+
+		const result = await executor.execute("id", { agent: "echo", task: "single task", sessionMode: "standalone" }, new AbortController().signal, undefined, makeCtx(manager));
+
+		assert.ok(result.content[0]?.text, "expected non-empty response content");
+		assert.deepEqual(calls, []);
+		const sessionFiles = findChildSessionFiles(tempDir);
+		assert.deepEqual(sessionFiles, [], "expected no seeded child session files");
+		assert.equal(result.details?.sessionMode, "standalone");
+	});
+
+	void it("seeds a linked child session when a built-in bounded agent defaults to lineage-only", async () => {
+		assert.ok(discoverAgents, "expected agent discovery module to be available");
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager, calls } = makeSessionManagerRecorder({
+			sessionFile: parentSessionFile,
+			leafId: "leaf-unused",
+		});
+		const executor = makeExecutor({ superagents: { commands: { "sp-implement": { worktrees: { enabled: false } } } } }, [], (cwd) => discoverAgents!(cwd));
+
+		const result = await executor.execute("id", { agent: "sp-implementer", task: "Implement the selected task." }, new AbortController().signal, undefined, makeCtx(manager));
+
+		assert.ok(result.content[0]?.text, "expected non-empty response content");
+		assert.deepEqual(calls, []);
+		assert.equal(result.details?.sessionMode, "lineage-only");
+		assert.equal(result.details?.results?.[0]?.sessionMode, "lineage-only");
+		const sessionFiles = findChildSessionFiles(tempDir);
+		assert.equal(sessionFiles.length, 1, "expected one seeded session file");
+		assert.equal(readSessionHeader(sessionFiles[0]).parentSession, parentSessionFile);
+		assert.equal(fs.readFileSync(sessionFiles[0], "utf-8").trim().split("\n").length, 1);
+	});
+
+	void it("creates isolated forked sessions per parallel task", async () => {
+		const { manager, calls } = makeSessionManagerRecorder({
+			sessionFile: "/tmp/parent.jsonl",
+			leafId: "leaf-777",
+		});
+		const executor = makeExecutor();
+
+		const result = await executor.execute(
+			"id",
+			{
+				tasks: [
+					{ agent: "echo", task: "task one" },
+					{ agent: "second", task: "task two" },
+				],
+				sessionMode: "fork",
+			},
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		// Success path — one branched session per parallel task must have been created.
+		assert.ok(result.content[0]?.text, "expected non-empty response content");
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls, ["leaf-777", "leaf-777"]);
+	});
+
+	void it("rejects top-level parallel worktree runs with a conflicting task cwd", async () => {
+		const { manager } = makeSessionManagerRecorder({ sessionFile: "/tmp/parent.jsonl", leafId: "leaf-777" });
+		const executor = makeExecutor({
+			superagents: { commands: { "sp-implement": { worktrees: { enabled: true } } } },
+		});
+
+		const result = await executor.execute(
+			"id",
+			{
+				tasks: [
+					{ agent: "echo", task: "task one" },
+					{ agent: "second", task: "task two", cwd: `${tempDir}/other` },
+				],
+				worktree: true,
+			},
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		// No isError field — verify the error message is present and no results returned.
+		// Mixed pre-isolated declarations are now rejected by validatePreIsolatedTaskCwds
+		// before the legacy shared-cwd conflict check runs.
+		assert.match(result.content[0]?.text ?? "", /pre-isolated parallel tasks must all declare cwd/i);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("rejects parallel runs that exceed MAX_PARALLEL", async () => {
+		const executor = makeExecutor();
+		const tasks = [];
+		for (let i = 0; i < 10; i++) {
+			tasks.push({ agent: "echo", task: `task ${i}` });
+		}
+
+		const result = await executor.execute("id", { tasks }, new AbortController().signal, undefined, makeCtx(makeSessionManagerRecorder().manager));
+
+		// No isError field — verify the error message is present and no results returned.
+		assert.match(result.content[0]?.text ?? "", /Max 8 tasks/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("rejects top-level resumeSession when tasks are also provided", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-x" });
+		const executor = makeExecutor();
+
+		const result = await executor.execute(
+			"id",
+			{
+				tasks: [{ agent: "echo", task: "task one" }],
+				resumeSession: "/tmp/some-implementer-session.jsonl",
+			},
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.match(result.content[0]?.text ?? "", /top-level resumeSession is valid only for single-agent execution/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("rejects duplicate non-empty tasks[*].resumeSession values", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-x" });
+		const executor = makeExecutor();
+		const sharedResume = path.join(tempDir, "shared-resume.jsonl");
+
+		const result = await executor.execute(
+			"id",
+			{
+				tasks: [
+					{ agent: "echo", task: "task one", resumeSession: sharedResume },
+					{ agent: "second", task: "task two", resumeSession: sharedResume },
+				],
+			},
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.match(result.content[0]?.text ?? "", /resumeSession may appear only once per parallel request/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("continues a prior sp-implementer session for a single execution", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager, calls } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-x" });
+		const executor = makeImplementerExecutor();
+		const childSessionFile = path.join(tempDir, "prior-implementer.jsonl");
+		seedLineageOnlySessionFile({
+			parentSessionFile,
+			childSessionFile,
+			childCwd: tempDir,
+			agentName: "sp-implementer",
+		});
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "sp-implementer", task: "Continue prior implementation", resumeSession: childSessionFile },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.ok(result.content[0]?.text, "expected non-empty response content");
+		assert.equal(result.details?.sessionMode, "lineage-only");
+		// No branched sessions should be created for the resume flow.
+		assert.deepEqual(calls, []);
+		// Header must not be re-seeded.
+		assert.equal(fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").length, 1);
+	});
+
+	void it("rejects a resumeSession with a different parent session", async () => {
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-x" });
+		const executor = makeImplementerExecutor();
+		const childSessionFile = path.join(tempDir, "wrong-parent.jsonl");
+		seedLineageOnlySessionFile({
+			parentSessionFile: "/tmp/different-parent.jsonl",
+			childSessionFile,
+			childCwd: tempDir,
+			agentName: "sp-implementer",
+		});
+
+		const result = await executor.execute(
+			"id",
+			{ agent: "sp-implementer", task: "Continue prior implementation", resumeSession: childSessionFile },
+			new AbortController().signal,
+			undefined,
+			makeCtx(manager),
+		);
+
+		assert.match(result.content[0]?.text ?? "", /parent session does not match/);
+		assert.equal(result.details?.results?.length ?? 0, 0);
+	});
+
+	void it("rejects duplicate active use of a resumed session when two parallel single executions race", async () => {
+		// The executor's module-local active-session Set plus the upfront parallel
+		// duplicate check together cover every process-local concurrent use. This test
+		// confirms that at most one of two parallel single executions that both resume
+		// the same session can succeed.
+		const parentSessionFile = path.join(tempDir, "parent.jsonl");
+		fs.writeFileSync(parentSessionFile, '{"type":"session"}\n', "utf-8");
+		const { manager } = makeSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-x" });
+		const executor = makeImplementerExecutor();
+		const childSessionFile = path.join(tempDir, "race-resume.jsonl");
+		seedLineageOnlySessionFile({
+			parentSessionFile,
+			childSessionFile,
+			childCwd: tempDir,
+			agentName: "sp-implementer",
+		});
+
+		const [first, second] = await Promise.all([
+			executor.execute("id-a", { agent: "sp-implementer", task: "task A", resumeSession: childSessionFile }, new AbortController().signal, undefined, makeCtx(manager)),
+			executor.execute("id-b", { agent: "sp-implementer", task: "task B", resumeSession: childSessionFile }, new AbortController().signal, undefined, makeCtx(manager)),
+		]);
+
+		const messages = [first.content[0]?.text ?? "", second.content[0]?.text ?? ""];
+		const results = [first.details?.results?.[0], second.details?.results?.[0]];
+		const successCount = results.filter((r) => r && r.exitCode === 0).length;
+		assert.ok(successCount <= 1, `expected at most one successful child, got ${successCount}: ${messages.join(" | ")}`);
+	});
+});
