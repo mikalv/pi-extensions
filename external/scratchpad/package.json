@@ -1,0 +1,61 @@
+{
+  "name": "@nikiforovall/scratchpad",
+  "version": "0.21.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "CLI-first tool to organize agent knowledge into scratchpads (folder + manifest), with a read-only visual viewer.",
+  "keywords": [
+    "cli",
+    "scratchpad",
+    "notes",
+    "agent",
+    "ai",
+    "knowledge",
+    "markdown",
+    "viewer",
+    "bun"
+  ],
+  "homepage": "https://github.com/nikiforovall/scratchpad#readme",
+  "bugs": {
+    "url": "https://github.com/nikiforovall/scratchpad/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikiforovall/scratchpad.git"
+  },
+  "license": "MIT",
+  "author": "Oleksii Nikiforov <alexey.nikiforovall@gmail.com>",
+  "type": "module",
+  "bin": {
+    "scratch": "./src/cli.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "scratch": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "vendor": "bun scripts/fetch-vendor.ts",
+    "build": "bun scripts/fetch-vendor.ts && bun build src/cli.ts --compile --outfile dist/scratch && bun scripts/build-host.ts",
+    "prepublishOnly": "bun test",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {
+    "glimpseui": "0.8.1"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^20.10.2",
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3",
+    "vitepress": "^1.6.3"
+  }
+}

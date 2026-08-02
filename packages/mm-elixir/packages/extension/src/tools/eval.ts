@@ -1,0 +1,254 @@
+import * as fs from 'node:fs'
+import * as path from 'node:path'
+
+import { flags } from '#src/flags.ts'
+import {
+  bridgeTool,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  DEFAULT_MAX_BYTES,
+  displaySingleLine,
+  truncated
+} from '#src/helpers.ts'
+import type { ToolArgs } from '#src/protocol/types.ts'
+import { renderElixirResult } from '#src/renderers.ts'
+import type { ExtensionAPI, ExtensionContext, Theme } from '@earendil-works/pi-coding-agent'
+import { Text } from '@earendil-works/pi-tui'
+import { Type } from 'typebox'
+
+interface EvalPayload {
+  kind?: string
+  io?: string
+  result?: string | null
+  error?: string
+  text?: string
+  parts?: Array<{
+    kind?: string
+    body?: string
+    language?: string | null
+    title?: string | null
+    data?: Record<string, unknown> | null
+  }>
+}
+
+interface SessionEntryLike {
+  id?: string
+  parentId?: string | null
+  message?: { toolCallId?: string }
+}
+
+interface SessionManagerLike {
+  getSessionFile?: () => string | undefined
+  getLeafId?: () => string | null
+  getEntry?: (id: string) => SessionEntryLike | undefined
+  getBranch?: (fromId?: string) => SessionEntryLike[]
+}
+
+function parseEvalPayload(text: string): EvalPayload | null {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return typeof parsed === 'object' && parsed !== null ? (parsed as EvalPayload) : null
+  } catch {
+    return null
+  }
+}
+
+function truncateOutputPart(part: NonNullable<EvalPayload['parts']>[number]) {
+  return typeof part.body === 'string' ? { ...part, body: truncated(part.body) } : part
+}
+
+function truncateEvalPayload(payload: EvalPayload): EvalPayload {
+  return {
+    ...payload,
+    ...(typeof payload.io === 'string' ? { io: truncated(payload.io) } : {}),
+    ...(typeof payload.result === 'string' ? { result: truncated(payload.result) } : {}),
+    ...(typeof payload.error === 'string' ? { error: truncated(payload.error) } : {}),
+    ...(typeof payload.text === 'string' ? { text: truncated(payload.text) } : {}),
+    ...(payload.parts ? { parts: payload.parts.map(truncateOutputPart) } : {})
+  }
+}
+
+function evalDetails(text: string) {
+  const payload = parseEvalPayload(text)
+  return payload?.kind === 'eval' ? { eval: truncateEvalPayload(payload) } : {}
+}
+
+function evalIsError(text: string) {
+  const payload = parseEvalPayload(text)
+  return payload?.kind === 'eval' && typeof payload.error === 'string' && payload.error.length > 0
+}
+
+function evalText(text: string) {
+  const payload = parseEvalPayload(text)
+  return payload?.kind === 'eval' && typeof payload.text === 'string' ? payload.text : text
+}
+
+function optionSuffix(args: ToolArgs, theme: Theme) {
+  const parts: string[] = []
+  if (args.mode === 'sandbox') parts.push(theme.fg('warning', 'sandbox'))
+  if (typeof args.target === 'string' && args.target !== 'project') {
+    parts.push(theme.fg('muted', args.target))
+  }
+  if (typeof args.timeout === 'number') parts.push(theme.fg('muted', `${args.timeout}ms`))
+  return parts.length > 0
+    ? theme.fg('muted', ' (') + parts.join(theme.fg('muted', ', ')) + theme.fg('muted', ')')
+    : ''
+}
+
+function safeFileName(value: string) {
+  return value.replace(/[^A-Za-z0-9_.-]/gu, '_')
+}
+
+function stateRoot(sessionFile: string) {
+  return path.join(`${sessionFile}.pi-elixir`, 'eval-state')
+}
+
+function statePathFor(root: string, nodeId: string) {
+  return path.join(root, `${safeFileName(nodeId)}.term`)
+}
+
+function candidateStateIds(entry: SessionEntryLike) {
+  return [entry.message?.toolCallId, entry.id].filter((id): id is string => typeof id === 'string')
+}
+
+function nearestRestorePath(manager: SessionManagerLike, root: string, leafId: string) {
+  const branch = manager.getBranch?.(leafId)
+  if (branch && branch.length > 0) {
+    for (const entry of branch.toReversed()) {
+      for (const stateId of candidateStateIds(entry)) {
+        const candidate = statePathFor(root, stateId)
+        if (fs.existsSync(candidate)) return candidate
+      }
+    }
+  }
+
+  let current: string | null | undefined = leafId
+  const seen = new Set<string>()
+
+  while (current && !seen.has(current)) {
+    seen.add(current)
+    const entry: SessionEntryLike | undefined = manager.getEntry?.(current)
+    if (entry) {
+      for (const stateId of candidateStateIds(entry)) {
+        const candidate = statePathFor(root, stateId)
+        if (fs.existsSync(candidate)) return candidate
+      }
+    }
+    current = entry?.parentId
+  }
+
+  return undefined
+}
+
+function prepareEvalParams(
+  params: ToolArgs,
+  ctx: ExtensionContext,
+  beamCwd: string,
+  toolCallId: string
+): ToolArgs {
+  if (params.mode === 'sandbox' || !flags.statefulEval()) return params
+
+  const manager = ctx.sessionManager as SessionManagerLike | undefined
+  if (!manager) return { ...params, sessionId: `ephemeral:${beamCwd}` }
+
+  const sessionFile = manager.getSessionFile?.()
+  const leafId = manager.getLeafId?.()
+  if (!sessionFile || !leafId) return { ...params, sessionId: `ephemeral:${beamCwd}` }
+
+  if (!flags.evalSidecar()) return { ...params, sessionId: `memory:${sessionFile}` }
+
+  const root = stateRoot(sessionFile)
+  const statePath = statePathFor(root, toolCallId)
+  const restorePath = nearestRestorePath(manager, root, leafId)
+
+  return {
+    ...params,
+    sessionId: toolCallId,
+    statePath,
+    ...(restorePath ? { restorePath } : {})
+  }
+}
+
+function evalPreview(code: unknown) {
+  const preview = displaySingleLine(code)
+  if (!flags.compactEvalPreview() || preview.length <= 96) return preview
+  return `${preview.slice(0, 95)}…`
+}
+
+interface EvalRenderContext {
+  executionStarted?: boolean
+  state?: { startedAt?: number; endedAt?: number }
+}
+
+function evalRenderContext(context: unknown): EvalRenderContext | undefined {
+  return typeof context === 'object' && context !== null
+    ? (context as EvalRenderContext)
+    : undefined
+}
+
+function renderEvalCall(toolName: string) {
+  return (args: ToolArgs, theme: Theme, context?: unknown) => {
+    const ctx = evalRenderContext(context)
+    if (ctx?.executionStarted && ctx.state && ctx.state.startedAt === undefined) {
+      ctx.state.startedAt = Date.now()
+      ctx.state.endedAt = undefined
+    }
+
+    const code = evalPreview(args.code)
+    return new Text(
+      theme.fg('toolTitle', theme.bold(`${toolName} `)) +
+        theme.fg('accent', code) +
+        optionSuffix(args, theme),
+      0,
+      0
+    )
+  }
+}
+
+export function register(pi: ExtensionAPI) {
+  bridgeTool(
+    pi,
+    'elixir_eval',
+    'project_eval_structured',
+    'iex',
+    `Evaluate Elixir in a persistent target VM. Prefer this over shell for project APIs, runtime state, dependencies, docs, processes, and typed data pipelines.
+
+Targets: "project" loads code/deps without application startup (default); "application" starts the managed app; "runtime" attaches to PI_ELIXIR_NODE; "bridge" provides pi-elixir helpers (AST, CodeMap, Self, Q, Docs). Use "sandbox" for untrusted snippets. Use the AST tools—not eval or text replacement—for structural source search/refactors.
+
+Output truncated to ${DEFAULT_MAX_LINES} lines / ${formatSize(DEFAULT_MAX_BYTES)}.`,
+    Type.Object({
+      code: Type.String({ description: 'Elixir code to evaluate' }),
+      mode: Type.Optional(
+        Type.Union([Type.Literal('trusted'), Type.Literal('sandbox')], {
+          description:
+            'Eval mode: trusted project introspection (default) or sandbox for untrusted code'
+        })
+      ),
+      target: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal('project'),
+            Type.Literal('application'),
+            Type.Literal('bridge'),
+            Type.Literal('runtime')
+          ],
+          {
+            description:
+              'Eval target: persistent project VM (default), managed application VM, isolated bridge helpers, or explicitly attached runtime node'
+          }
+        )
+      ),
+      timeout: Type.Optional(
+        Type.Integer({ description: 'Timeout in ms (default: 30000 trusted, 5000 sandbox)' })
+      )
+    }),
+    renderEvalCall('iex'),
+    {
+      transformResult: evalText,
+      isErrorResult: evalIsError,
+      prepareParams: prepareEvalParams,
+      resultDetails: evalDetails,
+      renderResult: renderElixirResult
+    }
+  )
+}

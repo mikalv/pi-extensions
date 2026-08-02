@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# offline vendor cache (populated by scripts/fetch-vendor.ts, baked into --offline exports)
+src/ui/vendor/
+
+# vitepress
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# logs
+*.log
+
+# editor / tooling local state
+.claude/
+.playwright-cli/
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# scratch / throwaway
+_ui-check.mjs
+*.tmp
+*.bun-build
+
+# exported viewer HTML (scratch export)
+*.html
+# …except the demo export bundled into the docs site
+!docs/public/**/*.html
+!docs/public/*.html

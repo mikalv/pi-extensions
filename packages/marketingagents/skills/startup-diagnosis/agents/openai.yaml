@@ -1,0 +1,4 @@
+interface:
+  display_name: "Startup Diagnosis"
+  short_description: "Find the highest-leverage marketing bottleneck"
+  default_prompt: "Diagnose this startup marketing system and recommend the next action."

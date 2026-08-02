@@ -1,0 +1,34 @@
+{
+  "name": "@kb/engine",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@kb/core": "workspace:*",
+    "@mariozechner/pi-ai": "^0.62.0",
+    "@mariozechner/pi-coding-agent": "^0.62.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  },
+  "private": true
+}

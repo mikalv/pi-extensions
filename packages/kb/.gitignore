@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# hai runtime (local board state — don't commit)
+.kb/
+.hai/
+.worktrees/
+
+# Pi
+.pi/

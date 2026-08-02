@@ -1,0 +1,289 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+import { patchPiAgentCoreSource } from "./lib/pi-agent-core-patch.mjs";
+import { PI_SUBAGENTS_PATCH_TARGETS, patchPiSubagentsSource, stripPiSubagentBuiltinModelSource } from "./lib/pi-subagents-patch.mjs";
+
+const appRoot = resolve(import.meta.dirname, "..");
+const settingsPath = resolve(appRoot, ".marketingagents", "settings.json");
+const packageJsonPath = resolve(appRoot, "package.json");
+const packageLockPath = resolve(appRoot, "package-lock.json");
+const marketingagentsDir = resolve(appRoot, ".marketingagents");
+const workspaceDir = resolve(appRoot, ".marketingagents", "npm");
+const workspaceNodeModulesDir = resolve(workspaceDir, "node_modules");
+const manifestPath = resolve(workspaceDir, ".runtime-manifest.json");
+const workspacePackageJsonPath = resolve(workspaceDir, "package.json");
+const workspaceArchivePath = resolve(marketingagentsDir, "runtime-workspace.tgz");
+const PRUNE_VERSION = 4;
+const PINNED_RUNTIME_PACKAGES = [
+	"@mariozechner/pi-agent-core",
+	"@mariozechner/pi-ai",
+	"@mariozechner/pi-coding-agent",
+	"@mariozechner/pi-tui",
+];
+
+function readPackageSpecs() {
+	const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+	const packageSpecs = Array.isArray(settings.packages)
+		? settings.packages
+			.filter((value) => typeof value === "string" && value.startsWith("npm:"))
+			.map((value) => value.slice(4))
+		: [];
+
+	for (const packageName of PINNED_RUNTIME_PACKAGES) {
+		const version = readLockedPackageVersion(packageName);
+		if (version) {
+			packageSpecs.push(`${packageName}@${version}`);
+		}
+	}
+
+	return Array.from(new Set(packageSpecs));
+}
+
+function parsePackageName(spec) {
+	const match = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@.+)?$/);
+	return match?.[1] ?? spec;
+}
+
+function readLockedPackageVersion(packageName) {
+	if (!existsSync(packageLockPath)) {
+		return undefined;
+	}
+	try {
+		const lockfile = JSON.parse(readFileSync(packageLockPath, "utf8"));
+		const entry = lockfile.packages?.[`node_modules/${packageName}`];
+		return typeof entry?.version === "string" ? entry.version : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function arraysMatch(left, right) {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function hashFile(path) {
+	if (!existsSync(path)) {
+		return null;
+	}
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function getRuntimeInputHash() {
+	const hash = createHash("sha256");
+	for (const path of [
+		packageJsonPath,
+		packageLockPath,
+		settingsPath,
+		resolve(appRoot, "scripts", "lib", "pi-agent-core-patch.mjs"),
+		resolve(appRoot, "scripts", "lib", "pi-subagents-patch.mjs"),
+	]) {
+		hash.update(path);
+		hash.update("\0");
+		hash.update(hashFile(path) ?? "missing");
+		hash.update("\0");
+	}
+	return hash.digest("hex");
+}
+
+function workspaceIsCurrent(packageSpecs) {
+	if (!existsSync(manifestPath) || !existsSync(workspaceNodeModulesDir)) {
+		return false;
+	}
+
+	try {
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+		if (!Array.isArray(manifest.packageSpecs) || !arraysMatch(manifest.packageSpecs, packageSpecs)) {
+			return false;
+		}
+		if (manifest.runtimeInputHash !== getRuntimeInputHash()) {
+			return false;
+		}
+		if (
+			manifest.nodeAbi !== process.versions.modules ||
+			manifest.platform !== process.platform ||
+			manifest.arch !== process.arch ||
+			manifest.pruneVersion !== PRUNE_VERSION
+		) {
+			return false;
+		}
+
+		return packageSpecs.every((spec) => existsSync(resolve(workspaceNodeModulesDir, parsePackageName(spec))));
+	} catch {
+		return false;
+	}
+}
+
+function writeWorkspacePackageJson() {
+	writeFileSync(
+		workspacePackageJsonPath,
+		JSON.stringify(
+			{
+				name: "marketingagents-runtime",
+				private: true,
+			},
+			null,
+			2,
+		) + "\n",
+		"utf8",
+	);
+}
+
+function childNpmInstallEnv() {
+	return {
+		...process.env,
+		// `npm pack --dry-run` exports dry-run config to lifecycle scripts. The
+		// vendored runtime workspace must still install real node_modules so the
+		// publish artifact can be validated without poisoning the archive.
+		npm_config_dry_run: "false",
+		NPM_CONFIG_DRY_RUN: "false",
+	};
+}
+
+function prepareWorkspace(packageSpecs) {
+	rmSync(workspaceDir, { recursive: true, force: true });
+	mkdirSync(workspaceDir, { recursive: true });
+	writeWorkspacePackageJson();
+
+	if (packageSpecs.length === 0) {
+		return;
+	}
+
+	const result = spawnSync(
+		process.env.npm_execpath ? process.execPath : "npm",
+		process.env.npm_execpath
+			? [process.env.npm_execpath, "install", "--prefer-online", "--no-audit", "--no-fund", "--no-dry-run", "--legacy-peer-deps", "--loglevel", "error", "--prefix", workspaceDir, ...packageSpecs]
+			: ["install", "--prefer-online", "--no-audit", "--no-fund", "--no-dry-run", "--legacy-peer-deps", "--loglevel", "error", "--prefix", workspaceDir, ...packageSpecs],
+		{ stdio: "inherit", env: childNpmInstallEnv() },
+	);
+	if (result.status !== 0) {
+		process.exit(result.status ?? 1);
+	}
+}
+
+function writeManifest(packageSpecs) {
+	writeFileSync(
+		manifestPath,
+		JSON.stringify(
+			{
+				packageSpecs,
+				runtimeInputHash: getRuntimeInputHash(),
+				generatedAt: new Date().toISOString(),
+				nodeAbi: process.versions.modules,
+				nodeVersion: process.version,
+				platform: process.platform,
+				arch: process.arch,
+				pruneVersion: PRUNE_VERSION,
+			},
+			null,
+			2,
+		) + "\n",
+		"utf8",
+	);
+}
+
+function pruneWorkspace() {
+	const result = spawnSync(process.execPath, [resolve(appRoot, "scripts", "prune-runtime-deps.mjs"), workspaceDir], {
+		stdio: "inherit",
+	});
+	if (result.status !== 0) {
+		process.exit(result.status ?? 1);
+	}
+}
+
+function patchBundledPiSubagents() {
+	const piSubagentsRoot = resolve(workspaceNodeModulesDir, "pi-subagents");
+	if (!existsSync(piSubagentsRoot)) {
+		return false;
+	}
+
+	let changed = false;
+	for (const relativePath of PI_SUBAGENTS_PATCH_TARGETS) {
+		const entryPath = resolve(piSubagentsRoot, relativePath);
+		if (!existsSync(entryPath)) continue;
+
+		const source = readFileSync(entryPath, "utf8");
+		const patched = patchPiSubagentsSource(relativePath, source);
+		if (patched === source) continue;
+		writeFileSync(entryPath, patched, "utf8");
+		changed = true;
+	}
+
+	const agentsRoot = resolve(piSubagentsRoot, "agents");
+	if (!existsSync(agentsRoot)) {
+		return changed;
+	}
+
+	for (const entry of readdirSync(agentsRoot, { withFileTypes: true })) {
+		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+		const entryPath = resolve(agentsRoot, entry.name);
+		const source = readFileSync(entryPath, "utf8");
+		const patched = stripPiSubagentBuiltinModelSource(source);
+		if (patched === source) continue;
+		writeFileSync(entryPath, patched, "utf8");
+		changed = true;
+	}
+	return changed;
+}
+
+function patchBundledPiAgentCore() {
+	const agentLoopPath = resolve(workspaceNodeModulesDir, "@mariozechner", "pi-agent-core", "dist", "agent-loop.js");
+	if (!existsSync(agentLoopPath)) {
+		return false;
+	}
+
+	const source = readFileSync(agentLoopPath, "utf8");
+	const patched = patchPiAgentCoreSource(source);
+	if (patched === source) {
+		return false;
+	}
+	writeFileSync(agentLoopPath, patched, "utf8");
+	return true;
+}
+
+function archiveIsCurrent() {
+	if (!existsSync(workspaceArchivePath) || !existsSync(manifestPath)) {
+		return false;
+	}
+
+	return statSync(workspaceArchivePath).mtimeMs >= statSync(manifestPath).mtimeMs;
+}
+
+function createWorkspaceArchive() {
+	rmSync(workspaceArchivePath, { force: true });
+
+	const result = spawnSync("tar", ["-czf", workspaceArchivePath, "-C", marketingagentsDir, "npm"], {
+		stdio: "inherit",
+	});
+	if (result.status !== 0) {
+		process.exit(result.status ?? 1);
+	}
+}
+
+const packageSpecs = readPackageSpecs();
+
+if (workspaceIsCurrent(packageSpecs)) {
+	console.log("[marketingagents] vendored runtime workspace already up to date");
+	if (patchBundledPiAgentCore() || patchBundledPiSubagents()) {
+		writeManifest(packageSpecs);
+		console.log("[marketingagents] patched bundled Pi runtime");
+	}
+	if (archiveIsCurrent()) {
+		process.exit(0);
+	}
+	console.log("[marketingagents] refreshing runtime workspace archive...");
+	createWorkspaceArchive();
+	console.log("[marketingagents] runtime workspace archive ready");
+	process.exit(0);
+}
+
+console.log("[marketingagents] preparing vendored runtime workspace...");
+prepareWorkspace(packageSpecs);
+pruneWorkspace();
+patchBundledPiAgentCore();
+patchBundledPiSubagents();
+writeManifest(packageSpecs);
+createWorkspaceArchive();
+console.log("[marketingagents] vendored runtime workspace ready");

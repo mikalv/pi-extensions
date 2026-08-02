@@ -1,0 +1,219 @@
+defmodule Pi.Bridge.Info do
+  @moduledoc "Startup inventory for pi_bridge sessions."
+
+  alias Pi.Plugin.Manager
+  alias Pi.Protocol.API.Extension
+  alias Pi.Protocol.API.Function
+  alias Pi.Protocol.API.Inventory
+  alias Pi.Protocol.API.Module, as: APIModule
+  alias Pi.Protocol.BridgeInfo
+  alias Pi.Protocol.PluginCommand
+  alias Pi.Protocol.PluginInfo
+  alias Pi.Protocol.SkillInfo
+  alias Pi.Skill.Loader
+
+  @protocol_version 2
+  @capabilities [
+    :stdio_jsonl,
+    :bridge_requests,
+    :project_eval_worker,
+    :application_eval_worker,
+    :attached_runtime_eval,
+    :structured_diagnostics,
+    :project_context
+  ]
+
+  @runtime_api_modules [
+    agent: Pi.Agent,
+    llm: Pi.LLM,
+    host: Pi.Host,
+    bridge_info: __MODULE__,
+    dev: Pi.Dev,
+    docs: Pi.Docs,
+    ast: Pi.AST,
+    web: Pi.Web,
+    plugin_ui: Pi.Plugin.UI,
+    plugin_events: Pi.Plugin.Event,
+    session: Pi.Session,
+    eval_sandbox: Pi.Eval.Sandbox
+  ]
+
+  def snapshot(transport \\ :stdio) do
+    version = bridge_version()
+
+    %BridgeInfo{
+      project: project_app(),
+      version: version,
+      build: "pi_bridge@#{version}/protocol-#{@protocol_version}",
+      protocol: @protocol_version,
+      transport: transport,
+      capabilities: @capabilities,
+      skills: skills(),
+      plugins: plugins(),
+      commands: commands(),
+      apis: %Inventory{
+        runtime: runtime_apis(),
+        extensions: extension_apis()
+      }
+    }
+  end
+
+  def runtime_apis do
+    @runtime_api_modules
+    |> Enum.reject(&runtime_api_disabled?/1)
+    |> Enum.map(fn {name, module} ->
+      %APIModule{name: name, module: module, functions: runtime_functions(module)}
+    end)
+  end
+
+  def apis, do: extension_apis()
+
+  def extension_apis do
+    (plugin_apis() ++ skill_apis())
+    |> Enum.map(&Extension.from_api/1)
+    |> Enum.uniq_by(&{&1.alias, &1.module})
+  end
+
+  def aliases_code do
+    builtin_aliases = [
+      "import Ecto.Query",
+      "use QuackDB.Ecto",
+      "alias Pi.Dev, as: Dev, warn: false",
+      "alias Pi.Docs, as: Docs, warn: false",
+      "alias Pi.AST, as: AST, warn: false",
+      "alias Pi.Web, as: Web, warn: false",
+      "alias Pi.Host, as: Host, warn: false",
+      "alias Pi.Self, as: Self, warn: false",
+      "alias Pi.CodeMap, as: CodeMap, warn: false",
+      "alias Pi.Quack, as: Q, warn: false",
+      "require Q",
+      "alias Pi.Quack.Event, as: E, warn: false",
+      "alias Pi.Quack.SessionFile, as: SF, warn: false"
+    ]
+
+    extension_aliases =
+      extension_apis()
+      |> Enum.filter(& &1.alias)
+      |> Enum.map(fn api -> "alias #{inspect(api.module)}, as: #{api.alias}" end)
+
+    Enum.join(builtin_aliases ++ extension_aliases, "\n")
+  end
+
+  defp runtime_api_disabled?({name, _module}) when name in [:agent, :session],
+    do: not Pi.Features.sessions?()
+
+  defp runtime_api_disabled?({:llm, _module}), do: not Pi.Features.llm?()
+
+  defp runtime_api_disabled?({name, _module}) when name in [:plugin_ui, :plugin_events],
+    do: not Pi.Features.plugins?()
+
+  defp runtime_api_disabled?(_api), do: false
+
+  defp bridge_version do
+    :pi_bridge
+    |> Application.spec(:vsn)
+    |> to_string()
+  end
+
+  defp project_app do
+    cwd = System.get_env("PI_ELIXIR_PROJECT_CWD")
+
+    mix_exs = if is_binary(cwd), do: Path.join(cwd, "mix.exs")
+
+    with path when is_binary(path) <- mix_exs,
+         true <- File.exists?(path),
+         {:ok, source} <- File.read(path),
+         app when is_atom(app) <- app_from_mix_exs_ast(source) do
+      app
+    else
+      _ -> Mix.Project.config()[:app]
+    end
+  end
+
+  defp app_from_mix_exs_ast(source) do
+    with {:ok, ast} <- Code.string_to_quoted(source) do
+      {_ast, app} =
+        Macro.prewalk(ast, nil, fn
+          {:def, _meta, [{:project, _, args}, [do: body]]} = node, nil
+          when args in [[], nil] ->
+            {node, app_from_project_body(body)}
+
+          node, app ->
+            {node, app}
+        end)
+
+      app
+    end
+  end
+
+  defp app_from_project_body(body) do
+    body
+    |> List.wrap()
+    |> Enum.find_value(&app_from_keyword_ast/1)
+  end
+
+  defp app_from_keyword_ast({key, value}) when key in [:app, :otp_app] and is_atom(value),
+    do: value
+
+  defp app_from_keyword_ast(list) when is_list(list) do
+    Enum.find_value(list, &app_from_keyword_ast/1)
+  end
+
+  defp app_from_keyword_ast({:__block__, _meta, expressions}) do
+    Enum.find_value(expressions, &app_from_keyword_ast/1)
+  end
+
+  defp app_from_keyword_ast(_other), do: nil
+
+  defp runtime_functions(module) do
+    module.__info__(:functions)
+    |> Enum.reject(fn {name, _arity} -> name in [:module_info, :__info__] end)
+    |> Enum.map(fn {name, arity} -> %Function{name: name, arity: arity} end)
+  end
+
+  defp skills do
+    if Pi.Features.skills?() do
+      Loader.serializable()
+      |> Enum.map(&normalize_skill/1)
+    else
+      []
+    end
+  end
+
+  defp plugins do
+    if Pi.Features.plugins?() do
+      Manager.plugins()
+      |> Enum.map(&normalize_plugin/1)
+    else
+      []
+    end
+  end
+
+  defp commands do
+    if Pi.Features.plugins?() do
+      Manager.commands()
+      |> Enum.map(&PluginCommand.from_command/1)
+    else
+      []
+    end
+  end
+
+  defp normalize_skill(%SkillInfo{} = skill), do: skill
+  defp normalize_skill(%{} = skill), do: SkillInfo.from_map!(skill)
+
+  defp normalize_plugin(%PluginInfo{} = plugin), do: plugin
+  defp normalize_plugin(%{} = plugin), do: PluginInfo.from_map!(plugin)
+
+  defp plugin_apis do
+    if Pi.Features.plugins?(), do: Manager.apis(), else: []
+  end
+
+  defp skill_apis do
+    if Pi.Features.skills?() do
+      Loader.discover()
+      |> Enum.flat_map(& &1.apis)
+    else
+      []
+    end
+  end
+end

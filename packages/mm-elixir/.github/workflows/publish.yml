@@ -1,0 +1,76 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.5.3
+          run_install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 25.x
+          registry-url: https://registry.npmjs.org/
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.0-otp-28"
+          otp-version: "28"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Hex
+        run: mix local.hex --force
+
+      - name: Install Elixir deps
+        run: mix deps.get
+        working-directory: packages/bridge
+
+      - name: Strict checks
+        run: pnpm run check
+
+      - name: Publish pi_bridge to Hex
+        run: mix hex.publish package --yes
+        working-directory: packages/bridge
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish pi_bridge docs to HexDocs
+        run: mix hex.publish docs --yes
+        working-directory: packages/bridge
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish to npm with token
+        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
+        run: pnpm publish --access public --provenance --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm with trusted publishing
+        if: ${{ env.HAS_NPM_TOKEN != 'true' }}
+        run: pnpm publish --access public --provenance --no-git-checks
+
+      - name: Create GitHub Release
+        run: |
+          node scripts/release-notes.ts /tmp/pi-elixir-release-notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file /tmp/pi-elixir-release-notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,44 @@
+{
+  "name": "@meeh/pi-prism",
+  "version": "0.1.0",
+  "description": "Pi tools for Prism — hybrid full-text, vector, and graph search.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prism",
+    "search",
+    "vector",
+    "graph",
+    "rag"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.20.5",
+    "typebox": "^1.3.9",
+    "typescript": "^7.0.2"
+  }
+}

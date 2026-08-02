@@ -1,0 +1,53 @@
+{
+  "name": "@meeh/mm-observational-memory",
+  "version": "0.1.0",
+  "description": "Observational memory (STM) for Pi — observe/reflect/drop with promote into wiki + Prism LTM.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mikal Villa",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikalv/pi-extensions",
+    "directory": "packages/mm-observational-memory"
+  },
+  "homepage": "https://github.com/mikalv/pi-extensions/tree/main/packages/mm-observational-memory",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "observational-memory",
+    "memory",
+    "compaction",
+    "stm"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src/",
+    "docs/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.83.0",
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
+    "@types/node": "^26.1.2",
+    "typebox": "^1.3.9",
+    "typescript": "^7.0.2",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "provider-retry-proxy",
+  "version": "1.3.0",
+  "description": "OMP/Pi extension: configurable HTTP retry proxy for LLM providers with triangular backoff, infinite retry, and per-provider overrides",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "retry-proxy.example.jsonc"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "dev": "bun run src/index.ts"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "keywords": [
+    "omp",
+    "pi",
+    "omp-plugin",
+    "pi-package",
+    "pi-extension",
+    "retry",
+    "proxy",
+    "backoff",
+    "503",
+    "provider"
+  ],
+  "license": "MIT",
+  "author": "liujiangnan",
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
+  }
+}

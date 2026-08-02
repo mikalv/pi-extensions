@@ -1,0 +1,92 @@
+name: Publish Package to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.1). Defaults to v + package.json version on the selected ref."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # For tag pushes this is the tag commit; for manual runs use the chosen ref.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck and build
+        run: npm run check
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+      - name: Resolve release version
+        id: version
+        run: |
+          set -euo pipefail
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.tag }}"
+            if [ -z "$RAW" ]; then
+              TAG="v${PKG}"
+            else
+              TAG="${RAW#v}"
+              TAG="v${TAG}"
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          EXPECTED="${TAG#v}"
+          if [ "$EXPECTED" != "$PKG" ]; then
+            echo "Tag ${TAG} does not match package.json version ${PKG}"
+            exit 1
+          fi
+          # Skip if this version is already on npm
+          if npm view "@rahularya01/pi-lazy@${PKG}" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${PKG} is already on npm — nothing to do"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${PKG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Publishing candidate @rahularya01/pi-lazy@${PKG} (${TAG})"
+
+      - name: Publish to npm
+        if: steps.version.outputs.already_published != 'true'
+        run: |
+          set -o pipefail
+          LOG="$(mktemp)"
+          if npm publish --access public --provenance 2>&1 | tee "$LOG"; then
+            exit 0
+          fi
+          if grep -q 'TLOG_CREATE_ENTRY_ERROR' "$LOG" && grep -q 'equivalent entry already exists' "$LOG"; then
+            echo "npm provenance transparency-log entry already exists; retrying without provenance"
+            npm publish --access public
+            exit 0
+          fi
+          exit 1
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

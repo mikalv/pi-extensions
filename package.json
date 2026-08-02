@@ -1,0 +1,71 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.61",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package"
+  ],
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "^0.42.0",
+    "@toon-format/toon": "^2.3.1",
+    "croner": "10.0.1",
+    "dedent": "^1.7.2"
+  },
+  "pi": {
+    "extensions": [
+      "./packages/agent-guidance/agent-guidance.ts",
+      "./packages/agent-loop-reflection/extensions",
+      "./packages/amphetamine/src/index.ts",
+      "./packages/amux/pi/index.ts",
+      "./packages/ask-user-question/index.ts",
+      "./packages/auto-naming-session/extensions",
+      "./packages/auto-retry/src/index.ts",
+      "./packages/claude-spinner/index.ts",
+      "./packages/clipboard/index.ts",
+      "./packages/code-actions/index.ts",
+      "./packages/context-control/extensions/index.ts",
+      "./packages/execute-python/extensions",
+      "./packages/execution-time.ts",
+      "./packages/files-widget/index.ts",
+      "./packages/gemini-search.ts",
+      "./packages/macos-notify.ts",
+      "./packages/marketingagents/extensions",
+      "./packages/mm-adhd/src/index.ts",
+      "./packages/mm-btw/src/index.ts",
+      "./packages/mm-elixir/packages/extension/src/index.ts",
+      "./packages/mm-lazy/dist/index.js",
+      "./packages/mm-memory/src/index.ts",
+      "./packages/mm-observational-memory/src/index.ts",
+      "./packages/mm-wiki/src/index.ts",
+      "./packages/mm-qq/extensions",
+      "./packages/mm-usage-center/index.ts",
+      "./packages/nmem/extensions",
+      "./packages/notify/extensions/index.ts",
+      "./packages/pi-prism/src/index.ts",
+      "./packages/powerline-footer/index.ts",
+      "./packages/provider-retry-proxy/dist/index.js",
+      "./packages/prune-context/extensions",
+      "./packages/raw-paste/index.ts",
+      "./packages/scheduler/index.ts",
+      "./packages/session-recap/index.ts",
+      "./packages/skills-injection/extensions",
+      "./packages/system-prompt.ts",
+      "./packages/tab-status/tab-status.ts",
+      "./packages/todos/index.ts",
+      "./packages/token-rate/index.ts",
+      "./packages/usage-extension/index.ts"
+    ],
+    "skills": [
+      "./packages/marketingagents/skills",
+      "./packages/mm-elixir/packages/extension/skills",
+      "./packages/mm-wiki/skills"
+    ],
+    "peerDependencies": {},
+    "devDependencies": {},
+    "themes": [
+      "./packages/dracula-themes/themes",
+      "./packages/nightfox-themes/themes"
+    ]
+  }
+}

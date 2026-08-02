@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.5.3
+          run_install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 25.x
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.0-otp-28"
+          otp-version: "28"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            packages/bridge/deps
+            packages/bridge/_build
+          key: beam-${{ runner.os }}-${{ hashFiles('packages/bridge/mix.lock') }}
+          restore-keys: beam-${{ runner.os }}-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Hex
+        run: mix local.hex --force
+
+      - name: Install Elixir deps
+        run: mix deps.get
+        working-directory: packages/bridge
+
+      - name: Strict checks
+        run: pnpm run check

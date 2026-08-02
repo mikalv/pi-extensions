@@ -1,0 +1,240 @@
+defmodule Pi.AgentTest do
+  use ExUnit.Case, async: false
+
+  alias Pi.Agent
+  alias Pi.Agent.Run
+  alias Pi.LLM.Broker
+  alias Pi.Protocol.LLM.Message
+  alias Pi.Protocol.Response
+  alias Pi.Session, as: RuntimeSession
+  alias Pi.Session.Supervisor, as: SessionSupervisor
+
+  setup do
+    if pid = Process.whereis(Pi.Agent.Manager), do: GenServer.stop(pid)
+    if pid = Process.whereis(Pi.Agent.JobSupervisor), do: GenServer.stop(pid)
+    :ok = Broker.reset()
+    :ok = SessionSupervisor.reset()
+    owner = self()
+    Pi.Transport.register(owner)
+    on_exit(fn -> Pi.Transport.unregister(owner) end)
+    :ok
+  end
+
+  test "creates top-level sessions from prompts" do
+    session = Agent.session("review this", name: :reviewer)
+
+    assert %Pi.Session.State{name: :reviewer, parent_id: nil} = session
+    assert [%Message{role: :user, content: "review this"}] = session.messages
+  end
+
+  test "creates child sessions" do
+    parent = Agent.session("plan", name: :planner)
+    child = Agent.child(parent, name: :reviewer)
+
+    assert child.parent_id == parent.id
+    assert child.name == :reviewer
+    assert Agent.history(parent) == [%Message{role: :user, content: "plan"}]
+    assert Agent.children(parent) == []
+  end
+
+  test "chains agent runs into a structured orchestration result" do
+    task = Task.async(fn -> Agent.chain(["draft", "review"]) end)
+
+    first = receive_request(:llm_complete)
+    Broker.deliver(first.id, %Response{ok: true, result: "plan"})
+
+    second = receive_request(:llm_complete)
+    Broker.deliver(second.id, %Response{ok: true, result: "review"})
+
+    assert {:ok, %Run{kind: :chain, status: :ok, results: [first_result, second_result]}} =
+             Task.await(task)
+
+    assert first_result.result == "plan"
+    assert second_result.result == "review"
+  end
+
+  test "parallel runs use child runtime sessions" do
+    task = Task.async(fn -> Agent.parallel(["tests", "docs"], name: :review) end)
+
+    first = receive_request(:llm_complete)
+    Broker.deliver(first.id, %Response{ok: true, result: "tests ok"})
+
+    second = receive_request(:llm_complete)
+    Broker.deliver(second.id, %Response{ok: true, result: "docs ok"})
+
+    assert {:ok, %Run{kind: :parallel, status: :ok, results: results}} = Task.await(task)
+    assert Enum.map(results, & &1.result) |> Enum.sort() == ["docs ok", "tests ok"]
+
+    states = RuntimeSession.list()
+    parent = Enum.find(states, &(&1.name == :review))
+    assert parent
+    children = Enum.filter(states, &(&1.parent_id == parent.id))
+    assert [_, _] = children
+    assert Enum.map(children, & &1.name) |> Enum.sort() == ["docs", "tests"]
+  end
+
+  test "supervised jobs expose lifecycle result and child session" do
+    assert {:ok, job} = Agent.start("review job", role: :reviewer)
+    assert job.status == :running
+    assert {:ok, running} = Agent.status(job.id)
+    assert running.child_session_id == job.child_session_id
+
+    request = receive_request(:llm_complete)
+    Broker.deliver(request.id, %Response{ok: true, result: "job done"})
+
+    assert {:ok, done} = Agent.await(job, 1_000)
+    assert done.status == :done
+    assert done.result == "job done"
+    assert Agent.result(done.id) == {:ok, "job done"}
+
+    assert %Pi.Session.State{messages: messages} = RuntimeSession.state(done.child_session_id)
+    assert Enum.map(messages, & &1.content) == ["review job", "job done"]
+  end
+
+  test "supervised jobs emit parent-visible lifecycle events" do
+    assert {:ok, parent} = RuntimeSession.start(name: :parent)
+    parent_id = RuntimeSession.state(parent).id
+
+    assert {:ok, job} = Agent.start("review child", parent_session_id: parent_id, role: :reviewer)
+
+    started = wait_for_event(parent, :agent_job_started)
+    assert started.data.child_session_id == job.child_session_id
+    assert started.data.parent_session_id == parent_id
+    assert started.data.status == :running
+
+    request = receive_request(:llm_complete)
+    Broker.deliver(request.id, %Response{ok: true, result: "child done"})
+
+    assert {:ok, done} = Agent.await(job, 1_000)
+    finished = wait_for_event(parent, :agent_job_finished)
+    assert finished.data.child_session_id == done.child_session_id
+    assert finished.data.status == :done
+    assert finished.data.result == "child done"
+  end
+
+  test "cancelling running jobs is terminal and ignores late LLM delivery" do
+    assert {:ok, parent} = RuntimeSession.start(name: :parent)
+    parent_id = RuntimeSession.state(parent).id
+
+    assert {:ok, job} = Agent.start("cancel me", parent_session_id: parent_id, role: :reviewer)
+    request = receive_request(:llm_complete)
+
+    assert :ok = Agent.cancel(job)
+    assert {:ok, cancelled} = wait_for_job_status(job.id, :cancelled)
+    assert Agent.await(job, 100) == {:error, cancelled}
+    assert Agent.result(job.id) == {:error, :cancelled}
+
+    finished = wait_for_event(parent, :agent_job_finished)
+    assert finished.data.child_session_id == job.child_session_id
+    assert finished.data.status == :cancelled
+    assert finished.data.error == :cancelled
+
+    assert %Pi.Session.State{status: :cancelled} = RuntimeSession.state(job.child_session_id)
+
+    Broker.deliver(request.id, %Response{ok: true, result: "too late"})
+    Process.sleep(25)
+
+    assert {:ok, still_cancelled} = Agent.status(job.id)
+    assert still_cancelled.status == :cancelled
+    assert still_cancelled.result == nil
+    assert Agent.result(job.id) == {:error, :cancelled}
+  end
+
+  test "cancelling completed jobs is a no-op" do
+    assert {:ok, job} = Agent.start("finish before cancel", role: :reviewer)
+
+    request = receive_request(:llm_complete)
+    Broker.deliver(request.id, %Response{ok: true, result: "already done"})
+
+    assert {:ok, done} = Agent.await(job, 1_000)
+    assert done.status == :done
+
+    assert :ok = Agent.cancel(job.id)
+    assert {:ok, still_done} = Agent.status(job.id)
+    assert still_done.status == :done
+    assert still_done.result == "already done"
+    assert Agent.result(job.id) == {:ok, "already done"}
+  end
+
+  test "run_many starts multiple supervised jobs" do
+    assert {:ok, jobs} =
+             Agent.run_many([
+               %{task: "review tests", role: :reviewer},
+               "review docs"
+             ])
+
+    assert [first_job, second_job] = jobs
+    assert Enum.all?([first_job, second_job], &match?(%Pi.Agent.Job{status: :running}, &1))
+
+    first = receive_request(:llm_complete)
+    second = receive_request(:llm_complete)
+    Broker.deliver(first.id, %Response{ok: true, result: "one"})
+    Broker.deliver(second.id, %Response{ok: true, result: "two"})
+
+    assert Enum.map(jobs, &Agent.await(&1, 1_000)) |> Enum.all?(&match?({:ok, _}, &1))
+  end
+
+  test "lists runtime sessions and reads canonical runtime history" do
+    task = Task.async(fn -> Agent.run("review this", name: :reviewer) end)
+
+    request = receive_request(:llm_complete)
+    Broker.deliver(request.id, %Response{ok: true, result: "done"})
+
+    assert {:ok, result} = Task.await(task)
+    assert result.session.name == :reviewer
+
+    assert [%Pi.Session.State{name: :reviewer} = runtime] = Agent.sessions()
+
+    assert Agent.history(runtime) == [
+             %Message{role: :user, content: "review this"},
+             %Message{role: :assistant, content: "done"}
+           ]
+  end
+
+  defp wait_for_event(session, type, attempts \\ 40)
+  defp wait_for_event(_session, type, 0), do: flunk("expected #{type} event")
+
+  defp wait_for_event(session, type, attempts) do
+    session
+    |> RuntimeSession.state()
+    |> Map.fetch!(:events)
+    |> Enum.find(&(&1.type == type))
+    |> case do
+      nil ->
+        Process.sleep(25)
+        wait_for_event(session, type, attempts - 1)
+
+      event ->
+        event
+    end
+  end
+
+  defp wait_for_job_status(id, status, attempts \\ 40)
+  defp wait_for_job_status(_id, status, 0), do: flunk("expected #{status} job")
+
+  defp wait_for_job_status(id, status, attempts) do
+    case Agent.status(id) do
+      {:ok, %Pi.Agent.Job{status: ^status} = job} ->
+        {:ok, job}
+
+      _other ->
+        Process.sleep(25)
+        wait_for_job_status(id, status, attempts - 1)
+    end
+  end
+
+  defp receive_request(op) do
+    expected_op = Atom.to_string(op)
+
+    receive do
+      {:pi_transport_emit, %{type: "request", id: id, op: ^expected_op, payload: payload}} ->
+        %{id: id, payload: payload}
+
+      {:pi_transport_emit,
+       %{"type" => "request", "id" => id, "op" => ^expected_op, "payload" => payload}} ->
+        %{id: id, payload: payload}
+    after
+      1_000 -> flunk("expected #{op} bridge request")
+    end
+  end
+end

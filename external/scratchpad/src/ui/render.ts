@@ -1,0 +1,3501 @@
+// Build the viewer HTML page. The CLI does all file I/O here and embeds the pad
+// data + file contents into one HTML string, so glimpse and the browser fallback
+// render identically with no round-trips. highlight.js and mermaid load from a
+// pinned CDN, added CONDITIONALLY — hljs only when a pad has code, mermaid only
+// when a ```mermaid block is present.
+
+import { stat } from "node:fs/promises";
+import { dirname, extname, isAbsolute, resolve } from "node:path";
+import pkg from "../../package.json" with { type: "json" };
+import type { ScratchConfig } from "../config.ts";
+import { type Pad, exportFileSlug, resolveEntryPath } from "../discovery.ts";
+import { type Comment, DEFAULT_TYPE, type FileEntry, type Layout, MANIFEST_NAME } from "../manifest.ts";
+import { type CommentItem, toCommentItems } from "../comments.ts";
+import { KIT_CSS, KIT_SVG_DEFS } from "./kit.ts";
+import { COLOR_THEMES, DEFAULT_COLOR_THEME, THEME_CSS } from "./theme.ts";
+
+// Pinned CDN builds (version + SRI) live in vendor-manifest.ts — the single source
+// of truth shared with scripts/fetch-vendor.ts (offline cache). The script-global
+// builds set window.hljs / window.mermaid / window.katex; if they fail to load
+// (online page, offline) the client degrades gracefully (plain code + raw source).
+import {
+  HLJS_CDN,
+  HLJS_THEME_DARK,
+  HLJS_THEME_LIGHT,
+  KATEX_CDN,
+  KATEX_CSS,
+  MERMAID_CDN,
+} from "./vendor-manifest.ts";
+
+const MAX_EMBED_BYTES = 5 * 1024 * 1024; // skip embedding text/code content above this
+// Images get a far larger budget than text — a single screenshot routinely
+// exceeds 512KB, and embedding it is the only way it survives an export over
+// file://. Base64 inflates bytes ~33%, so this is the on-disk source ceiling.
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".ico"]);
+const MD_EXT = new Set([".md", ".markdown", ".mdx"]);
+const TEXT_EXT = new Set([
+  ".txt", ".log", ".csv", ".tsv", ".env", ".ini", ".cfg", ".conf", ".gitignore",
+]);
+const CODE_EXT = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc", ".py", ".rb",
+  ".go", ".rs", ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".swift",
+  ".sh", ".bash", ".zsh", ".ps1", ".sql", ".yaml", ".yml", ".toml", ".xml",
+  ".css", ".scss", ".less", ".vue", ".svelte", ".lua", ".r", ".scala", ".dart",
+]);
+// Rendered in a sandboxed iframe (scripts disabled) rather than as source.
+const HTML_EXT = new Set([".html", ".htm"]);
+
+const MIME: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".svg": "image/svg+xml", ".webp": "image/webp", ".bmp": "image/bmp", ".ico": "image/x-icon",
+};
+
+type Kind = "markdown" | "code" | "image" | "text" | "html" | "binary" | "toolarge";
+
+interface FileView {
+  path: string;
+  /** Absolute on-disk path (resolves manifest `src`); used for copy-full-path. */
+  abs: string;
+  registered: boolean;
+  /** Linked from outside the pad — content read from the manifest `src`. */
+  external?: boolean;
+  title?: string;
+  description?: string;
+  tags?: string[];
+  type?: string;
+  /** Visual group header the file sits under (absent = ungrouped). */
+  group?: string;
+  kind: Kind;
+  /** language hint for code files (extension without dot). */
+  lang?: string;
+  /** text content for markdown/code/text; data URI for image; null otherwise. */
+  content: string | null;
+  /** For markdown: raw inline-image src → embedded data URI, so `![](rel)` refs
+   * survive an export over file://. Absent when the doc has no local images. */
+  assets?: Record<string, string>;
+  /** ISO timestamps from the file on disk (manifest has only pad-level dates). */
+  created?: string;
+  updated?: string;
+  /** Inline comments from the manifest (quote-anchored; see manifest.ts). */
+  comments?: Comment[];
+  /** Comments resolved against the source (file:line, heading, context) at render
+   * time — the CLI's `comments --json` shape, embedded so the viewer's Ctrl+Alt+C
+   * can copy it synchronously (no host round-trip = clipboard activation survives). */
+  commentsExport?: CommentItem[];
+}
+interface PadView {
+  name: string;
+  id?: string;
+  dir: string;
+  files: FileView[];
+  /** Optional group ordering/collapse hint from the manifest (see manifest.ts). */
+  layout?: Layout;
+}
+
+/** Base64 data URI for an embedded image's bytes (shared by the registered-file
+ * and inline-markdown embed paths). */
+function imageDataUri(buf: Buffer, ext: string): string {
+  return `data:${MIME[ext] ?? "application/octet-stream"};base64,${buf.toString("base64")}`;
+}
+
+/** Extract the bare src token from an ![](...) destination — drops an optional
+ * "title" and surrounding <...>. Must mirror the client's extraction so the
+ * server-built asset key matches the client lookup. */
+function imageSrcToken(raw: string): string {
+  let s = raw.trim();
+  const sp = s.search(/\s/);
+  if (sp >= 0) s = s.slice(0, sp);
+  if (s.startsWith("<") && s.endsWith(">")) s = s.slice(1, -1);
+  return s;
+}
+
+/** Embed each local file referenced by a markdown `![alt](src)` so the page stays
+ * self-contained, keyed by raw src. Images become a data URI; a local `.html` ref
+ * becomes its raw markup (rendered live in a sandboxed iframe client-side — md stays
+ * prose, the diagram is its own loose file, NOT a manifest entry). Remote/scheme refs
+ * and other types are left for the browser; missing/oversized files are skipped.
+ * Resolves relative to the doc's dir. */
+async function embedInlineAssets(markdown: string, baseDir: string): Promise<Record<string, string>> {
+  const assets: Record<string, string> = {};
+  // ![alt](src) — src is everything up to the first whitespace ("title" follows)
+  // or the closing paren. Local regex (not module-level) so the /g lastIndex is
+  // never shared across the concurrent scanPadFiles map.
+  for (const m of markdown.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    const src = imageSrcToken(m[1]!);
+    if (!src || src in assets) continue; // assets dedups by key
+    if (/^(https?:|data:|file:|\/\/)/i.test(src)) continue;
+    const ext = extname(src).toLowerCase();
+    const isImage = IMAGE_EXT.has(ext), isHtml = HTML_EXT.has(ext);
+    if (!isImage && !isHtml) continue;
+    let rel = src;
+    try {
+      rel = decodeURIComponent(src); // paths may be percent-encoded (e.g. %20)
+    } catch {
+      // malformed escape — fall back to the raw token
+    }
+    const file = Bun.file(isAbsolute(rel) ? rel : resolve(baseDir, rel));
+    if (file.size > (isImage ? MAX_IMAGE_BYTES : MAX_EMBED_BYTES)) continue; // 0 for a missing file → falls through to the read
+    try {
+      assets[src] = isImage
+        ? imageDataUri(Buffer.from(await file.arrayBuffer()), ext)
+        : await file.text();
+    } catch {
+      // missing / unreadable (raced delete, perms) — leave the ref untouched
+    }
+  }
+  return assets;
+}
+
+function classify(ext: string): Kind {
+  if (IMAGE_EXT.has(ext)) return "image";
+  if (HTML_EXT.has(ext)) return "html";
+  if (MD_EXT.has(ext)) return "markdown";
+  if (CODE_EXT.has(ext)) return "code";
+  if (TEXT_EXT.has(ext)) return "text";
+  return "binary";
+}
+
+/** List the pad's registered files (from the manifest), merged with metadata.
+ * Unregistered on-disk files are intentionally not shown. */
+async function scanPadFiles(pad: Pad): Promise<FileView[]> {
+  // Files are independent, so read them concurrently; Promise.all keeps the
+  // result in manifest.files[] order — the author's deliberate reading order.
+  // `hidden` entries stay registered in the manifest but never reach the viewer.
+  const views = pad.manifest.files.filter((meta) => !meta.hidden).map(async (meta): Promise<FileView> => {
+    const path = meta.path;
+    // Linked entries carry a label in `path`; classify by the real source filename
+    // (its extension) so external files preview by kind, not as "binary/missing".
+    const ext = extname(meta.src ?? path).toLowerCase();
+    let kind = classify(ext);
+    let content: string | null = null;
+    // Linked entries read from `src` (outside the pad); the rest from path under the pad dir.
+    const abs = resolveEntryPath(pad.dir, meta);
+    const file = Bun.file(abs);
+    let created: string | undefined;
+    let updated: string | undefined;
+    if (await file.exists()) {
+      try {
+        const st = await stat(abs);
+        updated = st.mtime.toISOString();
+        // birthtime is 0/epoch (or trails mtime) on filesystems that don't track
+        // creation — only surface it when it's a real date.
+        if (st.birthtimeMs > 0 && st.birthtimeMs <= st.mtimeMs) {
+          created = st.birthtime.toISOString();
+        }
+      } catch {
+        // stat raced a delete/rename — dates just stay absent
+      }
+      const size = file.size;
+      const cap = kind === "image" ? MAX_IMAGE_BYTES : MAX_EMBED_BYTES;
+      if (size > cap) {
+        kind = "toolarge";
+      } else if (kind === "image") {
+        content = imageDataUri(Buffer.from(await file.arrayBuffer()), ext);
+      } else if (kind === "binary") {
+        content = null;
+      } else {
+        content = await file.text();
+      }
+    } else {
+      kind = "binary";
+      content = null;
+    }
+    // Markdown may reference local images / html diagrams by relative path; embed
+    // them so the page stays self-contained (esp. an export, where the file isn't
+    // on disk).
+    let assets: Record<string, string> | undefined;
+    if (kind === "markdown" && content) {
+      const embedded = await embedInlineAssets(content, dirname(abs));
+      if (Object.keys(embedded).length) assets = embedded;
+    }
+    return {
+      path,
+      abs,
+      registered: true,
+      external: !!meta.src,
+      title: meta.title,
+      description: meta.description,
+      tags: meta.tags,
+      type: meta.type ?? DEFAULT_TYPE,
+      group: meta.group,
+      kind,
+      lang: kind === "code" ? ext.slice(1) : undefined,
+      content,
+      assets,
+      created,
+      updated,
+      comments: meta.comments,
+      // Resolve against the source now (only text content can be located; image
+      // data-URIs / binary / oversized are skipped) so the copy shortcut is sync.
+      commentsExport:
+        meta.comments?.length && content != null && kind !== "image"
+          ? toCommentItems(path, content, meta.comments)
+          : undefined,
+    };
+  });
+  return Promise.all(views);
+}
+
+export async function buildView(pads: Pad[]): Promise<PadView[]> {
+  return Promise.all(
+    pads.map(async (p) => ({
+      name: p.manifest.name,
+      id: p.manifest.id,
+      dir: p.dir,
+      files: await scanPadFiles(p),
+      ...(p.manifest.layout ? { layout: p.manifest.layout } : {}),
+    })),
+  );
+}
+
+const MERMAID_RE = /```[ \t]*mermaid\b/;
+// TeX math: $$display$$ (one line or multi-line) OR inline $…$. The inline arm
+// requires non-space adjacency to the delimiters and a non-word/non-$ char
+// outside them, so prose currency ("$5 and $10") doesn't trip it. Kept in sync
+// with the client extractor in mdInline/renderMarkdown; a drift only over- or
+// under-loads the bundle (the client still degrades to raw source).
+const MATH_RE = /\$\$[\s\S]+?\$\$|(?<![\\\w$])\$(?=\S)(?:\\.|[^$\n\\])+?(?<=\S)\$(?![\w$])/;
+
+/** The embedded data island, escaped for inline <script> AND safe as an eval arg. */
+export function payloadJson(view: PadView[], rootLabel: string): string {
+  return JSON.stringify({ pads: view, rootLabel }).replace(/</g, "\\u003c");
+}
+
+/** Which vendor bundles a view requires — used to decide in-place vs full reload. */
+export function bundleNeeds(view: PadView[]): { hljs: boolean; mermaid: boolean; math: boolean } {
+  return { hljs: needsHljs(view), mermaid: needsMermaid(view), math: needsMath(view) };
+}
+
+function needsHljs(view: PadView[]): boolean {
+  // Any code file, or any markdown (rendered fences AND the raw markdown source
+  // view are both syntax-highlighted), needs the hljs bundle inlined.
+  return view.some((p) =>
+    p.files.some(
+      (f) => f.content != null && (f.kind === "code" || f.kind === "markdown" || f.kind === "html"),
+    ),
+  );
+}
+function needsMermaid(view: PadView[]): boolean {
+  return view.some((p) =>
+    p.files.some((f) => f.kind === "markdown" && f.content != null && MERMAID_RE.test(f.content)),
+  );
+}
+function needsMath(view: PadView[]): boolean {
+  return view.some((p) =>
+    p.files.some((f) => f.kind === "markdown" && f.content != null && MATH_RE.test(f.content)),
+  );
+}
+
+/** Viewer settings embedded into the page (persisted in the user config file).
+ * Derived from ScratchConfig.ui so the shapes can't drift; frameless is a
+ * launch-time concern, and zoom / starredThemes / gridStyle / wideMode are
+ * optional here (renderHtml defaults them: 1 / [] / dots / false) so partial
+ * call sites keep working. */
+export type UiSettings = Omit<
+  ScratchConfig["ui"],
+  "frameless" | "zoom" | "starredThemes" | "gridStyle" | "wideMode" | "autoReload"
+> &
+  Partial<
+    Pick<ScratchConfig["ui"], "zoom" | "starredThemes" | "gridStyle" | "wideMode" | "autoReload">
+  >;
+
+const DEFAULT_UI: UiSettings = {
+  themeMode: "system",
+  colorTheme: DEFAULT_COLOR_THEME,
+  starredThemes: [],
+  gridStyle: "dots",
+  wideMode: false,
+  autoReload: true,
+};
+
+export async function renderHtml(
+  view: PadView[],
+  rootLabel: string,
+  ui: UiSettings = DEFAULT_UI,
+  opts: { exportMode?: boolean; offline?: boolean; pinned?: (keyof UiSettings)[] } = {},
+): Promise<string> {
+  const data = payloadJson(view, rootLabel);
+  // Static kit (tokens + classes + #arrow marker) baked into every ![](file.html)
+  // embed's iframe; same <-escape as the data island so it's inline-script-safe.
+  const kitJson = JSON.stringify({ css: KIT_CSS, defs: KIT_SVG_DEFS }).replace(/</g, "\\u003c");
+  const titleName = view.length === 1 ? view[0]!.name : rootLabel;
+  // Suggested filename for in-viewer save — the same slug `scratch export` writes.
+  const exportName = exportFileSlug(view.length === 1 ? view[0]!.name : null, rootLabel);
+  // Zoom is a per-machine reading preference, not a property of the pad, so an
+  // export starts at 100% rather than at the exporting machine's factor. The
+  // in-page zoom controls still work (and persist to the reader's localStorage).
+  const zoom = opts.exportMode ? 1 : (ui.zoom ?? 1);
+  const gridStyle = ui.gridStyle ?? "dots";
+  const wideMode = ui.wideMode ?? false;
+  // Theme axes the exporter chose EXPLICITLY (`scratch export --theme/--mode`), as
+  // opposed to inherited from its config: the client skips its localStorage seed for
+  // these (see the SETTINGS comment for why that matters on file://). Boot seed only —
+  // the in-page picker still works, it just doesn't survive a reload here.
+  const pinned = (opts.exportMode ? (opts.pinned ?? []) : []).join(" ");
+  // Persisted theme/zoom land on <html> server-side so the first paint is
+  // already correct (no flash). "system" stays attribute-less until the client
+  // resolves prefers-color-scheme — same dark-first default as today.
+  const htmlAttrs =
+    ` data-color-theme="${escapeHtml(ui.colorTheme)}"` +
+    ` data-grid="${escapeHtml(gridStyle)}"` +
+    (ui.themeMode === "system" ? "" : ` data-theme="${ui.themeMode}"`) +
+    (wideMode ? " data-wide" : "") +
+    // Static export: no host listens, so the page file is the comment store.
+    // The client keys "save a copy" behavior off this attribute, and it rides
+    // along when the page re-saves itself, so saved copies stay exports.
+    (opts.exportMode ? " data-export" : "") +
+    (pinned ? ` data-theme-pinned="${escapeHtml(pinned)}"` : "") +
+    ` data-export-name="${escapeHtml(exportName)}"` +
+    (zoom === 1 ? "" : ` style="zoom: ${zoom}"`);
+  // NOT part of payloadJson: __scratchReload diff-compares the data island to
+  // detect "no changes", and settings must not break that.
+  const settingsJson = JSON.stringify({
+    ...ui,
+    starredThemes: ui.starredThemes ?? [],
+    gridStyle,
+    wideMode,
+    zoom,
+    autoReload: ui.autoReload ?? true,
+  }).replace(/</g, "\\u003c");
+
+  let vendor = "";
+  let vendorCss = "";
+  if (opts.offline) {
+    // Self-contained export: inline the pinned vendor bytes (no CDN, no network).
+    // Bytes come from the gitignored build cache module scripts/fetch-vendor.ts
+    // generates (run `bun run vendor`/`build`). Imported dynamically so the normal
+    // CDN path never needs it and a missing cache only affects --offline.
+    //
+    // JS libs ride as a gzip+base64 island that VENDOR_BOOT decompresses in-page
+    // (mermaid 3.3MB→~1.2MB) — base64 is JSON/JS-string-safe, so no <-escape needed.
+    // BOOT injects each via a Blob-URL <script> ASYNCHRONOUSLY, i.e. AFTER CLIENT_JS
+    // captures PRISTINE synchronously, so the save snapshot stays clean and re-saved
+    // copies keep these compressed islands. CSS stays inline (gzip barely helps once
+    // the woff2 fonts are data: URIs); the <style> ids match the CDN <link> ids so the
+    // client's per-theme toggle still works ((HTMLStyleElement).disabled is honored),
+    // and they sit BEFORE our own <style>.
+    const b = await import("./vendor/bundle.ts");
+    const gz: Record<string, string> = {};
+    if (needsHljs(view)) gz.hljs = b.HLJS_JS_GZ;
+    if (needsMermaid(view)) gz.mermaid = b.MERMAID_JS_GZ;
+    if (needsMath(view)) gz.katex = b.KATEX_JS_GZ;
+    if (Object.keys(gz).length) {
+      vendor += `<script id="vendor-gz" type="application/json">${JSON.stringify(gz)}</script>\n`;
+      vendor += `<script>${VENDOR_BOOT}</script>\n`;
+    }
+    if (needsHljs(view)) {
+      vendorCss += `<style id="hljs-dark">${b.HLJS_THEME_DARK_CSS}</style>\n`;
+      vendorCss += `<style id="hljs-light">${b.HLJS_THEME_LIGHT_CSS}</style>\n`;
+    }
+    if (needsMath(view)) vendorCss += `<style id="katex-css">${b.KATEX_CSS}</style>\n`;
+  } else {
+    // CDN tags are blocking (no defer) so window.hljs/window.mermaid are ready
+    // before the client script runs. SRI + crossorigin guard integrity; on load
+    // failure the client degrades gracefully.
+    const cdnTag = (c: { url: string; sri: string }) =>
+      `<script src="${c.url}" integrity="${c.sri}" crossorigin="anonymous" referrerpolicy="no-referrer"></script>\n`;
+    if (needsHljs(view)) vendor += cdnTag(HLJS_CDN);
+    if (needsMermaid(view)) vendor += cdnTag(MERMAID_CDN);
+    if (needsMath(view)) vendor += cdnTag(KATEX_CDN);
+
+    // hljs theme stylesheets, placed BEFORE our <style> so equal-specificity
+    // overrides (e.g. transparent .hljs background) win without !important. Both
+    // present with an id; the client enables exactly one per the active theme.
+    const cssLink = (id: string, c: { url: string; sri: string }) =>
+      `<link id="${id}" rel="stylesheet" href="${c.url}" integrity="${c.sri}" crossorigin="anonymous" referrerpolicy="no-referrer" />\n`;
+    if (needsHljs(view)) {
+      vendorCss += cssLink("hljs-dark", HLJS_THEME_DARK);
+      vendorCss += cssLink("hljs-light", HLJS_THEME_LIGHT);
+    }
+    // KaTeX CSS is theme-agnostic (math inherits the page `color`), so a single
+    // link — no light/dark pair like hljs.
+    if (needsMath(view)) vendorCss += cssLink("katex-css", KATEX_CSS);
+  }
+
+  // The Save-a-copy button ships in BOTH modes (Ctrl+S in the client script
+  // mirrors it). In an export, saving is what persists comments (no write-back
+  // channel); in a live viewer it exports a standalone copy of the page — the
+  // saved file gets data-export injected so it opens as a real export. The
+  // saveDot (unsaved-comments hint) only ever fires in export mode.
+  const saveTitle = opts.exportMode
+    ? "Save a copy of this page — comments live in the saved file"
+    : "Export a copy of this page to a file (Ctrl+S)";
+  const saveBtn = `<button class="icon-btn" id="saveCopy" title="${saveTitle}" aria-label="Save a copy">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        <span class="save-dot" id="saveDot" hidden></span>
+      </button>
+      `;
+
+  return `<!doctype html>
+<html lang="en"${htmlAttrs}>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scratch · ${escapeHtml(titleName)}</title>
+${vendorCss}<style>${THEME_CSS}</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar" id="topbar">
+    <div class="brand">
+      <span class="wordmark">scratch<span class="dot">.</span></span>
+      <span class="padname" id="padname"></span>
+    </div>
+    <div class="view-actions">
+      ${saveBtn}<button class="icon-btn" id="commentsToggle" title="Comments summary (toggle visibility with C)" aria-label="Comments summary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span class="cmt-count" id="cmtCount" aria-label="Comment count" hidden></span>
+      </button>
+      <button class="icon-btn" id="reloadBtn" title="Reload from disk (R)" aria-label="Reload">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+      </button>
+      <button class="icon-btn" id="themeToggle" title="Toggle theme (T)" aria-label="Toggle theme">
+        <svg class="i-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
+        <svg class="i-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      </button>
+      <button class="icon-btn" id="settingsBtn" title="Settings (S)" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+      <button class="icon-btn" id="helpBtn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r="0.5" fill="currentColor"/></svg>
+      </button>
+      <a class="icon-btn" id="repoLink" href="https://github.com/nikiforovall/scratchpad" target="_blank" title="View on GitHub" aria-label="View on GitHub">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      </a>
+      <button class="icon-btn" id="closeBtn" title="Close (q)" aria-label="Close" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </header>
+  <div class="body">
+    <div class="sidebar" id="sidebar">
+      <button class="icon-btn" id="sidebarToggle" title="Collapse sidebar ([)" aria-label="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+      </button>
+      <nav class="tree" id="tree"></nav>
+      <div class="appver" title="scratch version">v${escapeHtml(pkg.version)}</div>
+    </div>
+    <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+    <main class="preview" id="preview" tabindex="0"></main>
+    <aside class="toc" id="toc" aria-label="On this page"></aside>
+    <button class="icon-btn" id="sidebarOpen" title="Show sidebar ([)" aria-label="Show sidebar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+    </button>
+  </div>
+  <div class="modal-scrim" id="helpModal" style="display:none">
+    <div class="modal">
+      <div class="modal-head"><span>Keyboard shortcuts</span><button class="icon-btn" id="helpClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+      <dl class="shortcuts">
+        <div class="sc-group">Navigate</div>
+        <div><dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Next / previous file</dd></div>
+        <div><dt><kbd>←</kbd><kbd>→</kbd></dt><dd>Collapse / expand group</dd></div>
+        <div class="sc-group">Scroll</div>
+        <div><dt><kbd>j</kbd><kbd>k</kbd></dt><dd>Down / up</dd></div>
+        <div><dt><kbd>d</kbd><kbd>u</kbd></dt><dd>Half page down / up</dd></div>
+        <div><dt><kbd>g</kbd><kbd>G</kbd></dt><dd>Top / bottom</dd></div>
+        <div class="sc-group">View</div>
+        <div><dt><kbd>v</kbd></dt><dd>Toggle raw / rendered (markdown)</dd></div>
+        <div><dt><kbd>f</kbd></dt><dd>Expand the embed under the cursor (html / mermaid) · <kbd>Esc</kbd> exits</dd></div>
+        <div><dt><kbd>o</kbd></dt><dd>Toggle table of contents</dd></div>
+        <div><dt><kbd>c</kbd></dt><dd>Toggle comments</dd></div>
+        <div><dt><kbd>Ctrl</kbd><span class="sc-plus">+</span><kbd>Alt</kbd><span class="sc-plus">+</span><kbd>C</kbd></dt><dd>Copy comments (JSON)</dd></div>
+        <div class="sc-live"><dt><kbd>Shift</kbd><span class="sc-plus">+</span><kbd>C</kbd></dt><dd>Copy active file path</dd></div>
+        <div class="sc-live"><dt><kbd>Ctrl</kbd><span class="sc-plus">+</span><kbd>Alt</kbd><span class="sc-plus">+</span><kbd>P</kbd></dt><dd>Copy manifest path</dd></div>
+        <div class="sc-live"><dt><kbd>Ctrl</kbd><span class="sc-plus">+</span><kbd>Alt</kbd><span class="sc-plus">+</span><kbd>H</kbd></dt><dd>Hide file from viewer</dd></div>
+        <div><dt><kbd>t</kbd></dt><dd>Toggle theme</dd></div>
+        <div><dt><kbd>[</kbd></dt><dd>Toggle sidebar</dd></div>
+        <div><dt><kbd>]</kbd></dt><dd>Toggle top bar</dd></div>
+        <div><dt><kbd>Ctrl</kbd><span class="sc-plus">+</span><kbd>+</kbd><kbd>−</kbd><kbd>0</kbd></dt><dd>Zoom in / out / reset</dd></div>
+        <div><dt><kbd>Ctrl</kbd><span class="sc-plus">+</span><kbd>S</kbd></dt><dd>Save / export a copy to a file</dd></div>
+        <div class="sc-group">General</div>
+        <div class="sc-live"><dt><kbd>r</kbd></dt><dd>Reload from disk</dd></div>
+        <div><dt><kbd>s</kbd></dt><dd>Settings</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>Show this help</dd></div>
+        <div class="sc-live"><dt><kbd>q</kbd></dt><dd>Quit (close window)</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Close dialogs</dd></div>
+      </dl>
+    </div>
+  </div>
+  ${SETTINGS_MODAL_HTML}
+  ${GALLERY_MODAL_HTML}
+  <div class="modal-scrim" id="diagramModal" style="display:none">
+    <button class="icon-btn diagram-close" id="diagramClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    <div class="diagram-stage" id="diagramStage"></div>
+  </div>
+  <button class="icon-btn focus-close" id="focusClose" title="Exit full window (Esc)" aria-label="Exit full window"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script id="data" type="application/json">${data}</script>
+<script id="settings" type="application/json">${settingsJson}</script>
+<script id="themes" type="application/json">${THEMES_JSON}</script>
+<script id="kit" type="application/json">${kitJson}</script>
+${vendor}<script>${CLIENT_JS}</script>
+</body>
+</html>`;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
+  );
+}
+
+// Theme registry slimmed for the page: id/label + the 4 swatch-dot colors per
+// mode. Cards (settings strip AND gallery) are rendered client-side from this
+// island — the starred strip changes as stars toggle, so static server markup
+// can't carry it. Static registry → build once at module load.
+const THEMES_JSON = JSON.stringify(
+  COLOR_THEMES.map((t) => ({
+    id: t.id,
+    label: t.label,
+    dark: [t.dark.field, t.dark.surface, t.dark.ember, t.dark.ink1],
+    light: [t.light.field, t.light.surface, t.light.ember, t.light.ink1],
+  })),
+).replace(/</g, "\\u003c");
+
+function settingsModalHtml(): string {
+  return `<div class="modal-scrim" id="settingsModal" style="display:none">
+    <div class="modal">
+      <div class="modal-head"><span>Settings</span><button class="icon-btn" id="settingsClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+      <div class="settings-body">
+        <div class="settings-section">
+          <div class="settings-label">Mode</div>
+          <div class="seg" id="modeSeg">
+            <button data-mode="light">Light</button>
+            <button data-mode="dark">Dark</button>
+            <button data-mode="system">System</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">Theme</div>
+          <div class="theme-grid">
+            <div class="starred-cards" id="starredGrid"></div>
+            <button class="pbtn browse-themes" id="browseThemes">Browse all themes…</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">Background</div>
+          <div class="seg" id="gridSeg">
+            <button data-grid="off">Off</button>
+            <button data-grid="dots">Dots</button>
+            <button data-grid="lines">Lines</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">Width</div>
+          <div class="seg" id="widthSeg">
+            <button data-wide="off">Normal</button>
+            <button data-wide="on">Wide</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label" title="Refresh the viewer when files change on disk (applies on next launch)">Auto reload</div>
+          <div class="seg" id="autoReloadSeg">
+            <button data-auto="on">On</button>
+            <button data-auto="off">Off</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">Contents (O)</div>
+          <div class="seg" id="tocSeg">
+            <button data-toc="on">On</button>
+            <button data-toc="off">Off</button>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">Zoom</div>
+          <div class="seg" id="zoomSeg">
+            <button id="zoomOut" aria-label="Zoom out" title="Zoom out (Ctrl+-)">&minus;</button>
+            <button id="zoomReset" title="Reset zoom (Ctrl+0)">100%</button>
+            <button id="zoomIn" aria-label="Zoom in" title="Zoom in (Ctrl+=)">+</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+// Depends only on the static theme registry, so build it once at module load
+// instead of on every render.
+const SETTINGS_MODAL_HTML = settingsModalHtml();
+
+// Theme gallery: every theme, each card with a star toggle (max 3 starred —
+// those are the cards the settings panel shows). Grid filled client-side from
+// the #themes island; scrim sits above the settings scrim so settings stays open.
+const GALLERY_MODAL_HTML = `<div class="modal-scrim gallery-scrim" id="galleryModal" style="display:none">
+    <div class="modal modal-wide">
+      <div class="modal-head"><span>Themes</span><button class="icon-btn" id="galleryClose" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
+      <div class="gallery-body"><div class="theme-grid" id="galleryGrid"></div></div>
+    </div>
+  </div>`;
+
+// Offline (--offline) vendor bootstrap. The JS libs ship gzip+base64 in the
+// #vendor-gz island (mermaid 3.3MB→~1.2MB on disk); this decompresses each with
+// DecompressionStream and injects it as a Blob-URL <script> so window.hljs/mermaid/
+// katex are set in global scope exactly as a real <script src> would. It runs BEFORE
+// CLIENT_JS but the actual injection is async (after PRISTINE is captured), so the
+// save snapshot never sees the blob scripts. __vendorPending tells enhance() to defer
+// mermaid's destructive raw-source fallback until libs land (or fail). On a browser
+// without DecompressionStream the promise rejects → CLIENT_JS clears pending and the
+// page degrades gracefully (raw code / mermaid source), same as an offline CDN miss.
+const VENDOR_BOOT = String.raw`
+window.__vendorPending = true;
+window.__vendorReady = (function () {
+  if (typeof DecompressionStream === 'undefined') return Promise.reject();
+  var V; try { V = JSON.parse(document.getElementById('vendor-gz').textContent); } catch (e) { return Promise.resolve(); }
+  function gunzip(b64) {
+    var bin = atob(b64), n = bin.length, a = new Uint8Array(n);
+    for (var i = 0; i < n; i++) a[i] = bin.charCodeAt(i);
+    return new Response(new Blob([a]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+  }
+  function addScript(buf) {
+    return new Promise(function (res) {
+      var u = URL.createObjectURL(new Blob([buf], { type: 'text/javascript' }));
+      var s = document.createElement('script');
+      s.onload = s.onerror = function () { URL.revokeObjectURL(u); res(); };
+      s.src = u; document.head.appendChild(s);
+    });
+  }
+  return Object.keys(V).reduce(function (p, k) {
+    return p.then(function () { return gunzip(V[k]).then(addScript); });
+  }, Promise.resolve());
+})();
+`;
+
+// Comment-anchor matcher. Split out of CLIENT_JS because it has to run in TWO
+// documents: the host page (markdown previews) and, for a standalone .html
+// preview, inside the sandboxed frame — where an opaque origin means the host
+// cannot reach the text at all. CLIENT_JS interpolates this to define the
+// functions; CMT_FRAME_SCRIPT ships the same source into the frame as a string,
+// so the two documents can never drift into resolving different occurrences.
+const CMT_MATCH_JS = String.raw`
+// All text nodes under root, excluding SVG (mermaid output) subtrees — anchoring
+// inside a diagram is too brittle, so those comments render as orphaned instead.
+// script/style source is skipped for a different reason: it is not displayed, so a
+// quote can never legitimately come from it, and buildHtmlIndex (src/comments.ts)
+// blanks it too — matching it here would resolve to text the CLI cannot see.
+function cmtTextNodes(root) {
+  const out = [];
+  (function walk(n) {
+    if (n.nodeType === 3) { out.push(n); return; }
+    if (n.nodeType !== 1) return;
+    const tag = n.tagName ? n.tagName.toLowerCase() : '';
+    if (tag === 'script' || tag === 'style') return;
+    if (tag === 'svg' || (n.classList && n.classList.contains('mermaid'))) return;
+    for (let c = n.firstChild; c; c = c.nextSibling) walk(c);
+  })(root);
+  return out;
+}
+
+// Re-find a comment's quote in the container. Multiple occurrences are
+// disambiguated by how many chars of prefix/suffix match contiguously from the
+// quote's boundary outward; ties keep the first match (deterministic).
+function cmtFindAnchor(container, anchor) {
+  if (!anchor || !anchor.quote) return null;
+  const nodes = cmtTextNodes(container);
+  let text = '';
+  const starts = nodes.map(n => { const s = text.length; text += n.nodeValue; return s; });
+  const q = anchor.quote;
+  const hits = [];
+  let i = text.indexOf(q);
+  while (i !== -1) { hits.push(i); i = text.indexOf(q, i + 1); }
+  if (!hits.length) return null;
+  let best = hits[0];
+  if (hits.length > 1) {
+    const p = anchor.prefix || '', s = anchor.suffix || '';
+    let bestScore = -1;
+    hits.forEach(h => {
+      const before = text.slice(Math.max(0, h - p.length), h);
+      const after = text.slice(h + q.length, h + q.length + s.length);
+      let score = 0;
+      for (let k = 1; k <= before.length; k++) { if (p[p.length - k] === before[before.length - k]) score++; else break; }
+      for (let k = 0; k < after.length; k++) { if (s[k] === after[k]) score++; else break; }
+      if (score > bestScore) { bestScore = score; best = h; }
+    });
+  }
+  return { nodes, starts, start: best, end: best + q.length };
+}
+
+// Wrap the matched flat-text range in highlight spans. Markdown nests elements,
+// so the range may cross several text nodes — split each at the boundaries and
+// wrap the inner piece (find-and-highlight style). Returns the created spans.
+function cmtWrap(found, cid) {
+  const spans = [];
+  for (let ni = 0; ni < found.nodes.length; ni++) {
+    const node = found.nodes[ni];
+    const ns = found.starts[ni], ne = ns + node.nodeValue.length;
+    if (ne <= found.start || ns >= found.end) continue;
+    const from = Math.max(found.start, ns) - ns;
+    const to = Math.min(found.end, ne) - ns;
+    let target = node;
+    if (from > 0) target = target.splitText(from);
+    if (to - from < target.nodeValue.length) target.splitText(to - from);
+    const span = document.createElement('span');
+    span.className = 'cmt-hl';
+    span.dataset.cid = cid;
+    target.parentNode.replaceChild(span, target);
+    span.appendChild(target);
+    spans.push(span);
+  }
+  return spans;
+}
+
+// Undo cmtWrap: lift each mark's children back out and re-join the split text nodes.
+// cid null unwraps every mark. Shared because both documents wrap the same way, so
+// they must unwrap the same way — the host adds its own .cmt-note cleanup on top.
+function cmtUnwrapIn(root, cid) {
+  root.querySelectorAll('.cmt-hl').forEach(sp => {
+    if (cid != null && sp.dataset.cid !== cid) return;
+    const p = sp.parentNode;
+    while (sp.firstChild) p.insertBefore(sp.firstChild, sp);
+    p.removeChild(sp);
+    if (p.normalize) p.normalize();
+  });
+}
+
+// Selection → anchor, against a container's flat text. Shared for the same reason
+// as the matcher: the frame captures its own selection, the host captures the
+// markdown pane's, and both must produce the prefix/suffix the matcher expects.
+function cmtAnchorFromRange(container, range) {
+  const quote = range.toString();
+  if (!quote || !quote.trim()) return null;
+  let prefix = '', suffix = '';
+  try {
+    const pre = container.ownerDocument.createRange();
+    pre.selectNodeContents(container);
+    pre.setEnd(range.startContainer, range.startOffset);
+    prefix = pre.toString().slice(-32);
+    const post = container.ownerDocument.createRange();
+    post.selectNodeContents(container);
+    post.setStart(range.endContainer, range.endOffset);
+    suffix = post.toString().slice(0, 32);
+  } catch (_) {}
+  return { quote, prefix, suffix };
+}
+`;
+
+// Client-side: tree nav, preview switching, minimal markdown renderer, raw/
+// rendered toggle, syntax highlighting (if hljs present), mermaid (if present),
+// and auto-detected theme. Kept dependency-free; vendored libs are optional.
+const CLIENT_JS = String.raw`
+let DATA = JSON.parse(document.getElementById('data').textContent);
+// Static export (scratch export bakes data-export onto <html>): no host listens,
+// so the page file itself is where comments persist. Capture the pristine source
+// now, before any rendering mutates the DOM — saveCopy() splices the live DATA
+// back into this string instead of re-serializing the mutated document. Captured
+// in every mode: a live viewer's Ctrl+S exports a copy off this same snapshot.
+const EXPORT_MODE = document.documentElement.hasAttribute('data-export');
+const PRISTINE = '<!doctype html>\n' + document.documentElement.outerHTML;
+// Whether a host is listening for write-backs — the single answer every
+// persistence path consults (postToHost, and the settings seed below). Keyed off
+// EXPORT_MODE and not the protocol alone: an export is equally hostless over
+// file:// and over http (embedded in a page, on a static host), where it would
+// otherwise have a live viewer's protocol but no route behind it.
+const HAS_HOST = !EXPORT_MODE && ((window.chrome && window.chrome.webview) || /^https?:$/.test(location.protocol));
+const esc = (s) => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// A pad path stripped to its basename without extension — how a wikilink [[name]]
+// refers to a file (matched case-insensitively in mdInline).
+const baseNoExt = (p) => p.replace(/^.*\//, '').replace(/\.[^./]+$/, '');
+
+// Wrap an author HTML doc/fragment as srcdoc for a sandboxed iframe (used by
+// ![](file.html) embeds). color-scheme follows the host theme; a ResizeObserver
+// posts content height up so the parent can size the frame to its content (see the
+// message listener in enhance). Runs in an opaque-origin iframe — no host access.
+// Static embed kit (tokens + classes + #arrow marker), read once from the #kit
+// island. See kit.ts.
+const KIT = (function () {
+  try { return JSON.parse(document.getElementById('kit').textContent); }
+  catch (_) { return { css: '', defs: '' }; }
+})();
+// Static frame script: posts content height up (ResizeObserver) so the parent can
+// size the frame, and forwards keystrokes up so the host's shortcuts (t/s/?/…) still
+// fire when focus is inside the frame (an iframe otherwise swallows them; keys typed
+// into the frame's own inputs are left alone). Fully static — built once, not per
+// embed. srcdoc auto-wraps content in a document, so no doctype/html/head/body
+// scaffolding. The script tags are built as '<' + 'script>' so no literal script-tag
+// (least of all a closing one) appears in this source — this whole block is itself
+// emitted inside the host page's own script element, where a closing tag would end it.
+const KEY_RELAY = 'addEventListener("keydown",function(e){var x=e.target;if(x&&(x.tagName==="INPUT"||x.tagName==="TEXTAREA"||x.isContentEditable))return;parent.postMessage({__scratchKey:1,key:e.key,ctrlKey:e.ctrlKey,metaKey:e.metaKey,altKey:e.altKey,shiftKey:e.shiftKey},"*");});';
+const FRAME_SCRIPT = '<' + 'script>(function(){function p(){var d=document.documentElement,b=document.body,h=Math.max(d.scrollHeight,b?b.scrollHeight:0,b?b.offsetHeight:0);parent.postMessage({__scratchFrame:1,h:h},"*");}var o=new ResizeObserver(p);o.observe(document.documentElement);if(document.body)o.observe(document.body);addEventListener("load",p);p();' + KEY_RELAY + '})();' + '<' + '/script>';
+// The relay alone, for a STANDALONE .html preview: that frame is the author's own
+// document (no kit, no auto-sizing), but it must not trap the keyboard — without
+// this, clicking into a full-window page leaves Esc with nowhere to go.
+const KEY_RELAY_SCRIPT = '<' + 'script>(function(){' + KEY_RELAY + '})();' + '<' + '/script>';
+// Prepended, so an author's own scrollbar rule wins — a default, not an override (the
+// properties inherit, so this reaches their inner scrollers too). Theme-neutral gray
+// because, unlike htmlFrameDoc, we must not force color-scheme here: that would repaint
+// an author page that never opted into dark, and light-dark() would resolve light-only.
+const FRAME_SCROLLBAR = '<style>html{scrollbar-width:thin;scrollbar-color:rgba(136,136,136,0.55) transparent}</style>';
+// Comments inside a STANDALONE .html preview. The host cannot read that frame's
+// selection or text (opaque origin), so the frame does its own capture, matching
+// and marking, and talks to the host over postMessage — the same relay the key
+// and resize scripts already use. Only the frame's own document is touched: the
+// author's FILE is never rewritten, marks live in the DOM for the session.
+// The matcher arrives as source text so the host and the frame share one copy.
+const CMT_MATCH_SRC = ${JSON.stringify(CMT_MATCH_JS)};
+// currentColor at 22% so the highlight reads on whatever the author's background
+// is — we cannot know their palette, and must not repaint their page to find out.
+const CMT_FRAME_CSS = '<style>.cmt-hl{background:color-mix(in srgb, currentColor 22%, transparent);border-bottom:2px solid color-mix(in srgb, currentColor 55%, transparent);cursor:pointer}</style>';
+const CMT_FRAME_BODY = CMT_MATCH_SRC + ';(function(){' +
+  'function post(m){parent.postMessage(m,"*");}' +
+  // Selection is reported on mouseup only (not selectionchange): the host shows a
+  // click-to-comment button, so a half-dragged selection must not arm it.
+  'addEventListener("mouseup",function(e){' +
+    'var s=null;try{s=getSelection();}catch(_){}' +
+    'if(!s||s.isCollapsed||!s.rangeCount){post({__scratchSel:1,quote:""});return;}' +
+    'var r=s.getRangeAt(0),a=cmtAnchorFromRange(document.body,r);' +
+    'if(!a){post({__scratchSel:1,quote:""});return;}' +
+    'var b=r.getBoundingClientRect();' +
+    'post({__scratchSel:1,quote:a.quote,prefix:a.prefix,suffix:a.suffix,' +
+      'left:b.left,top:b.top,bottom:b.bottom,width:b.width,height:b.height});' +
+  '});' +
+  'function mark(cid){var t=null;[].forEach.call(document.querySelectorAll(".cmt-hl"),' +
+    'function(sp){if(!t&&sp.dataset.cid===cid)t=sp;});return t;}' +
+  // The host owns the popover (it has the pad data and the edit/delete actions), so
+  // a mark only reports which comment and where. Same payload whether the reader
+  // clicked it or the host asked us to reveal it.
+  'function postMark(t){var b=t.getBoundingClientRect();post({__scratchCmtClick:1,cid:t.dataset.cid,' +
+    'left:b.left,top:b.top,bottom:b.bottom,width:b.width,height:b.height});}' +
+  'addEventListener("click",function(e){' +
+    'var t=e.target&&e.target.closest?e.target.closest(".cmt-hl"):null;' +
+    // A click off any mark is the host's dismiss gesture — its own document-level
+    // mousedown handler never sees clicks landing in here.
+    'if(!t){post({__scratchCmtBlur:1});return;}' +
+    'postMark(t);' +
+  '});' +
+  // Re-mark from scratch on every push: add/edit/delete all send the full list,
+  // so unwinding individual spans (the host page path) buys nothing here.
+  'addEventListener("message",function(e){' +
+    'if(!e.data||e.data.__scratchCmt!==1)return;cmtUnwrapIn(document,null);' +
+    'var miss=[];(e.data.comments||[]).forEach(function(c){' +
+      'var f=cmtFindAnchor(document.body,c.anchor);' +
+      'if(!f){miss.push(c.id);return;}' +
+      'var sp=cmtWrap(f,c.id);' +
+      'if(sp.length)sp.forEach(function(s){s.title=c.body;});else miss.push(c.id);' +
+    '});' +
+    // The host keeps the orphan bookkeeping — it owns the pill and the summary.
+    'post({__scratchCmtMiss:1,ids:miss});' +
+  '});' +
+  // Jump to a comment from the host's summary list. The host can't scroll to a mark
+  // it cannot see, so it names the id and we reveal it, then report the landed rect
+  // through the click path so the popover opens where the mark ended up.
+  'var muteScroll=0;' +
+  'addEventListener("message",function(e){' +
+    'if(!e.data||e.data.__scratchCmtGoto!==1)return;' +
+    'var t=mark(e.data.cid);if(!t)return;' +
+    // Our own scrollIntoView would otherwise fire the scroll report below and
+    // dismiss the popover we are about to ask for.
+    'muteScroll=Date.now()+400;' +
+    'try{t.scrollIntoView({block:"center"});}catch(_){}' +
+    'postMark(t);' +
+  '});' +
+  // The host's popover/add-button are position:fixed, and this frame has a fixed
+  // height — so its scrolling never reaches previewEl's scroll handler. Report it
+  // so the host can dismiss them instead of leaving them stranded mid-page.
+  'addEventListener("scroll",function(){' +
+    'if(Date.now()<muteScroll)return;post({__scratchCmtScroll:1});' +
+  '},{passive:true});' +
+  'post({__scratchCmtReady:1});' +
+'})();';
+const CMT_FRAME_SCRIPT = CMT_FRAME_CSS + '<' + 'script>' + CMT_FRAME_BODY + '<' + '/script>';
+function htmlFrameDoc(fragment) {
+  // Force color-scheme to the RESOLVED viewer theme (not the OS) so the kit's
+  // light-dark() tokens track the toggle. data-theme is absent in system mode →
+  // fall back to the OS preference, dark-first like the rest of the viewer.
+  const t = document.documentElement.dataset.theme;
+  const dark = t === 'dark' || (!t && (!window.matchMedia || matchMedia('(prefers-color-scheme: dark)').matches));
+  // body:flow-root (in the kit) contains child margins so the last child's bottom
+  // margin is counted in scrollHeight — otherwise a collapsed margin under-reports
+  // and the frame shows a phantom scrollbar (FRAME_SCRIPT measures the max metric).
+  return '<style>:root{color-scheme:' + (dark ? 'dark' : 'light') + '}' + KIT.css + '</style>'
+    + KIT.defs
+    + fragment
+    + FRAME_SCRIPT;
+}
+
+// Footnote registry for the current renderMarkdown pass (Pandoc/GFM [^id] refs +
+// [^id]: defs). Set/reset by renderMarkdown; null outside a render so mdInline
+// leaves stray [^x] literal. { defs: id→text, order: [id…] in ref order, seen: id→n }.
+let FN = null;
+
+function mdInline(s) {
+  // Stash inline code spans and math BEFORE escaping/emphasis run — their bodies
+  // hold chars ($ _ * \\ <) those passes would corrupt, and a $…$ inside \`code\`
+  // must stay literal (not become math). Restored at the very end.
+  const stash = [];
+  const hold = (html) => { stash.push(html); return '\x00S' + (stash.length - 1) + '\x00'; };
+  s = s.replace(/\`([^\`]+)\`/g, (_, c) => hold('<code>' + esc(c) + '</code>'));
+  // $$display$$ or inline $…$ (single line). data-tex carries the source; KaTeX
+  // renders it in enhance(). Offline (no katex) the raw source stays as the span's
+  // text, so math degrades to readable source. Kept in sync with MATH_RE.
+  s = s.replace(/\$\$([^$\n]+?)\$\$|(?<![\\\w$])\$(?=\S)((?:\\.|[^$\n\\])+?)(?<=\S)\$(?![\w$])/g, (raw, disp, inl) => {
+    const display = disp != null, tex = display ? disp : inl;
+    return hold('<span class="math' + (display ? ' math-display' : '') + '" data-tex="' + esc(tex) + '">' + esc(raw) + '</span>');
+  });
+  // Backslash escapes (GFM): \\<punct> → the literal punctuation. Stashed here —
+  // AFTER code/math extraction so a real $…$ span keeps its own backslashes — so
+  // the emphasis/link/footnote passes never see the escaped char and \\$ renders
+  // as a plain $ (consistent with a bare $). Backtick is omitted: code spans own
+  // it, and it'd clash with this raw-template delimiter.
+  s = s.replace(/\\([\\$*_~\[\]()#+\-.!<>{}|])/g, (_, ch) => hold(esc(ch)));
+  // Angle-bracket autolinks (CommonMark): <https://…>, <mailto:…>, or a bare
+  // <user@host>. Stashed BEFORE esc — otherwise the < > get HTML-escaped and the
+  // whole thing renders as literal text (the footnote-URL bug this fixes). The
+  // inner string is the link text verbatim; a bare email gets a mailto: href.
+  s = s.replace(/<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]+|[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+)>/g, (_, url) => {
+    const href = !url.includes(':') ? 'mailto:' + url : url;
+    return hold('<a href="' + esc(href) + '">' + esc(url) + '</a>');
+  });
+  s = esc(s);
+  // Triple-star first: the nested-aware bold rule below would otherwise eat
+  // one edge star of a ***bold italic*** run and strand the leftover.
+  s = s.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+  // Bold may nest italics (GFM: bold with *italic* inside) — allow lone stars
+  // in the body, just never ** (that closes). The italic pass right after
+  // converts the nested single-star run inside the strong body.
+  s = s.replace(/\*\*((?:[^*]|\*(?!\*))+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
+  // Underscore emphasis (__bold__ / _italic_). Per GFM, underscores inside a
+  // word don't open/close emphasis (snake_case stays literal), so require a
+  // non-word char on the outer side of each delimiter. Same nesting rule as
+  // the star form: lone underscores may appear in the bold body.
+  s = s.replace(/(^|[^\w])__((?:[^_]|_(?!_))+)__(?!\w)/g, '$1<strong>$2</strong>');
+  s = s.replace(/(^|[^\w])_([^_]+)_(?!\w)/g, '$1<em>$2</em>');
+  s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  // Images BEFORE links — else the link rule eats the [alt](src) tail. Local
+  // refs resolve to the embedded data URI (currentRef.f.assets, built server-
+  // side so exports stay self-contained); URLs/unknown refs pass through.
+  s = s.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, dst) => {
+    let src = dst.trim();
+    const sp = src.search(/\s/); if (sp >= 0) src = src.slice(0, sp);
+    if (src.startsWith('<') && src.endsWith('>')) src = src.slice(1, -1);
+    const a = currentRef && currentRef.f && currentRef.f.assets;
+    // A local .html ref embeds as raw markup (server-side) → render it live in a
+    // sandboxed iframe. Keeps the md as prose; the diagram is its own loose file.
+    // Wrapped so the expand-to-full-window chip has a positioning context; the
+    // chip is wired in enhance (the html here is a string, not live nodes yet).
+    if (/\.html?$/i.test(src) && a && a[src] != null)
+      return hold('<span class="htmlembed"><iframe class="htmlframe" sandbox="allow-scripts" srcdoc="' +
+        esc(htmlFrameDoc(a[src])) + '" title="' + alt + '"></iframe>' +
+        EMBED_CHIP + '</span>');
+    // Eager (not lazy): this is a local, self-contained viewer, so lazy buys
+    // almost nothing — and a lazy image that loads mid-scroll reflows the doc and
+    // drifts an anchor/TOC jump off its target. Loading up front fixes heights early.
+    return hold('<img class="mdimg" src="' + ((a && a[src]) || src) + '" alt="' + alt + '"/>');
+  });
+  // Wikilinks [[name]] / [[name|Display]] (Obsidian/Logseq-style). Stashed BEFORE
+  // the plain-link rule below — that rule's [text](url) only matches when a (
+  // immediately follows the closing ], which a bare [[name]] never has, but
+  // resolving here first keeps the two forms from ever being able to interact.
+  // name is looked up against the current pad's file list — basename (no ext,
+  // case-insensitive) first, then title — the same two ways a person would refer
+  // to a note. currentRef is already escaped text at this point (esc() ran above),
+  // same as the plain-link text/href handled next.
+  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, name, alias) => {
+    name = name.trim();
+    const files = currentRef && currentRef.pad && currentRef.pad.files;
+    const key = name.toLowerCase();
+    // Basename wins over title: ANY basename hit beats every title hit, so the two
+    // scans stay separate (a single ||-predicate pass would let an earlier file's
+    // title outrank a later file's basename).
+    const f = files && (files.find(x => baseNoExt(x.path).toLowerCase() === key)
+      || files.find(x => (x.title || '').toLowerCase() === key));
+    const disp = alias != null ? alias.trim() : (f && f.title || name);
+    if (!f) return hold('<span class="wikilink-broken">' + disp + '</span>');
+    // Leading '/' makes resolveRel treat this as pad-root-absolute (see its
+    // startsWith('/') branch) — the wikilink target is already the exact pad
+    // path, not something relative to the current file's directory.
+    return hold('<a href="/' + esc(f.path) + '">' + disp + '</a>');
+  });
+  // Links are stashed, not left inline: their generated markup (and any URL in an
+  // href or an embedded iframe srcdoc above) must be invisible to the bare-URL
+  // pass below, so it only ever linkifies URLs in real prose.
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, h) => hold('<a href="' + h + '">' + t + '</a>'));
+  // Bare-URL linkification (GFM autolink extension): http(s):// or www. runs in
+  // plain prose. Trailing sentence punctuation and an unbalanced closing ) are
+  // pushed back outside the link.
+  s = s.replace(/(?:https?:\/\/|www\.)[^\s<]+/g, (url) => {
+    let tail = '';
+    const tm = url.match(/[.,;:!?'"]+$/);
+    if (tm) { tail = tm[0]; url = url.slice(0, -tail.length); }
+    if (url.endsWith(')') && !url.includes('(')) { tail = ')' + tail; url = url.slice(0, -1); }
+    const href = url.startsWith('www.') ? 'http://' + url : url;
+    return hold('<a href="' + href + '">' + url + '</a>') + tail;
+  });
+  // Footnote references [^id]: numbered by first-appearance order, linked to the
+  // definitions list renderMarkdown appends. Only refs with a matching definition
+  // are transformed; an unknown [^x] is left literal. ([^id] has no (…) tail, so
+  // the link rule above never touches it.)
+  if (FN) s = s.replace(/\[\^([^\]\s]+)\]/g, (whole, id) => {
+    if (FN.defs[id] == null) return whole;
+    let n = FN.seen[id];
+    if (!n) { FN.order.push(id); n = FN.order.length; FN.seen[id] = n; }
+    return '<sup class="fnref" id="fnref-' + esc(id) + '"><a href="#fn-' + esc(id) + '">' + n + '</a></sup>';
+  });
+  // Loop until stable: a stashed construct can nest inside another (a code span
+  // as link text → the link stashes a token containing the code-span token). A
+  // single pass leaves the inner token un-restored, and its NUL sentinels render
+  // invisibly — surfacing the bare "S0"/"S1" placeholder body.
+  if (stash.length) {
+    let prev;
+    do { prev = s; s = s.replace(/\x00S(\d+)\x00/g, (_, n) => stash[+n]); } while (s !== prev);
+  }
+  return s;
+}
+// Map a fence/extension language token to highlight.js's canonical grammar name.
+// Two reasons this is needed: (1) hljs parses the language out of the
+// "language-X" class with [\\w-]+, so a class like "language-c#" yields just "c"
+// (highlighted as C, not C#) — normalizing to "csharp" fixes that; (2) some file
+// extensions (hpp, cxx, h) aren't hljs aliases. Anything not in the map passes
+// through unchanged, so hljs's built-in aliases (cs, rs, py, ...) still work.
+const LANG_ALIAS = {
+  'c#': 'csharp', 'cs': 'csharp',
+  'c++': 'cpp', 'cxx': 'cpp', 'cc': 'cpp', 'hpp': 'cpp', 'hxx': 'cpp', 'h': 'c',
+  'f#': 'fsharp', 'fs': 'fsharp',
+  'objective-c': 'objectivec', 'objc': 'objectivec', 'obj-c': 'objectivec',
+  'ps1': 'powershell', 'ps': 'powershell', 'pwsh': 'powershell',
+};
+function normLang(lang) {
+  if (!lang) return lang;
+  const k = lang.toLowerCase();
+  return LANG_ALIAS[k] || k;
+}
+function renderMarkdown(src) {
+  const lines = src.replace(/\r\n/g, '\n').split('\n');
+  let html = '', i = 0, inUl = false, inOl = false;
+  const closeLists = () => { if (inUl) { html += '</ul>'; inUl = false; } if (inOl) { html += '</ol>'; inOl = false; } };
+  // Pre-pass: collect footnote definitions ([^id]: text) so inline refs can be
+  // numbered and a definitions list rendered at the end. Lines are NOT removed —
+  // task-checkbox data-line uses the source index — the main loop skips them.
+  FN = { defs: {}, order: [], seen: {} };
+  for (const ln of lines) { const d = ln.match(/^\[\^([^\]\s]+)\]:\s*(.*)$/); if (d) FN.defs[d[1]] = d[2]; }
+  while (i < lines.length) {
+    let line = lines[i];
+    if (/^\[\^[^\]\s]+\]:/.test(line)) { i++; continue; } // a footnote def — collected above
+    let fence = line.match(/^\s*\`\`\`\s*([^\s\`]*)\s*$/);
+    if (fence) {
+      closeLists(); const lang = normLang(fence[1] || ''); i++; let buf = [];
+      while (i < lines.length && !/^\s*\`\`\`\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+      i++;
+      if (lang === 'mermaid') html += '<div class="mermaid">' + esc(buf.join('\n')) + '</div>';
+      else html += '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + esc(buf.join('\n')) + '</code></pre>';
+      continue;
+    }
+    // Display math block: a line that STARTS with $$. Scan forward to the matching
+    // closing $$ — which may be on a later line and/or followed by trailing prose —
+    // so a block can be lone-delimiter ($$ on its own lines), a full single line
+    // ($$x$$), or span lines with text after the close ($$…$$ where …). The closing
+    // line's trailing text is re-emitted as a paragraph. Scanning to the FIRST $$
+    // (not a lone-$$ line) is what stops a stray $$ from swallowing later
+    // headings/tables. Kept in sync with MATH_RE / the inline extractor.
+    if (/^\s*\$\$/.test(line)) {
+      closeLists();
+      let rest = line.slice(line.indexOf('$$') + 2);
+      const parts = []; let closed = false, tail = '';
+      for (;;) {
+        const ci = rest.indexOf('$$');
+        if (ci >= 0) { parts.push(rest.slice(0, ci)); tail = rest.slice(ci + 2); closed = true; break; }
+        parts.push(rest); i++;
+        if (i >= lines.length) break;
+        rest = lines[i];
+      }
+      i++; // past the closing line (or off the end if unclosed)
+      const tex = parts.join('\n').trim();
+      html += '<div class="math math-display" data-tex="' + esc(tex) + '">' + esc('$$' + tex + '$$') + '</div>';
+      if (closed && tail.trim()) html += '<p>' + mdInline(tail) + '</p>';
+      continue;
+    }
+    // GFM pipe table: a header row followed by a |---|:--:|---| separator row.
+    if (line.indexOf('|') !== -1 && i + 1 < lines.length &&
+        /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+      closeLists();
+      const cells = (r) => { let s = r.trim(); if (s.startsWith('|')) s = s.slice(1); if (s.endsWith('|')) s = s.slice(0, -1); return s.split('|').map(c => c.trim()); };
+      const heads = cells(line);
+      const aligns = cells(lines[i + 1]).map(c => { const l = c.startsWith(':'), r = c.endsWith(':'); return l && r ? 'center' : r ? 'right' : l ? 'left' : ''; });
+      const sty = (ci) => aligns[ci] ? ' style="text-align:' + aligns[ci] + '"' : '';
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].indexOf('|') !== -1 && !/^\s*$/.test(lines[i])) { rows.push(cells(lines[i])); i++; }
+      let t = '<table><thead><tr>';
+      heads.forEach((h, ci) => { t += '<th' + sty(ci) + '>' + mdInline(h) + '</th>'; });
+      t += '</tr></thead><tbody>';
+      rows.forEach(rc => { t += '<tr>'; heads.forEach((_, ci) => { t += '<td' + sty(ci) + '>' + mdInline(rc[ci] || '') + '</td>'; }); t += '</tr>'; });
+      html += t + '</tbody></table>';
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { closeLists(); html += '<h' + m[1].length + '>' + mdInline(m[2]) + '</h' + m[1].length + '>'; i++; continue; }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { closeLists(); html += '<hr/>'; i++; continue; }
+    if ((m = line.match(/^\s*>\s?(.*)$/))) { closeLists(); html += '<blockquote>' + mdInline(m[1]) + '</blockquote>'; i++; continue; }
+    if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      if (!inUl) { closeLists(); html += '<ul>'; inUl = true; }
+      // GFM task list item: "- [ ] todo" / "- [x] done". Checked → green box.
+      // data-line carries the 0-based source line index so a checkbox click can
+      // toggle the exact "[ ]"/"[x]" marker back in the file (see the checkbox
+      // click handler — the one place the read-only viewer writes file content).
+      const task = m[1].match(/^\[([ xX])\]\s+(.*)$/);
+      if (task) {
+        const done = task[1] !== ' ';
+        html += '<li class="task' + (done ? ' done' : '') + '" data-line="' + i + '"><span class="chk" role="checkbox" tabindex="0" aria-checked="' + done + '">' + (done ? '✓' : '') + '</span>' + mdInline(task[2]) + '</li>';
+      } else { html += '<li>' + mdInline(m[1]) + '</li>'; }
+      i++; continue;
+    }
+    if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) { if (!inOl) { closeLists(); html += '<ol>'; inOl = true; } html += '<li>' + mdInline(m[1]) + '</li>'; i++; continue; }
+    if (/^\s*$/.test(line)) { closeLists(); i++; continue; }
+    closeLists(); html += '<p>' + mdInline(line) + '</p>'; i++;
+  }
+  closeLists();
+  // Footnote definitions list, in reference order, each with a ↩ back-link.
+  if (FN.order.length) {
+    const ids = FN.order.slice(); // snapshot — a def may itself reference a footnote
+    html += '<hr class="fn-sep"/><section class="footnotes"><ol>';
+    for (const id of ids) {
+      html += '<li id="fn-' + esc(id) + '">' + mdInline(FN.defs[id]) +
+        ' <a href="#fnref-' + esc(id) + '" class="fn-back" aria-label="Back to reference">↩</a></li>';
+    }
+    html += '</ol></section>';
+  }
+  FN = null; // outside a render, leave stray [^x] literal
+  return html;
+}
+
+// Highlight a code string with hljs for a given language; falls back to escaped
+// plain text when hljs or the grammar is unavailable.
+function hlCode(code, lang) {
+  if (window.hljs && lang && window.hljs.getLanguage && window.hljs.getLanguage(lang)) {
+    try { return window.hljs.highlight(code, { language: lang }).value; } catch (e) {}
+  }
+  return esc(code);
+}
+// Raw markdown view: hljs's markdown grammar does NOT recurse into fenced blocks
+// (a \`\`\`json block stays plain), so we split the source ourselves — markdown
+// runs highlighted as markdown, each fence's body highlighted as ITS language —
+// and stitch them back with the fence delimiter lines preserved.
+function highlightRawMarkdown(src) {
+  if (!window.hljs) return esc(src);
+  const lines = src.replace(/\r\n/g, '\n').split('\n');
+  const parts = []; let mdbuf = [], i = 0;
+  const flush = () => { if (mdbuf.length) { parts.push(hlCode(mdbuf.join('\n'), 'markdown')); mdbuf = []; } };
+  while (i < lines.length) {
+    const open = lines[i].match(/^\s*\`\`\`+\s*([^\s\`]*)\s*$/);
+    if (open) {
+      const lang = normLang(open[1] || '');
+      const openLine = lines[i]; i++;
+      const code = [];
+      while (i < lines.length && !/^\s*\`\`\`+\s*$/.test(lines[i])) { code.push(lines[i]); i++; }
+      const hasClose = i < lines.length; const closeLine = hasClose ? lines[i] : '';
+      if (hasClose) i++;
+      flush();
+      let block = '<span class="hljs-code">' + esc(openLine) + '</span>';
+      if (code.length) block += '\n' + hlCode(code.join('\n'), lang);
+      if (hasClose) block += '\n<span class="hljs-code">' + esc(closeLine) + '</span>';
+      parts.push(block);
+      continue;
+    }
+    mdbuf.push(lines[i]); i++;
+  }
+  flush();
+  return parts.join('\n');
+}
+
+let current = null;       // key of selected file
+let currentRef = null;    // { pad, f }
+const scrollMem = {};     // fileKey -> last scrollTop (session-only)
+let rawMode = false;      // markdown: show source instead of rendered
+// Remember the raw/rendered preference across files AND sessions (localStorage
+// works in the browser fallback; the native data-URL origin may not persist it,
+// so it's wrapped in try/catch). The choice is sticky — switching files keeps it.
+try { rawMode = localStorage.getItem('scratch.raw') === '1'; } catch (_) {}
+function setRaw(v) {
+  rawMode = v;
+  try { localStorage.setItem('scratch.raw', v ? '1' : '0'); } catch (_) {}
+}
+let ITEMS = [];           // flat [{pad,f}] in tree order — for j/k navigation
+let curIdx = -1;          // index of selected file within ITEMS
+let lastTreeHtml = null;  // last tree markup rendered — skip DOM swap when unchanged
+
+// Resolve a relative link target against the current file's directory → a pad
+// path. Pads are usually flat, but handle ./ and ../ segments anyway.
+function resolveRel(from, rel) {
+  // Leading '/' = pad-root-absolute (skip relative resolution). Author-written
+  // /links use it; mdInline's wikilinks also rely on it — they emit href="/<path>"
+  // to hand the click handler an already-exact pad path.
+  if (rel.startsWith('/')) return rel.replace(/^\/+/, '');
+  const base = from.split('/').slice(0, -1);
+  rel.split('/').forEach(p => { if (p === '..') base.pop(); else if (p !== '.' && p !== '') base.push(p); });
+  return base.join('/');
+}
+
+function mermaidTheme() { return document.documentElement.dataset.theme === 'light' ? 'neutral' : 'dark'; }
+
+// Size each rendered html-frame to its content. Added once; matches the posting
+// frame by contentWindow so multiple frames on a page resize independently.
+function armHtmlFrames() {
+  // Guard on the DOCUMENT, not window: these listeners live exactly as long as the
+  // document does, and a window-scoped flag outlives it under the DOM test harness
+  // (globalThis survives happy-dom's unregister) — the second page then wires none.
+  if (document.__scratchFrameListener) return;
+  document.__scratchFrameListener = true;
+  addEventListener('message', (e) => {
+    if (!e.data) return;
+    // Keystroke forwarded out of an embed iframe (which would otherwise swallow
+    // it) — replay it on the host document so the global shortcut handler runs.
+    if (e.data.__scratchKey === 1) {
+      // Remember which frame the key came out of: the synthetic event below can't
+      // carry e.source, and 'f' needs to know WHICH embed to expand.
+      keySource = e.source;
+      document.dispatchEvent(new KeyboardEvent('keydown', {
+        key: e.data.key, ctrlKey: e.data.ctrlKey, metaKey: e.data.metaKey,
+        altKey: e.data.altKey, shiftKey: e.data.shiftKey, bubbles: true,
+      }));
+      return;
+    }
+    // Comment traffic out of a standalone .html preview frame. Rects arrive in the
+    // FRAME's viewport coords, so they are offset by the iframe's own box before
+    // any host UI is placed against them (see cmtRectFromFrame).
+    if (e.data.__scratchSel === 1) { onFrameSelection(e.source, e.data); return; }
+    if (e.data.__scratchCmtClick === 1) {
+      const c = findComment(e.data.cid);
+      if (c && commentsVisible) cmtViewPop(c, cmtRectFromFrame(e.source, e.data));
+      return;
+    }
+    if (e.data.__scratchCmtScroll === 1) { closeCmtPop(); hideCmtAdd(); return; }
+    if (e.data.__scratchCmtBlur === 1) { closeCmtPop(); return; }
+    if (e.data.__scratchCmtMiss === 1) { onFrameMisses(e.source, e.data.ids || []); return; }
+    if (e.data.__scratchCmtReady === 1) { onFrameReady(e.source); return; }
+    if (e.data.__scratchFrame !== 1) return;
+    // A focused frame is sized by CSS — don't fight it with content height. Bail
+    // before the lookup: going full window resizes the frame's document, so its
+    // in-frame observer turns chatty exactly where the work is wasted.
+    if (focusedFrame && focusedFrame.contentWindow === e.source) return;
+    const f = frameByWindow(e.source);
+    if (f) f.style.height = (e.data.h + 1) + 'px';
+  });
+  // Delegated (frames are re-created on every render): track the frame under the
+  // pointer so a bare 'f' knows which embed you mean, and wire the expand chips.
+  // Once the pointer is INSIDE a frame the parent sees no more mouse events, so the
+  // crossing-the-boundary mouseover (target = the iframe element) is the signal.
+  document.addEventListener('mouseover', (e) => {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    // A mouseover anywhere OFF an embed clears it: 'f' must expand only what the
+    // pointer is on right now, and a hoverTarget that was only ever set (never
+    // cleared) kept re-opening the last diagram from anywhere on the page. Match the
+    // wrapper, not just the svg — the chip is a sibling inside it. The full-file html
+    // preview is a bare frame with no wrapper, so it is its own host.
+    const host = (t.tagName === 'IFRAME' && t.classList.contains('htmlframe'))
+      ? t : t.closest('.htmlembed, .mermaid');
+    if (!host) { hoverHost = hoverTarget = null; return; }
+    // mouseover bubbles at every child boundary the pointer crosses and a mermaid svg
+    // has hundreds of children — while the pointer stays inside one host, bail before
+    // re-walking the tree for an answer that cannot have changed.
+    if (host === hoverHost) return;
+    hoverHost = host;
+    hoverTarget = host.tagName === 'IFRAME' ? host : host.querySelector('iframe.htmlframe, svg');
+  });
+  // Leaving the window fires no further mouseover, so clear on the way out (a null
+  // relatedTarget is the pointer exiting the document, not moving between elements).
+  document.addEventListener('mouseout', (e) => {
+    if (!e.relatedTarget) hoverHost = hoverTarget = null;
+  });
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest ? e.target.closest('.embed-full') : null;
+    if (!btn) return;
+    e.preventDefault();
+    const host = btn.closest('.htmlembed, .mermaid');
+    expandEmbed(host && host.querySelector('iframe.htmlframe, svg'));
+  });
+}
+
+// --- Full-window mode for html embeds ('f') ------------------------------------
+// Transient by design (no config key): a viewer that reopened with all its chrome
+// gone would be alarming. Purely additive CSS on <html> + the frame — the iframe
+// node is never touched, so the author page keeps its scroll and in-page state.
+let keySource = null;      // contentWindow of the frame that forwarded the last key
+let hoverTarget = null;    // embed under the pointer (html frame OR mermaid svg)
+let hoverHost = null;      // its wrapper — the mouseover fast path compares against this
+let focusedFrame = null;
+let focusHinted = false;   // the Esc hint is once per session, not once per open
+
+// 'f' expands either kind of embed. The PRESENTATION differs on purpose: an SVG has
+// no state to lose and wants pan/zoom, so it clones into the lightbox; an iframe must
+// never be reparented (that reloads the author page), so it goes full-window in place.
+const EMBED_SEL = 'iframe.htmlframe, .mermaid svg';
+// Both embed kinds get the SAME chip: the md path emits it as markup, mermaid injects
+// it after run() settles. Authored once so relabeling stays one edit.
+const EMBED_CHIP = '<button class="embed-full" title="Full window (f)">⛶</button>';
+function frameByWindow(w) {
+  if (!w) return null;
+  return [...document.querySelectorAll('iframe.htmlframe')].find(f => f.contentWindow === w) || null;
+}
+// Which embed does a bare 'f' mean? The frame you were typing inside, else the one
+// under the pointer. No "it's the only one on the page" fallback: that fired with the
+// pointer nowhere near it, so 'f' anywhere in a doc with one diagram opened it.
+function pickTarget() {
+  const typed = frameByWindow(keySource);
+  if (typed) return typed;
+  // contains(), not a fresh querySelectorAll of every embed: hoverTarget can only ever
+  // have come from EMBED_SEL, so the only thing left to check is that a re-render
+  // hasn't detached it since.
+  return hoverTarget && document.contains(hoverTarget) ? hoverTarget : null;
+}
+function enterFocus(frame) {
+  if (!frame || focusedFrame) return;
+  // Nothing else may be layered over a full-window frame.
+  showDiagram(false); showGallery(false); showSettings(false); showHelp(false);
+  focusedFrame = frame;
+  frame.setAttribute('data-focused', '');
+  document.documentElement.setAttribute('data-focus', '');
+  applyZoom();   // reads data-focus: full window is unzoomed, see applyZoom
+  if (!focusHinted) { focusHinted = true; showToast('Esc to exit full window', 'info'); }
+}
+function exitFocus() {
+  if (!focusedFrame) return;
+  focusedFrame.removeAttribute('data-focused');
+  focusedFrame.style.height = '';  // let the ResizeObserver re-size the md embed
+  focusedFrame = null;
+  document.documentElement.removeAttribute('data-focus');
+  applyZoom();   // restores the reader zoom
+  keySource = null;
+  const p = document.getElementById('preview');
+  if (p) p.focus({ preventScroll: true });
+}
+// The one entry point for 'f' / the ⛶ chips, over both embed kinds.
+// (No focusedFrame branch: while focused, the keydown handler intercepts every key
+// and the chrome that could call this is hidden behind the frame.)
+function expandEmbed(target) {
+  if (diagramModal.style.display !== 'none') { showDiagram(false); return; }
+  const t = target || pickTarget();
+  if (!t) {
+    // Ambiguous ('f' with several embeds and no pointer/focus hint) reads as a broken
+    // key otherwise — say what would disambiguate it.
+    if (document.querySelector(EMBED_SEL)) showToast('Hover an embed, then press f', 'info');
+    return;
+  }
+  if (t.tagName === 'IFRAME') enterFocus(t); else openDiagram(t);
+}
+
+function enhance(container) {
+  armHtmlFrames();
+  if (window.hljs) {
+    container.querySelectorAll('pre code:not(.hl-done)').forEach(el => { try { window.hljs.highlightElement(el); } catch (e) {} });
+  }
+  if (window.mermaid) {
+    const nodes = container.querySelectorAll('.mermaid');
+    if (nodes.length) {
+      try {
+        window.mermaid.initialize({ startOnLoad: false, theme: mermaidTheme(), securityLevel: 'strict' });
+        // Same expand affordance as an html embed — one hover chip, one 'f' key for
+        // both. run() is ASYNC and replaces the div's content, so the chips can only
+        // go on after its promise settles (settled, not resolved: a diagram that
+        // fails to parse still leaves the others rendered). Both handlers, not
+        // finally(): finally re-throws, and a parse error is already reported by
+        // mermaid's own error node — it must not also surface as an unhandled reject.
+        const chips = () => nodes.forEach(el => {
+          if (!el.querySelector('svg') || el.querySelector('.embed-full')) return;
+          el.insertAdjacentHTML('beforeend', EMBED_CHIP);
+        });
+        Promise.resolve(window.mermaid.run({ nodes })).then(chips, chips);
+      } catch (e) {}
+    }
+  } else if (!window.__vendorPending) {
+    // mermaid unavailable (offline CDN miss, or no DecompressionStream for an inlined
+    // export): show the diagram SOURCE as a readable code block instead of a div with
+    // whitespace-collapsed text. Skipped while __vendorPending — the offline bootstrap
+    // is still decompressing mermaid; replacing the .mermaid div now would be
+    // destructive (nothing left to render). The post-boot re-render handles it.
+    container.querySelectorAll('.mermaid').forEach(el => {
+      const pre = document.createElement('pre'); pre.className = 'code';
+      const code = document.createElement('code'); code.textContent = el.textContent;
+      pre.appendChild(code); el.replaceWith(pre);
+    });
+  }
+  // KaTeX: render each .math node in place. data-tex holds the source (the DOM
+  // decodes the attribute on read). If katex is absent (offline) the raw $…$ left
+  // in the node stays visible — graceful degradation, like mermaid above.
+  if (window.katex) {
+    container.querySelectorAll('.math').forEach(el => {
+      const tex = el.getAttribute('data-tex');
+      if (tex == null) return;
+      try { window.katex.render(tex, el, { displayMode: el.classList.contains('math-display'), throwOnError: false }); }
+      catch (e) {}
+    });
+  }
+  // Runs LAST so it also catches the pre.code the mermaid fallback just created.
+  decorateCodeBlocks(container);
+}
+
+// Code-block chrome: wrap each <pre><code> in a figure with a header (language
+// badge + hover-reveal Copy button) and, for real code (a language- class, not
+// the raw-markdown source view / plain text / untagged fences), a line-number
+// gutter. The gutter lives INSIDE the <pre> so it inherits that context's exact
+// font metrics (.md fenced blocks are 14px/1.7, full-file pre.code is 15px/1.75)
+// and aligns for free; the <code> becomes the horizontal scroll box so the gutter
+// stays put while long lines scroll under it. Copy reuses copyText — the same
+// execCommand fallback the rest of the page relies on under file://.
+function decorateCodeBlocks(container) {
+  container.querySelectorAll('pre > code').forEach(code => {
+    const pre = code.parentElement;
+    if (!pre || pre.closest('.cb')) return; // already wrapped
+    const m = (code.className || '').match(/language-([\w-]+)/);
+    const lang = m ? m[1] : '';
+    const isMdSrc = code.classList.contains('mdsrc');
+    const text = code.textContent.replace(/\n$/, ''); // shared by gutter + copy
+
+    const fig = document.createElement('figure');
+    fig.className = 'cb';
+    const head = document.createElement('div');
+    head.className = 'cb-head';
+    head.innerHTML = '<span class="cb-lang">' + esc(lang) + '</span>';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cb-copy';
+    btn.setAttribute('aria-label', 'Copy code');
+    btn.textContent = 'Copy';
+    head.appendChild(btn);
+
+    pre.replaceWith(fig);
+    fig.appendChild(head);
+    fig.appendChild(pre);
+
+    if (lang && !isMdSrc) {
+      const lines = text.split('\n');
+      if (lines.length > 1) {
+        const g = document.createElement('span');
+        g.className = 'cb-nos';
+        g.setAttribute('aria-hidden', 'true');
+        g.textContent = lines.map((_, i) => i + 1).join('\n');
+        pre.insertBefore(g, code);
+        pre.classList.add('has-nos');
+      }
+    }
+
+    btn.addEventListener('click', () => {
+      copyText(text).then(() => {
+        btn.textContent = 'Copied';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1200);
+      }).catch(() => showToast('Copy failed'));
+    });
+  });
+}
+
+// Compact "when": relative while it reads naturally (today), then a short date,
+// with the year only when it isn't this year. Hover shows the full timestamp.
+function fmtWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const now = new Date(), diff = now - d;
+  if (diff >= 0 && diff < 60e3) return 'just now';
+  if (diff >= 0 && diff < 3600e3) return Math.round(diff / 60e3) + 'm ago';
+  if (diff >= 0 && diff < 86400e3 && now.toDateString() === d.toDateString()) return Math.round(diff / 3600e3) + 'h ago';
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString(undefined, opts);
+}
+function fmtFull(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? '' : d.toLocaleString();
+}
+
+// Clipboard: navigator.clipboard needs a secure context, but glimpse delivers
+// the page via NavigateToString / file:// — an opaque origin where it's absent
+// or rejects (the copy silently no-ops). Fall back to a hidden-textarea
+// execCommand('copy'), which works in that context (and in the browser).
+function execCopy(text) {
+  return new Promise((resolve, reject) => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error('execCommand copy failed'));
+    } catch (e) { reject(e); }
+  });
+}
+function copyText(text) {
+  return navigator.clipboard && navigator.clipboard.writeText
+    ? navigator.clipboard.writeText(text).catch(() => execCopy(text))
+    : execCopy(text);
+}
+// Copy the active file's path (Shift+C). Mirrors the 🔗 path button, including
+// its absence in exports (the path only means something on the exporter's machine).
+function copyActivePath() {
+  const f = currentRef && currentRef.f;
+  if (!f || EXPORT_MODE) return;
+  copyText(f.abs || f.path)
+    .then(() => showToast('Path copied', 'success'))
+    .catch(() => showToast('Copy failed'));
+}
+
+// Copy the active pad's manifest path (Ctrl+Alt+P). Like copyActivePath, the
+// path is only meaningful on the exporter's machine, so it's absent in exports.
+function copyManifestPath() {
+  const pad = currentRef && currentRef.pad;
+  if (!pad || EXPORT_MODE) return;
+  const path = pad.dir.replace(/\\/g, '/') + '/${MANIFEST_NAME}';
+  copyText(path)
+    .then(() => showToast('Manifest path copied', 'success'))
+    .catch(() => showToast('Copy failed'));
+}
+
+// Copy the active file's comments as JSON (Ctrl+Alt+C) — the same shape
+// 'scratch comments <file> --json' emits, for handing off to an agent. The
+// resolved locate fields (file:line, heading, context) are precomputed on the
+// host and embedded as f.commentsExport, so this copies synchronously inside the
+// keydown handler (an async host round-trip would lose the clipboard's user
+// activation). Works in exports too: comments are content, not a machine-specific
+// path. The LIVE f.comments array is the source of truth (it's what add/edit/
+// delete mutate); commentsExport is a render-time snapshot we only borrow the
+// resolved fields from, by id. So a comment deleted this session is gone here,
+// and one added/edited live falls back to the minimal shape until a reload.
+function copyPageComments() {
+  const ref = currentRef;
+  if (!ref || !ref.f) return;
+  const resolved = {};
+  (ref.f.commentsExport || []).forEach((it) => { resolved[it.id] = it; });
+  const items = (ref.f.comments || []).map((c) => {
+    const r = resolved[c.id];
+    const quote = (c.anchor && c.anchor.quote ? c.anchor.quote : '').replace(/\s+/g, ' ').trim();
+    return r && r.comment === c.body && r.quote === quote
+      ? r // unchanged since render — use the fully-resolved snapshot
+      : {
+          id: c.id, file: ref.f.path, comment: c.body, quote,
+          matched: false, line: null, section_heading: null, context: null, context_lines: null,
+        };
+  });
+  if (!items.length) { showToast('No comments on this page'); return; }
+  // Drop null-valued keys (unmatched comments carry line/heading/context = null)
+  // so the copied JSON stays compact — absent key reads the same as null downstream.
+  const json = JSON.stringify({ pad: ref.pad.name, comments: items }, (_k, v) => v === null ? undefined : v, 2);
+  copyText(json)
+    .then(() => showToast(items.length + (items.length === 1 ? ' comment copied' : ' comments copied'), 'success'))
+    .catch(() => showToast('Copy failed'));
+}
+
+// Hide the active file from the viewer (Ctrl+Alt+H). One-way: the host sets the
+// entry's hidden flag in scratchpad.json (no unhide in the UI — edit the
+// manifest by hand to restore). We drop it from the in-memory model and rebuild
+// the tree so the change shows immediately, with NO reload (a reload would
+// re-read disk and drop it anyway — this just skips the blink). Lands on the
+// neighbouring file. No-op in the file:// export, where no host listens.
+function hideCurrentFile() {
+  const ref = currentRef;
+  if (!ref || !ref.f) return;
+  const sent = postToHost('__scratch_hide', '/hide', { padDir: ref.pad.dir, filePath: ref.f.path });
+  if (!sent) { showToast('Hiding is unavailable in exports'); return; }
+  // Pick a neighbour to land on BEFORE the file leaves ITEMS.
+  const idx = ITEMS.findIndex(it => it.pad === ref.pad && it.f === ref.f);
+  const nb = idx >= 0 ? (ITEMS[idx + 1] || ITEMS[idx - 1]) : null;
+  ref.pad.files = ref.pad.files.filter(f => f !== ref.f);
+  buildTree(nb ? nb.pad.dir + '::' + nb.f.path : null); // rebuilds ITEMS + selects the neighbour (or empty state)
+  showToast('File hidden', 'info');
+}
+
+// ---------------------------------------------------------------------------
+// In-app navigation history (back / forward across viewed documents).
+// The viewer is a single setHTML page with NO server and NO real URLs, so the
+// WebView's back/forward — including the mouse side buttons (3/4) — would leave
+// it for the blank initial entry the host opened before NavigateToString (the
+// "empty hanging page"). We mirror every document switch into the History API
+// so those buttons traverse the docs we've actually viewed. A buffer entry +
+// popstate trap keep the user from ever falling off the start onto that blank
+// page (back at the first doc just stays put; forward history is preserved).
+let navStack = [];        // [fileKey] viewed, in order
+let navIdx = -1;          // current position in navStack
+let navApplying = false;  // suppress recording while applying a popstate
+
+function navResolve(key) {
+  const sep = key.indexOf('::');
+  if (sep < 0) return null;
+  const dir = key.slice(0, sep), path = key.slice(sep + 2);
+  // Match by string (dir::path) — resilient across reloads that rebuild ITEMS
+  // with fresh pad/f objects but identical identities.
+  return ITEMS.find(x => x.pad.dir === dir && x.f.path === path) || null;
+}
+
+// Record a document switch as a History API entry. Called from renderPreview
+// for every switch; skipped while applying a popstate and de-duped when the key
+// is unchanged (raw-mode toggles, theme re-renders, hot-reloads of the same
+// file all re-call renderPreview without being real navigations).
+function navRecord(key) {
+  if (navApplying) return;
+  if (navIdx >= 0 && navStack[navIdx] === key) return;
+  if (navStack.length === 0) {
+    // Buffer entry: a same-document history slot below the first doc, so the
+    // first "back" is absorbed here (we bounce forward) instead of reloading
+    // the blank initial page cross-document.
+    try { history.replaceState({ scratchNav: '__buffer__' }, ''); } catch (_) {}
+  }
+  navStack = navStack.slice(0, navIdx + 1);
+  navStack.push(key);
+  navIdx = navStack.length - 1;
+  try { history.pushState({ scratchNav: navIdx }, ''); } catch (_) {}
+}
+
+window.addEventListener('popstate', (e) => {
+  const v = e.state && e.state.scratchNav;
+  if (v === '__buffer__' || v == null) {
+    // At (or below) the buffer — bounce forward to the first doc so the blank
+    // initial page is never shown. forward() keeps any forward entries intact.
+    if (navStack.length) { try { history.forward(); } catch (_) {} }
+    return;
+  }
+  const idx = typeof v === 'number' ? v : -1;
+  if (idx < 0 || idx >= navStack.length || idx === navIdx) return;
+  const it = navResolve(navStack[idx]);
+  if (!it) return;
+  navIdx = idx;
+  navApplying = true;
+  try { renderPreview(it.pad, it.f); } finally { navApplying = false; }
+});
+
+// nav describes how this render was triggered, which decides the scroll target:
+//   • { anchor }   — a link with a #fragment → land on that heading
+//   • { top:true } — a plain link → top of the doc (a fresh read, not a resume)
+//   • absent       — left-nav / history / re-render → restore the remembered scroll
+function renderPreview(pad, f, nav) {
+  // Remember the outgoing file's scroll so returning to it lands where you left
+  // off (session-only — not persisted across launches).
+  if (current && previewEl) scrollMem[current] = previewEl.scrollTop;
+  // A render replaces the frames, so a focused one is about to become a detached
+  // node — drop out first rather than leave the chrome hidden with nothing over it.
+  exitFocus();
+  // Both point at nodes this render is about to detach — holding either would keep a
+  // whole discarded iframe document (or SVG subtree) reachable until the next
+  // hover/keystroke.
+  hoverHost = hoverTarget = keySource = null;
+  cancelPin(); // a re-render invalidates any in-flight anchor re-pin (stale element)
+  current = pad.dir + '::' + f.path; currentRef = { pad, f };
+  navRecord(current);
+  curIdx = ITEMS.findIndex(it => it.pad === pad && it.f === f);
+  // Meta is a single tight dot-separated line (type · #tags) — not scattered chips.
+  const metaBits = [f.registered ? esc(f.type || 'note') : 'unregistered'];
+  if (f.external) metaBits.push('linked');
+  (f.tags || []).forEach(t => metaBits.push('#' + esc(t)));
+  const metaLine = metaBits.join(' · ');
+  const canRaw = (f.kind === 'markdown' || f.kind === 'html') && f.content != null;
+  const canFull = f.kind === 'html' && f.content != null && !rawMode;
+  const canCopyContent = f.content != null && (f.kind === 'markdown' || f.kind === 'html' || f.kind === 'code' || f.kind === 'text');
+  const hasComments = !!(f.comments && f.comments.length);
+  const ctrls = '<span class="pctrls">' +
+    // The path is the exporter's local filesystem path — meaningless to whoever
+    // receives an exported copy, so exports don't offer it.
+    (EXPORT_MODE ? '' : '<button class="pbtn" id="copyPath">🔗 path</button>') +
+    (canCopyContent ? '<button class="pbtn" id="copyContent">⧉ copy</button>' : '') +
+    (hasComments ? '<button class="pbtn" id="clearComments" title="Delete all comments on this file">🗑 ' + nComments(f.comments.length) + '</button>' : '') +
+    (canFull ? '<button class="pbtn" id="vFull" title="Full window (f)">⛶ full</button>' : '') +
+    (canRaw
+      ? '<button class="pbtn ' + (!rawMode ? 'on' : '') + '" id="vRendered">rendered</button>' +
+        '<button class="pbtn ' + (rawMode ? 'on' : '') + '" id="vRaw">raw</button>'
+      : '') +
+    '</span>';
+  // File dates, kept quiet next to the controls. An untouched file has
+  // created === updated — one "created" entry says it all.
+  const dateBits = [];
+  if (f.created && fmtWhen(f.created)) dateBits.push(['created', f.created]);
+  if (f.updated && fmtWhen(f.updated) && !(f.created && fmtWhen(f.created) === fmtWhen(f.updated))) {
+    dateBits.push(['updated', f.updated]);
+  }
+  const datesHtml = dateBits.length
+    ? '<span class="pdates" title="' + esc(dateBits.map(([w, iso]) => w + ' ' + fmtFull(iso)).join(' · ')) + '">' +
+      dateBits.map(([w, iso]) => w + ' ' + esc(fmtWhen(iso))).join(' · ') + '</span>'
+    : '';
+
+  let bodyHtml = '';
+  if (f.kind === 'toolarge') bodyHtml = '<div class="notice">File too large to preview.</div>';
+  else if (f.kind === 'image' && f.content) bodyHtml = '<div class="imgwrap"><img src="' + f.content + '" alt="' + esc(f.path) + '"/></div>';
+  else if (f.kind === 'markdown' && f.content != null) bodyHtml = rawMode
+    ? (window.hljs
+        ? '<pre class="code"><code class="hljs hl-done mdsrc">' + highlightRawMarkdown(f.content) + '</code></pre>'
+        : '<pre class="code"><code class="language-markdown">' + esc(f.content) + '</code></pre>')
+    : '<div class="md">' + renderMarkdown(f.content) + '</div>';
+  else if (f.kind === 'html' && f.content != null) bodyHtml = rawMode
+    ? '<pre class="code"><code class="language-html">' + esc(f.content) + '</code></pre>'
+    // Sandboxed with allow-scripts so interactive author pages run their own JS;
+    // opaque-origin iframe still blocks host/parent access. srcdoc is attr-escaped.
+    : '<iframe class="htmlframe" sandbox="allow-scripts" srcdoc="' + esc(FRAME_SCROLLBAR + f.content + KEY_RELAY_SCRIPT + CMT_FRAME_SCRIPT) + '"></iframe>';
+  else if ((f.kind === 'code' || f.kind === 'text') && f.content != null) {
+    const cls = f.lang ? ' class="language-' + esc(normLang(f.lang)) + '"' : '';
+    bodyHtml = '<pre class="code"><code' + cls + '>' + esc(f.content) + '</code></pre>';
+  } else bodyHtml = '<div class="notice">No preview available (binary or missing file).</div>';
+
+  const preview = document.getElementById('preview');
+  // One reading column wraps the whole view so the header strip, title, meta,
+  // and body all share a single left edge (per-element margins no longer fight
+  // the centering).
+  preview.innerHTML = '<div class="pbody">' +
+    '<div class="phead"><span class="pfile">' + esc(f.path) + '</span>' + datesHtml + ctrls + '</div>' +
+    '<h1 class="ptitle">' + esc(f.title || f.path) + '</h1>' +
+    '<div class="pmeta">' + metaLine + '</div>' +
+    (f.description ? '<div class="pdesc">' + esc(f.description) + '</div>' : '') +
+    '<hr class="divider"/>' + bodyHtml +
+    '</div>';
+
+  // The preview pane is the only scrollable element (html/body are overflow:hidden),
+  // so keyboard scrolling and a browser Vimium need it focused to act on it — they
+  // target the focused/document element, not an arbitrary inner overflow box.
+  // preventScroll so this never fights the reload scroll-position restore.
+  preview.focus({ preventScroll: true });
+
+  if (canFull) {
+    document.getElementById('vFull').addEventListener('click', () => {
+      // Through expandEmbed like every other trigger, so all three doors stay one door.
+      expandEmbed(preview.querySelector('iframe.htmlframe'));
+    });
+  }
+  if (canRaw) {
+    const rd = document.getElementById('vRendered'), rw = document.getElementById('vRaw');
+    rd.addEventListener('click', () => { if (rawMode) { setRaw(false); renderPreview(pad, f); } });
+    rw.addEventListener('click', () => { if (!rawMode) { setRaw(true); renderPreview(pad, f); } });
+  }
+  // Flash the button label (✓ copied) and pop a toast so the action registers
+  // whether the user is looking at the button or the corner.
+  const flash = (btn, label, toast) => {
+    btn.textContent = '✓ copied';
+    btn.classList.add('on');
+    clearTimeout(btn._flashTimer);
+    btn._flashTimer = setTimeout(() => { btn.textContent = label; btn.classList.remove('on'); }, 1200);
+    showToast(toast, 'success');
+  };
+  const cp = document.getElementById('copyPath');
+  if (cp) cp.addEventListener('click', () =>
+    copyText(f.abs || f.path)
+      .then(() => flash(cp, '🔗 path', 'Path copied'))
+      .catch(() => showToast('Copy failed')));
+  const cc = document.getElementById('copyContent');
+  if (cc) cc.addEventListener('click', () =>
+    copyText(f.content)
+      .then(() => flash(cc, '⧉ copy', 'Content copied'))
+      .catch(() => showToast('Copy failed')));
+  // Bulk-clear is irreversible, so it arms on the first click and only deletes on
+  // the second (within 3s) — unlike the per-comment delete, which fires straight away.
+  const clr = document.getElementById('clearComments');
+  if (clr) {
+    const label = clr.textContent;
+    let armed = false;
+    clr.addEventListener('click', () => {
+      if (!armed) {
+        armed = true;
+        clr.textContent = '⚠ clear all?';
+        clr.classList.add('on');
+        clearTimeout(clr._t);
+        clr._t = setTimeout(() => { armed = false; clr.textContent = label; clr.classList.remove('on'); }, 3000);
+        return;
+      }
+      deleteAllComments();
+      clr.remove();
+    });
+  }
+  enhance(preview);
+  // After hljs rewrote the code blocks' text nodes — comment quote-matching
+  // walks the final DOM. (With no .md container, applyComments hands off to the
+  // standalone .html preview frame, which marks its own document.)
+  applyComments();
+  buildToc();
+  document.querySelectorAll('.frow').forEach(el => el.classList.toggle('active', el.dataset.key === current));
+  expandActiveGroup();
+  const wantKey = current;
+  // A link with a #fragment lands on the heading — beating the rAF re-apply below,
+  // so the scroll-restore is skipped entirely when an anchor target resolves.
+  if (nav && nav.anchor) {
+    // Land on the heading and keep it pinned while layout settles (hljs/mermaid/
+    // images/embeds shift heights right after render). cancelPin() above already
+    // killed any prior pin, so this jump owns the re-pin window.
+    pinAnchor(document.getElementById(nav.anchor));
+    return;
+  }
+  // A plain link forces the top (nav.top); left-nav / history / re-renders resume
+  // where the file was last left (0 the first time it's opened).
+  const wantScroll = nav && nav.top ? 0 : (scrollMem[current] || 0);
+  if (previewEl) {
+    previewEl.scrollTop = wantScroll;
+    // Highlighting / images / async content can shift heights right after render
+    // and nudge the position, so re-apply once layout settles — unless the user
+    // already switched away (wantKey stale) or scrolled the restored view.
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        if (current === wantKey && previewEl && previewEl.scrollTop !== wantScroll) {
+          previewEl.scrollTop = wantScroll;
+        }
+      });
+    }
+  }
+}
+
+// Sidebar file-kind glyphs (Lucide-style, currentColor so they track the theme
+// and the active-row accent). Purely visual, driven by f.kind; unknown kinds
+// (binary/toolarge/missing) fall back to a generic file. Trusted static markup —
+// never interpolates file data.
+const FILE_ICON_PATHS = {
+  markdown: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h6"/>',
+  code: '<path d="M14 9l3 3-3 3"/><path d="M10 9l-3 3 3 3"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+  html: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M9 10l-2 2 2 2"/><path d="M15 10l2 2-2 2"/>',
+  text: '<path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/>',
+};
+const FILE_ICON_DEFAULT = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>';
+function fileIcon(kind) {
+  const p = FILE_ICON_PATHS[kind] || FILE_ICON_DEFAULT;
+  return '<svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + '</svg>';
+}
+// Session-only group collapse overrides: group key -> collapsed bool. Set when the
+// user toggles a group header; consulted on every rebuild so a toggle survives a
+// hot-reload. Never persisted — a fresh page load starts empty, restoring the
+// layout-authored default (see decision: collapse toggles are ephemeral).
+const groupCollapseState = {};
+
+// Client mirror of groupKey() in manifest.ts — normalize a group name to its
+// comparison key ('' = ungrouped). Guards against non-strings since the layout
+// reaches the client as raw JSON (not necessarily via sanitizeLayout).
+function groupKey(raw) {
+  return (typeof raw === 'string' ? raw : '').trim().toLowerCase();
+}
+
+// Mirror of orderGroupKeys() in manifest.ts — KEEP IN SYNC. present = group keys in
+// first-appearance order; returns the ordered subset per the layout hint. (The
+// layout.groups guard is intentionally stronger than the TS copy — client input
+// isn't guaranteed to have passed through sanitizeLayout.)
+function orderGroups(present, layout) {
+  if (!layout || !Array.isArray(layout.groups)) return present;
+  const presentSet = new Set(present), emitted = new Set(), out = [];
+  layout.groups.forEach((gr) => {
+    const key = groupKey(gr && gr.name);
+    if (!presentSet.has(key) || emitted.has(key)) return;
+    out.push(key); emitted.add(key);
+  });
+  present.forEach((key) => { if (key !== '' && !emitted.has(key)) { out.push(key); emitted.add(key); } });
+  if (presentSet.has('') && !emitted.has('')) out.push('');
+  return out;
+}
+
+// Keys of groups the layout marks collapsed-by-default.
+function layoutCollapsedSet(layout) {
+  const s = new Set();
+  if (layout && Array.isArray(layout.groups)) layout.groups.forEach((gr) => {
+    if (gr && gr.collapsed === true) s.add(groupKey(gr.name));
+  });
+  return s;
+}
+
+// Single write-through for a group's collapse state: DOM class, the header's
+// aria-expanded, and the in-session override map (never persisted — see buildTree).
+function setGroupCollapsed(box, collapsed) {
+  if (!box) return;
+  box.classList.toggle('collapsed', collapsed);
+  box.querySelector('.glabel')?.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  groupCollapseState[box.dataset.group] = collapsed;
+}
+
+function toggleGroup(headerEl) {
+  const box = headerEl.closest('.ggroup');
+  if (box) setGroupCollapsed(box, !box.classList.contains('collapsed'));
+}
+
+// Collapse/expand the group holding the active file — bound to ←/→ (a dedicated
+// designation, distinct from ↑/↓ file nav).
+function setActiveGroupCollapsed(collapsed) {
+  setGroupCollapsed(document.querySelector('.frow.active')?.closest('.ggroup'), collapsed);
+}
+
+// Selecting a file inside a collapsed group auto-expands it so the active row is
+// visible (nav order spans collapsed groups — see ITEMS).
+function expandActiveGroup() {
+  setGroupCollapsed(document.querySelector('.frow.active')?.closest('.ggroup.collapsed'), false);
+}
+
+function buildTree(preferKey, prevSelJson) {
+  const tree = document.getElementById('tree');
+  // Single-pad focus: the viewer shows the current pad's files as a flat list —
+  // no pad-level grouping or switching. (Multiple pads, if ever passed, are
+  // listed together; the current pad is the only mental model.)
+  const items = [];
+  DATA.pads.forEach((pad, pi) => pad.files.forEach((f, fi) => items.push({ pad, f, pi, fi })));
+  // Group files by their (optional) group, preserving first-appearance order of
+  // both the groups and the files within each. Ungrouped files share the '' key,
+  // rendered under the default "FILES" header. ITEMS (j/k nav order) is rebuilt in
+  // the final grouped order so keyboard navigation matches the visible layout.
+  // Grouping is case-insensitive (headers render uppercase, so "Resolved" and
+  // "RESOLVED" are the same group); the first-seen casing wins as the label.
+  const groups = new Map();
+  items.forEach((it) => {
+    const g = groupKey(it.f.group);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(it);
+  });
+  // Group DISPLAY order honors the pad's optional layout (mirror of orderGroupKeys
+  // in manifest.ts). Layout is a per-pad hint, so only apply it in the single-pad
+  // view; multi-pad falls back to first-appearance (the Map preserves it).
+  const layout = DATA.pads.length === 1 ? DATA.pads[0].layout : null;
+  const groupOrder = orderGroups([...groups.keys()], layout);
+  const collapsedDefault = layoutCollapsedSet(layout);
+  ITEMS = groupOrder.flatMap((g) => groups.get(g));
+
+  document.getElementById('padname').textContent = DATA.pads.length === 1 ? DATA.pads[0].name : DATA.rootLabel;
+
+  if (!items.length) {
+    const msg = DATA.pads.length
+      ? '<div class="empty"><div class="big">Empty scratchpad</div><div>No files yet.</div></div>'
+      : '<div class="empty"><div class="big">No scratchpad here</div><div>Create one: <code>scratch new &lt;name&gt; --dir &lt;parent&gt;</code></div></div>';
+    document.getElementById('preview').innerHTML = msg;
+    tree.innerHTML = '<div class="label">FILES</div><div class="notice" style="padding:8px">none</div>';
+    return;
+  }
+
+  let html = '';
+  groupOrder.forEach((g) => {
+    // First-seen casing labels the group (headers render uppercase); '' → "FILES".
+    const label = groups.get(g)[0].f.group || '';
+    // Collapse state: a user's in-session toggle (groupCollapseState) wins; otherwise
+    // the layout default. Toggles are DOM-only and never persisted — relaunch (a fresh
+    // page, empty groupCollapseState) restores the layout default.
+    const isCollapsed = g in groupCollapseState ? groupCollapseState[g] : collapsedDefault.has(g);
+    html += '<div class="ggroup' + (isCollapsed ? ' collapsed' : '') + '" data-group="' + esc(g) + '">';
+    html += '<div class="label glabel" role="button" tabindex="0" aria-expanded="' + (isCollapsed ? 'false' : 'true') + '">' +
+      '<span class="gcaret" aria-hidden="true"></span>' + (label ? esc(label) : 'FILES') + '</div>';
+    html += '<div class="grows">';
+    groups.get(g).forEach(({ pad, f, pi, fi }) => {
+      const key = pad.dir + '::' + f.path;
+      const cls = 'frow' + (f.registered ? '' : ' unreg');
+      const ttl = f.title || f.path;
+      const tag = f.registered ? (f.type || 'note') : '·';
+      html += '<div class="' + cls + '" data-key="' + esc(key) + '" data-pi="' + pi + '" data-fi="' + fi + '">' +
+        fileIcon(f.kind) +
+        '<span class="fttl" title="' + esc(ttl) + '">' + esc(ttl) + '</span><span class="ftag">' + esc(tag) + '</span></div>';
+    });
+    html += '</div></div>';
+  });
+  // Only swap the tree DOM when the markup actually changed — otherwise reloading
+  // (or re-selecting) needlessly destroys/recreates the sidebar = a visible flash.
+  // Compare against the last GENERATED string (reading back innerHTML is unreliable
+  // — the browser normalizes it).
+  if (lastTreeHtml !== html) {
+    lastTreeHtml = html;
+    tree.innerHTML = html;
+    tree.querySelectorAll('.frow[data-fi]').forEach(row => row.addEventListener('click', () => {
+      const pad = DATA.pads[+row.dataset.pi]; renderPreview(pad, pad.files[+row.dataset.fi]);
+    }));
+    tree.querySelectorAll('.glabel').forEach(h => {
+      h.addEventListener('click', () => toggleGroup(h));
+      h.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGroup(h); }
+      });
+    });
+  }
+
+  updateCommentsCount();
+
+  // On a hot-reload we re-select the file the user was on (by pad::path) so the
+  // view doesn't jump back to the top. If it's gone (deleted/renamed), fall back
+  // to the first file and drop raw mode.
+  let sel = items[0];
+  if (preferKey) {
+    const m = items.find(it => (it.pad.dir + '::' + it.f.path) === preferKey);
+    if (m) sel = m;
+  }
+  // On a hot-reload, if the selected file is byte-for-byte unchanged, skip the
+  // preview re-render (it swaps innerHTML + re-runs hljs/mermaid → a visible
+  // blink). Just refresh the tree's active highlight and leave the preview be.
+  const selKey = sel.pad.dir + '::' + sel.f.path;
+  if (prevSelJson != null && selKey === current && JSON.stringify(sel.f) === prevSelJson) {
+    document.querySelectorAll('.frow').forEach(el => el.classList.toggle('active', el.dataset.key === current));
+    expandActiveGroup();
+    return;
+  }
+  renderPreview(sel.pad, sel.f);
+}
+
+// On-demand reload (native host): on a reload request the launcher rebuilds from
+// disk and calls this via win.send(__scratchReload(...)). We patch DATA in place
+// and re-render, preserving the selected file, raw mode, and scroll position —
+// and skipping the preview re-render entirely when the open file is unchanged
+// (buildTree handles that). (When the set of needed vendor bundles GROWS, the
+// launcher re-navigates the whole page instead so highlighting/diagrams load.)
+// Transient bottom-left toast (reload feedback). Re-triggerable: each call resets
+// the auto-dismiss timer; an optional variant ('success' | 'info') tints it.
+let _toastTimer;
+function showToast(msg, variant) {
+  // Guard the document ref: a deferred caller (e.g. the reload toast) can fire
+  // after the DOM is gone (headless teardown), where document is undefined.
+  if (typeof document === 'undefined') return;
+  const el = document.getElementById('toast');
+  if (!el) return;
+  clearTimeout(_toastTimer);
+  el.classList.remove('toast-success', 'toast-info');
+  el.textContent = msg;
+  if (variant) el.classList.add('toast-' + variant);
+  el.classList.add('visible');
+  _toastTimer = setTimeout(() => el.classList.remove('visible'), 2000);
+}
+
+// quiet=true is the hard-refresh auto-sync (see the bootstrap below): patch
+// silently if disk drifted, and say NOTHING when it matches — otherwise every
+// plain launch/refresh (where the embedded island already equals disk) would
+// flash a toast. The user-initiated 'r' reload (quiet falsy) always gives feedback.
+// commentsExport is a snapshot the host RE-RESOLVES on every disk read, while the
+// page mutates comments locally without it. Counting it as a change would make the
+// viewer's own comment write echo back as a content change — rebuilding the tree,
+// reloading an .html preview's iframe and toasting, for a write we already applied.
+function reloadSansDerived(p) {
+  return JSON.stringify(p, (k, v) => (k === 'commentsExport' ? undefined : v));
+}
+// Adopt the freshly-resolved snapshots so the copy shortcut stays current. Mutates
+// the existing file objects in place — currentRef holds one of them.
+function adoptCommentsExport(payload) {
+  const byKey = {};
+  (DATA.pads || []).forEach(p => (p.files || []).forEach(f => { byKey[p.dir + '::' + f.path] = f; }));
+  (payload.pads || []).forEach(p => (p.files || []).forEach(f => {
+    const cur = byKey[p.dir + '::' + f.path];
+    if (cur) cur.commentsExport = f.commentsExport;
+  }));
+}
+window.__scratchReload = function (payload, quiet) {
+  if (!payload || !payload.pads) return;
+  // Nothing on disk changed since last render → no DOM swap, no flash; just tell
+  // the user it's current. This is the common case when reload is pressed out of habit.
+  if (reloadSansDerived(payload) === reloadSansDerived(DATA)) {
+    adoptCommentsExport(payload);
+    if (!quiet) showToast('No changes — up to date', 'info');
+    return;
+  }
+  const key = currentRef ? currentRef.pad.dir + '::' + currentRef.f.path : null;
+  const prevSelJson = currentRef ? JSON.stringify(currentRef.f) : null;
+  const pv = document.getElementById('preview');
+  const scroll = pv ? pv.scrollTop : 0;
+  DATA = payload;
+  buildTree(key, prevSelJson);
+  const pv2 = document.getElementById('preview');
+  if (pv2) pv2.scrollTop = scroll;
+  showToast(quiet ? 'Synced from disk' : 'Reloaded from disk', 'success');
+};
+
+// Theme + settings. The server embeds the persisted choice (#settings island,
+// from the user config file); changes are pushed back through whichever channel
+// exists: WebView2 postMessage → POST /settings (browser server) → localStorage
+// (the file:// export, where no host is listening).
+// Theme registry for the page (id/label + 4 swatch dots per mode) — theme cards
+// are rendered client-side because the starred strip changes as stars toggle.
+const THEMES = (function () {
+  try { return JSON.parse(document.getElementById('themes').textContent); } catch (_) { return []; }
+})();
+const THEME_IDS = THEMES.map((t) => t.id);
+// Mirror of sanitizeStarred (src/config.ts) — keep in sync: known ids, deduped, newest 3 (FIFO).
+function clampStarred(v) {
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const id of v) if (typeof id === 'string' && THEME_IDS.indexOf(id) >= 0 && out.indexOf(id) < 0) out.push(id);
+  return out.slice(-3);
+}
+const SETTINGS = (function () {
+  // tocVisible is deliberately NOT persisted — the TOC is on-demand and always
+  // boots hidden, toggled ('o' / settings) for the current session only. So it's
+  // absent from the embedded snapshot / localStorage / saveConfig, unlike the rest.
+  let s = { themeMode: 'system', colorTheme: 'ember', starredThemes: [], gridStyle: 'dots', wideMode: false, tocVisible: false, zoom: 1, autoReload: true };
+  try { s = Object.assign(s, JSON.parse(document.getElementById('settings').textContent)); } catch (_) {}
+  // With no host the embedded snapshot is whatever the exporting machine had
+  // saved — the reader's own remembered choice wins ('scratch.theme' is the
+  // pre-settings key, kept as a migration seed). EXCEPT for axes the exporter
+  // pinned with "scratch export --theme/--mode": those are a property of the
+  // published page, so the baked value beats localStorage. Note all file:// pages
+  // share one origin, so without pinning ANY export the reader has themed repaints
+  // every other export they open. Seed only — setColorTheme/setThemeMode still work.
+  if (!HAS_HOST) {
+    const PINNED = (document.documentElement.getAttribute('data-theme-pinned') || '').split(' ');
+    try {
+      const m = localStorage.getItem('scratch.themeMode') || localStorage.getItem('scratch.theme');
+      const c = localStorage.getItem('scratch.colorTheme');
+      let st = null;
+      try { st = clampStarred(JSON.parse(localStorage.getItem('scratch.starredThemes') || 'null')); } catch (_) {}
+      const g = localStorage.getItem('scratch.gridStyle');
+      const w = localStorage.getItem('scratch.wideMode');
+      const z = parseFloat(localStorage.getItem('scratch.zoom'));
+      if (PINNED.indexOf('themeMode') < 0 && (m === 'dark' || m === 'light' || m === 'system')) s.themeMode = m;
+      if (PINNED.indexOf('colorTheme') < 0 && c) s.colorTheme = c;
+      if (st) s.starredThemes = st;
+      if (g === 'off' || g === 'dots' || g === 'lines') s.gridStyle = g;
+      if (w === 'true' || w === 'false') s.wideMode = w === 'true';
+      if (z >= 0.5 && z <= 2) s.zoom = z;
+    } catch (_) {}
+  }
+  return s;
+})();
+// Push a payload to whichever host is listening: WebView2 postMessage (wrapped
+// under the given message key) or a POST to the browser server. Returns false
+// when no host is listening (any export — the file itself is the store) so
+// callers can fall back.
+function postToHost(key, path, payload, onFail) {
+  if (!HAS_HOST) return false;
+  const wv = window.chrome && window.chrome.webview;
+  if (wv) {
+    try { const m = {}; m[key] = payload; wv.postMessage(m); } catch (_) {}
+    return true;
+  }
+  if (/^https?:$/.test(location.protocol)) {
+    try {
+      fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+        .then(r => { if (!r.ok && onFail) onFail(); })
+        .catch(() => { if (onFail) onFail(); });
+    } catch (_) {}
+    return true;
+  }
+  return false;
+}
+function persistSettings() {
+  const payload = { themeMode: SETTINGS.themeMode, colorTheme: SETTINGS.colorTheme, starredThemes: SETTINGS.starredThemes, gridStyle: SETTINGS.gridStyle, wideMode: SETTINGS.wideMode, zoom: SETTINGS.zoom, autoReload: SETTINGS.autoReload };
+  if (postToHost('__scratch_settings', '/settings', payload)) return;
+  try {
+    localStorage.setItem('scratch.themeMode', SETTINGS.themeMode);
+    localStorage.setItem('scratch.colorTheme', SETTINGS.colorTheme);
+    localStorage.setItem('scratch.starredThemes', JSON.stringify(SETTINGS.starredThemes));
+    localStorage.setItem('scratch.gridStyle', SETTINGS.gridStyle);
+    localStorage.setItem('scratch.wideMode', String(SETTINGS.wideMode));
+    localStorage.setItem('scratch.zoom', String(SETTINGS.zoom));
+  } catch (_) {}
+}
+function resolvedMode() {
+  if (SETTINGS.themeMode === 'dark' || SETTINGS.themeMode === 'light') return SETTINGS.themeMode;
+  const dark = !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
+  return dark ? 'dark' : 'light';
+}
+function syncThemeIcon() {
+  const dark = document.documentElement.dataset.theme !== 'light';
+  const d = document.querySelector('#themeToggle .i-dark'), l = document.querySelector('#themeToggle .i-light');
+  if (d) d.style.display = dark ? '' : 'none';
+  if (l) l.style.display = dark ? 'none' : '';
+  // Enable exactly one hljs theme stylesheet to match the active mode.
+  const hd = document.getElementById('hljs-dark'), hl = document.getElementById('hljs-light');
+  if (hd) hd.disabled = !dark;
+  if (hl) hl.disabled = dark;
+}
+// Theme cards (settings strip + gallery), rendered from THEMES. Each card
+// carries dot previews for BOTH modes; CSS shows only the resolved mode's set
+// (.sw-dark / .sw-light). The star is a span (a button can't nest in the card
+// button) that toggles a favorite WITHOUT applying the theme.
+function swatchesHtml(dots, cls) {
+  return '<span class="swatches ' + cls + '">' + dots.map((c) => '<span class="swatch" style="background:' + c + '"></span>').join('') + '</span>';
+}
+function themeCardHtml(t, withStar) {
+  return '<button class="theme-card" data-theme-id="' + esc(t.id) + '">' +
+    swatchesHtml(t.dark, 'sw-dark') + swatchesHtml(t.light, 'sw-light') +
+    '<span class="fttl">' + esc(t.label) + '</span>' +
+    (withStar ? '<span class="theme-star" role="button" tabindex="0" data-star="' + esc(t.id) + '" aria-label="Star theme"></span>' : '') +
+    '</button>';
+}
+// Settings shows the starred cards (max 3) plus the active theme when it isn't
+// starred — the current choice must always be visible/clickable there.
+function renderStarredGrid() {
+  const g = document.getElementById('starredGrid');
+  if (!g) return;
+  const ids = SETTINGS.starredThemes.slice();
+  if (ids.indexOf(SETTINGS.colorTheme) < 0) ids.push(SETTINGS.colorTheme);
+  g.innerHTML = ids.map((id) => THEMES.find((t) => t.id === id)).filter(Boolean).map((t) => themeCardHtml(t, false)).join('');
+  syncThemeCards();
+}
+function renderGalleryGrid() {
+  const g = document.getElementById('galleryGrid');
+  if (!g) return;
+  g.innerHTML = THEMES.map((t) => themeCardHtml(t, true)).join('');
+  syncThemeCards();
+}
+function syncThemeCards() {
+  document.querySelectorAll('.theme-card').forEach((b) => b.classList.toggle('on', b.dataset.themeId === SETTINGS.colorTheme));
+  document.querySelectorAll('.theme-star').forEach((s) => {
+    const on = SETTINGS.starredThemes.indexOf(s.dataset.star) >= 0;
+    s.classList.toggle('on', on);
+    s.textContent = on ? '★' : '☆';
+  });
+}
+function toggleStar(id) {
+  const st = SETTINGS.starredThemes;
+  const i = st.indexOf(id);
+  if (i >= 0) st.splice(i, 1);
+  else { st.push(id); if (st.length > 3) st.shift(); } // FIFO: the oldest star drops
+  renderStarredGrid();
+  persistSettings();
+}
+function applyTheme() {
+  const r = document.documentElement;
+  r.dataset.theme = resolvedMode();
+  r.dataset.colorTheme = SETTINGS.colorTheme;
+  r.dataset.grid = SETTINGS.gridStyle;
+  r.toggleAttribute('data-wide', !!SETTINGS.wideMode);
+  syncThemeIcon();
+  // Reflect the active choice in the settings modal.
+  document.querySelectorAll('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === SETTINGS.themeMode));
+  syncThemeCards();
+  document.querySelectorAll('#gridSeg button').forEach((b) => b.classList.toggle('on', b.dataset.grid === SETTINGS.gridStyle));
+  document.querySelectorAll('#widthSeg button').forEach((b) => b.classList.toggle('on', b.dataset.wide === (SETTINGS.wideMode ? 'on' : 'off')));
+  document.querySelectorAll('#autoReloadSeg button').forEach((b) => b.classList.toggle('on', b.dataset.auto === (SETTINGS.autoReload ? 'on' : 'off')));
+  document.querySelectorAll('#tocSeg button').forEach((b) => b.classList.toggle('on', b.dataset.toc === (SETTINGS.tocVisible ? 'on' : 'off')));
+  updateToc();
+}
+function setThemeMode(m) {
+  SETTINGS.themeMode = m;
+  applyTheme();
+  persistSettings();
+  // Mode flips swap the mermaid palette → re-render the open preview.
+  if (currentRef) renderPreview(currentRef.pad, currentRef.f);
+}
+function setColorTheme(id) {
+  SETTINGS.colorTheme = id;
+  // The active-but-unstarred card rides the starred strip — re-render it so the
+  // new choice appears there (and the old one drops out).
+  renderStarredGrid();
+  applyTheme();
+  persistSettings();
+}
+function setGridStyle(g) {
+  SETTINGS.gridStyle = g;
+  applyTheme();
+  persistSettings();
+}
+function setWideMode(on) {
+  SETTINGS.wideMode = on;
+  applyTheme();
+  persistSettings();
+}
+// The watcher is launch-scoped (created by the host at launch), so flipping this
+// persists the choice for the next launch rather than starting/stopping the live
+// watcher — the tooltip on the settings label says so.
+function setAutoReload(on) {
+  SETTINGS.autoReload = on;
+  applyTheme(); // re-syncs the segment
+  persistSettings();
+}
+function setTocVisible(on) {
+  SETTINGS.tocVisible = on;
+  applyTheme(); // re-syncs the segment + calls updateToc(); session-only, not persisted
+  // Turning it on but nothing appears (see tocShouldShow) reads as broken — say
+  // why. Lives here so both entry points ('o' key + settings segment) get it;
+  // the on && guard keeps it off the init/toggle-off paths.
+  if (on && !tocShouldShow()) {
+    const isRenderedMd = currentRef && currentRef.f.kind === 'markdown' && !rawMode;
+    showToast(isRenderedMd ? 'No headings to outline on this page' : 'Outline is only for rendered markdown', 'info');
+  }
+}
+// The table of contents is an opaque on-demand panel: off by default, shown only
+// when the user asks for it ('o' / settings) AND the file has ≥2 headings. Being
+// opaque, it can float over the gutter without a transparency/legibility worry,
+// so no width gating is needed.
+let tocObserver = null;
+function tocShouldShow() {
+  return SETTINGS.tocVisible &&
+    document.querySelectorAll('#preview .md :is(h1,h2,h3,h4,h5,h6)').length >= 2;
+}
+function updateToc() {
+  const toc = document.getElementById('toc');
+  if (toc) toc.style.display = tocShouldShow() ? 'block' : 'none';
+}
+// Build the TOC from the rendered markdown's full heading hierarchy (H1–H6).
+// Runs after each preview render (file switch, raw↔rendered, reload) — it
+// (re)assigns heading ids, wires smooth-scroll links indented by level, and a
+// scroll-spy observer that lights the active section.
+function buildToc() {
+  const toc = document.getElementById('toc');
+  if (!toc) return;
+  if (tocObserver) { tocObserver.disconnect(); tocObserver = null; }
+  const md = document.querySelector('#preview .md');
+  const heads = md ? Array.from(md.querySelectorAll('h1, h2, h3, h4, h5, h6')) : [];
+  const used = {};
+  const slug = (t) => {
+    // GFM slug: drop everything but [a-z0-9], space and hyphen, then map each
+    // space to ONE hyphen. Must NOT collapse runs — "A — B" loses the em-dash to
+    // two spaces → "a--b" (double hyphen), which is the id GitHub/the author links to.
+    let base = (t || '').toLowerCase().replace(/[^a-z0-9 -]+/g, '').replace(/ /g, '-').replace(/^-+|-+$/g, '') || 'section';
+    if (used[base] == null) { used[base] = 0; return base; }
+    return base + '-' + (++used[base]);
+  };
+  // Assign GFM heading ids before the <2-heading early return, so in-page anchor
+  // links ([x](#heading)) resolve even on docs with too few headings for a TOC.
+  heads.forEach((h) => { if (!h.id) h.id = slug(h.textContent); });
+  if (heads.length < 2) { toc.innerHTML = ''; updateToc(); return; }
+  let html = '<div class="toc-head">On this page</div><nav class="toc-nav">';
+  const links = {};
+  heads.forEach((h) => {
+    const id = h.id;
+    html += '<a class="toc-link toc-' + h.tagName.toLowerCase() + '" href="#' + id +
+      '" data-tid="' + id + '" title="' + esc(h.textContent) + '">' + esc(h.textContent) + '</a>';
+  });
+  toc.innerHTML = html + '</nav>';
+  // Move the .active class between two links rather than rescanning every entry
+  // on each scroll-spy batch (fires repeatedly while scrolling).
+  let activeLink = null;
+  const setActive = (id) => {
+    const next = links[id] || null;
+    if (next === activeLink) return;
+    if (activeLink) activeLink.classList.remove('active');
+    if (next) next.classList.add('active');
+    activeLink = next;
+  };
+  toc.querySelectorAll('.toc-link').forEach((a) => {
+    links[a.dataset.tid] = a;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const t = document.getElementById(a.dataset.tid);
+      if (t) pinAnchor(t);
+      // Light the clicked entry right away; the spy keeps it correct as you scroll.
+      setActive(a.dataset.tid);
+    });
+  });
+  // Scroll-spy: a heading counts as "current" while it's in the top 30% band (the
+  // bottom rootMargin clips the rest). Several can sit in the band at once, and
+  // IntersectionObserver delivers entries in no positional order — so we track the
+  // visible set and always light the *topmost* (document-order) one, rather than
+  // letting whichever entry fired last win (which lit the next heading instead).
+  if (typeof IntersectionObserver === 'function') {
+    const visible = new Set();
+    tocObserver = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (en.isIntersecting) visible.add(en.target.id);
+        else visible.delete(en.target.id);
+      });
+      const top = heads.find((h) => visible.has(h.id));
+      if (top) setActive(top.id);
+    }, { root: document.getElementById('preview'), rootMargin: '0px 0px -70% 0px', threshold: 0 });
+    heads.forEach((h) => tocObserver.observe(h));
+  }
+  updateToc();
+}
+window.addEventListener('resize', updateToc);
+renderGalleryGrid();
+renderStarredGrid();
+applyTheme();
+if (window.matchMedia) {
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  (mq.addEventListener ? mq.addEventListener.bind(mq, 'change') : mq.addListener.bind(mq))(() => {
+    if (SETTINGS.themeMode !== 'system') return;
+    applyTheme();
+    if (currentRef) renderPreview(currentRef.pad, currentRef.f);
+  });
+}
+// Quick toggle (topbar button / 't'): flips to an explicit light/dark mode.
+function toggleTheme() { setThemeMode(resolvedMode() === 'dark' ? 'light' : 'dark'); }
+document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+
+// Settings modal.
+const settingsModal = document.getElementById('settingsModal');
+const showSettings = (v) => { settingsModal.style.display = v ? 'flex' : 'none'; };
+document.getElementById('settingsBtn').addEventListener('click', () => showSettings(true));
+document.getElementById('settingsClose').addEventListener('click', () => showSettings(false));
+settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) showSettings(false); });
+document.querySelectorAll('#modeSeg button').forEach((b) => b.addEventListener('click', () => setThemeMode(b.dataset.mode)));
+document.querySelectorAll('#gridSeg button').forEach((b) => b.addEventListener('click', () => setGridStyle(b.dataset.grid)));
+document.querySelectorAll('#widthSeg button').forEach((b) => b.addEventListener('click', () => setWideMode(b.dataset.wide === 'on')));
+document.querySelectorAll('#autoReloadSeg button').forEach((b) => b.addEventListener('click', () => setAutoReload(b.dataset.auto === 'on')));
+document.querySelectorAll('#tocSeg button').forEach((b) => b.addEventListener('click', () => setTocVisible(b.dataset.toc === 'on')));
+
+// Theme grids use delegation — the starred strip re-renders its cards, so
+// per-card listeners would go stale. Star click toggles a favorite only; it
+// must not bubble into the card (which would also apply the theme).
+function bindThemeGrid(el) {
+  el.addEventListener('click', (e) => {
+    const star = e.target.closest && e.target.closest('.theme-star');
+    if (star) { e.stopPropagation(); toggleStar(star.dataset.star); return; }
+    const card = e.target.closest && e.target.closest('.theme-card');
+    if (card) setColorTheme(card.dataset.themeId);
+  });
+}
+bindThemeGrid(document.getElementById('starredGrid'));
+bindThemeGrid(document.getElementById('galleryGrid'));
+
+// Theme gallery modal: opened from settings (which stays open underneath).
+const galleryModal = document.getElementById('galleryModal');
+const showGallery = (v) => { galleryModal.style.display = v ? 'flex' : 'none'; };
+document.getElementById('browseThemes').addEventListener('click', () => showGallery(true));
+document.getElementById('galleryClose').addEventListener('click', () => showGallery(false));
+galleryModal.addEventListener('click', (e) => { if (e.target === galleryModal) showGallery(false); });
+
+// Zoom. Owned by the page (CSS zoom on the root) because neither host remembers
+// zoom across launches: glimpse never exposes WebView2's ZoomFactor, and the
+// browser server binds a random port so the per-origin zoom memory never matches.
+// Persisted as ui.zoom through the same settings channel.
+function applyZoom() {
+  // Full-window mode runs UNZOOMED: CSS zoom on :root reflows the fixed full-window
+  // box against a viewport that no longer matches the window, so the frame landed
+  // offset with page content showing around it. Deriving it from the focus attribute
+  // here keeps one writer of style.zoom — a settings sync mid-focus can't resurrect it.
+  document.documentElement.style.zoom =
+    document.documentElement.hasAttribute('data-focus') ? '' : SETTINGS.zoom;
+  const r = document.getElementById('zoomReset');
+  if (r) r.textContent = Math.round(SETTINGS.zoom * 100) + '%';
+}
+function setZoom(z) {
+  const next = Math.min(2, Math.max(0.5, Math.round(z * 10) / 10));
+  if (next === SETTINGS.zoom) return;
+  SETTINGS.zoom = next;
+  applyZoom();
+  persistSettings();
+  showToast('Zoom ' + Math.round(next * 100) + '%', 'info');
+}
+applyZoom();
+document.getElementById('zoomIn').addEventListener('click', () => setZoom(SETTINGS.zoom + 0.1));
+document.getElementById('zoomOut').addEventListener('click', () => setZoom(SETTINGS.zoom - 0.1));
+document.getElementById('zoomReset').addEventListener('click', () => setZoom(1));
+// Ctrl+wheel: replace the host's transient zoom with ours (non-passive so
+// preventDefault stops Chromium's own page zoom from stacking on top).
+window.addEventListener('wheel', (e) => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  setZoom(SETTINGS.zoom + (e.deltaY < 0 ? 0.1 : -0.1));
+}, { passive: false });
+
+// Re-sync settings from the host after a native reload. A WebView2 reload
+// (Ctrl+R/F5) re-renders the HTML string presented at launch, so the #settings
+// island — and thus SETTINGS above — reflects config as of launch, not changes
+// saved since. We ask the host for the authoritative config (it replies via
+// __scratchSettings) and re-apply whatever drifted. No-op on first launch (island
+// already matches disk) and outside the webview (the browser re-fetches a freshly
+// rebuilt page; the file:// export has no host to ask).
+window.__scratchSettings = function (cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  let drift = false;
+  if ((cfg.themeMode === 'dark' || cfg.themeMode === 'light' || cfg.themeMode === 'system') && cfg.themeMode !== SETTINGS.themeMode) { SETTINGS.themeMode = cfg.themeMode; drift = true; }
+  if (cfg.colorTheme && cfg.colorTheme !== SETTINGS.colorTheme) { SETTINGS.colorTheme = cfg.colorTheme; drift = true; }
+  const starred = clampStarred(cfg.starredThemes);
+  if (starred && JSON.stringify(starred) !== JSON.stringify(SETTINGS.starredThemes)) { SETTINGS.starredThemes = starred; drift = true; }
+  if ((cfg.gridStyle === 'off' || cfg.gridStyle === 'dots' || cfg.gridStyle === 'lines') && cfg.gridStyle !== SETTINGS.gridStyle) { SETTINGS.gridStyle = cfg.gridStyle; drift = true; }
+  if (typeof cfg.wideMode === 'boolean' && cfg.wideMode !== SETTINGS.wideMode) { SETTINGS.wideMode = cfg.wideMode; drift = true; }
+  if (typeof cfg.autoReload === 'boolean' && cfg.autoReload !== SETTINGS.autoReload) { SETTINGS.autoReload = cfg.autoReload; drift = true; }
+  if (typeof cfg.zoom === 'number' && cfg.zoom >= 0.5 && cfg.zoom <= 2 && cfg.zoom !== SETTINGS.zoom) { SETTINGS.zoom = cfg.zoom; drift = true; }
+  if (!drift) return;
+  renderStarredGrid();
+  applyTheme();
+  applyZoom();
+  // A mode flip swaps the mermaid palette → re-render the open file.
+  if (currentRef) renderPreview(currentRef.pad, currentRef.f);
+};
+(function () {
+  const wv = window.chrome && window.chrome.webview;
+  if (!wv) return;
+  // A native hard refresh (Ctrl+R/F5) re-renders the launch-time HTML string, so
+  // the embedded #settings island AND #data island are frozen at launch — stale
+  // after any settings change OR file/comment edit saved since. Ask the host for
+  // both authoritative copies; it replies via __scratchSettings / __scratchReload.
+  // No-op on first launch (the islands already match disk).
+  const post = (msg) => { try { wv.postMessage(msg); } catch (_) {} };
+  post({ __scratch_get_settings: true });
+  post({ __scratch_get_data: true });
+})();
+
+// Shortcuts help modal.
+const helpModal = document.getElementById('helpModal');
+const showHelp = (v) => { helpModal.style.display = v ? 'flex' : 'none'; };
+document.getElementById('helpBtn').addEventListener('click', () => showHelp(true));
+document.getElementById('helpClose').addEventListener('click', () => showHelp(false));
+helpModal.addEventListener('click', (e) => { if (e.target === helpModal) showHelp(false); });
+
+// Diagram lightbox: the ⛶ chip or 'f' over a rendered mermaid SVG enlarges it
+// (fit-to-viewport) — the same affordance an html embed uses, see expandEmbed.
+// The SVG is CLONED into the stage — moving it would break the in-page layout and
+// mermaid's own sizing. Mermaid stamps an inline max-width on the svg that caps it
+// at its layout width; strip it so the lightbox CSS can scale it up.
+const diagramModal = document.getElementById('diagramModal');
+const diagramStage = document.getElementById('diagramStage');
+// Pan/zoom state — ONLY in expanded mode. The cloned svg fits the stage at
+// scale 1 (CSS); zoom/pan layer a CSS transform on top (origin 0 0, so the math
+// below is anchor-able to the cursor). Reset on every open.
+let dgSvg = null, dgScale = 1, dgTx = 0, dgTy = 0, dgDrag = null;
+const DG_MIN = 0.5, DG_MAX = 16;
+// Cursor-anchored zoom offsets by the stage's padding — read it from CSS so the
+// value lives in one place (theme.ts) rather than being duplicated here.
+const DG_PAD = parseFloat(getComputedStyle(diagramStage).paddingLeft) || 0;
+function dgApply() {
+  if (dgSvg) dgSvg.style.transform = 'translate(' + dgTx + 'px,' + dgTy + 'px) scale(' + dgScale + ')';
+}
+function dgReset() { dgScale = 1; dgTx = 0; dgTy = 0; dgApply(); }
+const showDiagram = (v) => {
+  diagramModal.style.display = v ? 'flex' : 'none';
+  if (!v) { diagramStage.innerHTML = ''; dgSvg = null; dgDrag = null; }
+};
+function openDiagram(svg) {
+  const clone = svg.cloneNode(true);
+  clone.style.maxWidth = '';
+  clone.style.transformOrigin = '0 0';
+  diagramStage.innerHTML = '';
+  diagramStage.appendChild(clone);
+  dgSvg = clone;
+  dgReset();
+  showDiagram(true);
+}
+document.getElementById('focusClose').addEventListener('click', exitFocus);
+document.getElementById('diagramClose').addEventListener('click', () => showDiagram(false));
+diagramModal.addEventListener('click', (e) => { if (e.target === diagramModal) showDiagram(false); });
+// Zoom toward the cursor: keep the point under the pointer fixed as scale changes.
+diagramStage.addEventListener('wheel', (e) => {
+  if (!dgSvg) return;
+  e.preventDefault();
+  const r = diagramStage.getBoundingClientRect();
+  const px = e.clientX - r.left - DG_PAD, py = e.clientY - r.top - DG_PAD;
+  const next = Math.min(DG_MAX, Math.max(DG_MIN, dgScale * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+  const k = next / dgScale;
+  dgTx = px - (px - dgTx) * k; dgTy = py - (py - dgTy) * k; dgScale = next;
+  dgApply();
+}, { passive: false });
+diagramStage.addEventListener('pointerdown', (e) => {
+  if (!dgSvg) return;
+  dgDrag = { x: e.clientX, y: e.clientY, tx: dgTx, ty: dgTy };
+  diagramStage.setPointerCapture(e.pointerId);
+});
+diagramStage.addEventListener('pointermove', (e) => {
+  if (!dgDrag) return;
+  dgTx = dgDrag.tx + (e.clientX - dgDrag.x); dgTy = dgDrag.ty + (e.clientY - dgDrag.y);
+  dgApply();
+});
+diagramStage.addEventListener('pointerup', () => { dgDrag = null; });
+diagramStage.addEventListener('dblclick', dgReset);
+
+// Frameless window chrome: glimpse's Windows WebView2 host opens with no system
+// title bar (frameless), so the page must offer its own close affordance. The
+// host closes when the page posts {__glimpse_close:true}. Only shown when running
+// inside the WebView2 host (window.chrome.webview); in the browser fallback there
+// is a normal tab/title bar, so the button stays hidden.
+const webview = window.chrome && window.chrome.webview;
+const closeWindow = webview ? () => webview.postMessage({ __glimpse_close: true })
+  : (window.glimpse && window.glimpse.close ? () => window.glimpse.close() : null);
+
+// Manual reload (button + 'r'). Reload is on-demand, not automatic — a watcher
+// that re-rendered on every disk change blinked. In the WebView2 host we ask the
+// launcher to rebuild from disk and push fresh data (it replies via
+// __scratchReload, which only re-renders the preview if the open file changed);
+// in the browser we just reload the page (the server rebuilds per request).
+function requestReload() {
+  // An export has no disk to reload from — location.reload() would just re-read
+  // the file and silently drop unsaved comments.
+  if (EXPORT_MODE) return;
+  if (webview) { try { webview.postMessage({ __scratch_reload: true }); } catch (_) {} }
+  // Browser: full reload (the server rebuilds per request). Stash a flag so the
+  // freshly-loaded page can surface the toast the native path shows inline.
+  else { try { sessionStorage.setItem('scratch_reloaded', '1'); } catch (_) {} location.reload(); }
+}
+document.getElementById('reloadBtn').addEventListener('click', requestReload);
+// Browser reload just happened → show the toast the pre-reload page couldn't.
+try { if (sessionStorage.getItem('scratch_reloaded')) { sessionStorage.removeItem('scratch_reloaded'); showToast('Reloaded from disk', 'success'); } } catch (_) {}
+
+// Auto hot-reload (browser transport). The server pushes an SSE event when a
+// watched file changes: full → a new vendor bundle is needed, so hard-reload;
+// otherwise fetch the fresh data island and patch in place (quiet — the same
+// no-op/scroll-preserving path 'r' uses). The native window gets its push through
+// the host (__scratchReload) instead, and an export has no server to listen to.
+(function () {
+  if (EXPORT_MODE || webview || !SETTINGS.autoReload) return;
+  if (!/^https?:$/.test(location.protocol) || typeof EventSource === 'undefined') return;
+  try {
+    const es = new EventSource('/events');
+    es.onmessage = function (e) {
+      let full = false;
+      try { full = !!JSON.parse(e.data).full; } catch (_) {}
+      if (full) { try { sessionStorage.setItem('scratch_reloaded', '1'); } catch (_) {} location.reload(); return; }
+      fetch('/data').then((r) => r.json()).then((payload) => { window.__scratchReload(payload, true); }).catch(() => {});
+    };
+  } catch (_) {}
+})();
+(function () {
+  const btn = document.getElementById('closeBtn');
+  if (closeWindow && btn) { btn.style.display = ''; btn.addEventListener('click', closeWindow); }
+})();
+
+// GitHub link: in the WebView2 host a target=_blank popup has no handler, so
+// hand the URL to the system browser via the host (browser fallback keeps the
+// normal anchor behavior).
+document.getElementById('repoLink').addEventListener('click', (e) => {
+  if (!webview) return;
+  e.preventDefault();
+  webview.postMessage({ __glimpse_open: e.currentTarget.href });
+});
+
+// Resizable sidebar: drag the handle to set the tree width, persisted across
+// sessions. Width is clamped so neither pane can be dragged away entirely.
+(function () {
+  const TREE_MIN = 200, TREE_MAX = 640;
+  const resizer = document.getElementById('resizer');
+  const tree = document.getElementById('sidebar');
+  const setW = (px) => {
+    const w = Math.max(TREE_MIN, Math.min(TREE_MAX, px));
+    document.documentElement.style.setProperty('--tree-w', w + 'px');
+    return w;
+  };
+  try { const saved = parseInt(localStorage.getItem('scratch.treeW'), 10); if (saved) setW(saved); } catch (_) {}
+  let dragging = false;
+  const onMove = (e) => { if (dragging) setW(e.clientX - tree.getBoundingClientRect().left); };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    tree.classList.remove('resizing');
+    document.body.style.userSelect = '';
+    document.body.style.cursor = '';
+    try { localStorage.setItem('scratch.treeW', String(tree.getBoundingClientRect().width | 0)); } catch (_) {}
+  };
+  resizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    resizer.classList.add('dragging');
+    tree.classList.add('resizing');
+    // Suppress text selection + keep the resize cursor through the whole drag.
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+  });
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+  // Double-click resets to the default width. preventDefault stops the browser's
+  // double-click default (text selection / smart-zoom) from firing on the handle.
+  resizer.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    document.documentElement.style.removeProperty('--tree-w');
+    try { localStorage.removeItem('scratch.treeW'); } catch (_) {}
+    showToast('Sidebar width reset', 'info');
+  });
+})();
+
+// Collapsible sidebar (in-pane panel button / '['). Like the resizable width
+// (scratch.treeW above), this is per-machine window geometry — localStorage,
+// not the config file.
+const sidebarEl = document.getElementById('sidebar');
+function toggleSidebar() {
+  const c = sidebarEl.classList.toggle('collapsed');
+  try { localStorage.setItem('scratch.sidebarCollapsed', c ? '1' : '0'); } catch (_) {}
+}
+document.getElementById('sidebarToggle').addEventListener('click', toggleSidebar);
+// The in-pane toggle collapses away with the pane; this floater (top-left of
+// the body, shown by CSS only while collapsed) is the way back.
+document.getElementById('sidebarOpen').addEventListener('click', toggleSidebar);
+try {
+  if (localStorage.getItem('scratch.sidebarCollapsed') === '1') {
+    // Restore closed without the slide-shut animation playing at boot.
+    sidebarEl.style.transition = 'none';
+    sidebarEl.classList.add('collapsed');
+    setTimeout(() => { sidebarEl.style.transition = ''; }, 0);
+  }
+} catch (_) {}
+
+// Collapsible top bar (']' key). Per-machine window geometry, same as the
+// sidebar above — localStorage, not the config file.
+const topbarEl = document.getElementById('topbar');
+function toggleTopbar() {
+  const c = topbarEl.classList.toggle('collapsed');
+  try { localStorage.setItem('scratch.topbarCollapsed', c ? '1' : '0'); } catch (_) {}
+}
+try {
+  if (localStorage.getItem('scratch.topbarCollapsed') === '1') {
+    topbarEl.style.transition = 'none';
+    topbarEl.classList.add('collapsed');
+    setTimeout(() => { topbarEl.style.transition = ''; }, 0);
+  }
+} catch (_) {}
+
+// Keyboard shortcuts (see the help modal). Ignored while typing in a field.
+const previewEl = document.getElementById('preview');
+document.addEventListener('keydown', (e) => {
+  // A trusted event came from the host page, so any frame recorded by the relay
+  // (which dispatches an UNtrusted synthetic event) is stale — don't let it decide
+  // which embed 'f' expands.
+  if (e.isTrusted) keySource = null;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    // Take over the host's zoom accelerators so OUR (persisted) zoom is the one
+    // that moves, instead of Chromium's forgotten-on-relaunch page zoom.
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoom(SETTINGS.zoom + 0.1); return; }
+    if (e.key === '-') { e.preventDefault(); setZoom(SETTINGS.zoom - 0.1); return; }
+    if (e.key === '0') { e.preventDefault(); setZoom(1); return; }
+    // Save / export a copy — swallow the host's "save page" so ours runs instead.
+    if (e.key === 's' || e.key === 'S') { e.preventDefault(); saveCopy(); return; }
+  }
+  // Ctrl+Alt copies (not Ctrl+Shift+C — that's the browser's inspect-element).
+  // Alt is excluded from the block above, so handle these here.
+  if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'c' || e.key === 'C')) {
+    e.preventDefault(); copyPageComments(); return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'p' || e.key === 'P')) {
+    e.preventDefault(); copyManifestPath(); return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'h' || e.key === 'H')) {
+    e.preventDefault(); hideCurrentFile(); return;
+  }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  // Full-window mode owns the viewport, so only exit / quit / theme act here. Every
+  // other shortcut would change something invisible behind the frame; ignore it so
+  // you can never end up chrome-less with no way back. (Keys typed inside the frame
+  // reach us via the postMessage relay in armHtmlFrames, so Esc always works.)
+  if (focusedFrame) {
+    if (e.key === 'Escape' || e.key === 'f') { e.preventDefault(); exitFocus(); return; }
+    if (e.key === 'q' && closeWindow) { closeWindow(); return; }
+    if (e.key === 't') { toggleTheme(); return; }
+    return;
+  }
+  if (e.key === 'f') { expandEmbed(); return; }
+  if (e.key === 'Escape') {
+    // Esc only dismisses open overlays — never closes the window ('q' does that).
+    if (diagramModal.style.display !== 'none') showDiagram(false);
+    else if (galleryModal.style.display !== 'none') showGallery(false);
+    else if (settingsModal.style.display !== 'none') showSettings(false);
+    else if (helpModal.style.display !== 'none') showHelp(false);
+    else if (SETTINGS.tocVisible) setTocVisible(false);
+    return;
+  }
+  if (e.key === 'q' && closeWindow) { closeWindow(); return; }
+  if (e.key === '?') { showHelp(helpModal.style.display === 'none'); return; }
+  if (e.key === 's') { showSettings(settingsModal.style.display === 'none'); return; }
+  if (e.key === 't') { toggleTheme(); return; }
+  if (e.key === '[') { toggleSidebar(); return; }
+  if (e.key === ']') { toggleTopbar(); return; }
+  if (e.key === 'r') { requestReload(); return; }
+  if (e.key === 'v' && currentRef && currentRef.f.kind === 'markdown' && currentRef.f.content != null) {
+    setRaw(!rawMode); renderPreview(currentRef.pad, currentRef.f); return;
+  }
+  if (e.key === 'o') { setTocVisible(!SETTINGS.tocVisible); return; }
+  if (e.key === 'C') { copyActivePath(); return; }
+  if (e.key === 'c') { setCommentsVisible(!commentsVisible); return; }
+  // vimium-style scrolling: j/k line steps, d/u half page. Instant (no smooth) —
+  // smooth scrollBy queues badly under key auto-repeat. File nav stays on arrows.
+  if (e.key === 'j' || e.key === 'k') {
+    e.preventDefault(); previewEl.scrollBy(0, e.key === 'j' ? 60 : -60); return;
+  }
+  if (e.key === 'd' || e.key === 'u') {
+    e.preventDefault(); previewEl.scrollBy(0, (e.key === 'd' ? 1 : -1) * previewEl.clientHeight / 2); return;
+  }
+  if (e.key === 'g' || e.key === 'G') {
+    e.preventDefault(); previewEl.scrollTo(0, e.key === 'g' ? 0 : previewEl.scrollHeight); return;
+  }
+  // ←/→ collapse/expand the active file's group (dedicated designation); ↑/↓ move
+  // between files. Nav auto-expands a collapsed target group (see expandActiveGroup).
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault(); setActiveGroupCollapsed(e.key === 'ArrowLeft'); return;
+  }
+  const next = e.key === 'ArrowDown';
+  const prev = e.key === 'ArrowUp';
+  if ((next || prev) && ITEMS.length) {
+    e.preventDefault();
+    const n = curIdx + (next ? 1 : -1);
+    if (n >= 0 && n < ITEMS.length) { renderPreview(ITEMS[n].pad, ITEMS[n].f); }
+  }
+});
+
+// Intercept link clicks in the preview. The viewer is a single self-contained
+// page (loaded via setHTML in the WebView2 host — NO server, NO real URLs), so
+// letting a link navigate the webview lands on a dead URL = blank window. Instead:
+//   • relative link to a pad file  → open that file in the viewer
+//   • external (http/https/mailto) → hand off to the system browser
+//   • anything else                → swallow (no navigation)
+// Scroll an in-doc anchor to the top of the preview, CLAMPED to the container's
+// scroll range. A near-bottom target — notably the footnotes block, which
+// renderMarkdown appends at the very end — has less content below it than the
+// viewport height, and scrollIntoView({block:'start'}) over-scrolls past the
+// bottom here (WebView2/Chromium), leaving a blank gap below the doc. Computing
+// the target scrollTop and clamping to [0, scrollHeight - clientHeight] keeps the
+// scroll constrained to actual content. ANCHOR_GAP gives a little headroom above
+// the target (mirrors the headings' scroll-margin-top).
+const ANCHOR_GAP = 24;
+function scrollToAnchor(el) {
+  if (!el || !previewEl) return;
+  const offsetTop = el.getBoundingClientRect().top - previewEl.getBoundingClientRect().top;
+  const top = previewEl.scrollTop + offsetTop - ANCHOR_GAP;
+  const max = Math.max(0, previewEl.scrollHeight - previewEl.clientHeight);
+  // Set scrollTop directly (clamped) rather than scrollTo({behavior:'smooth'}):
+  // the destination clamp is the actual fix (a near-bottom target like the
+  // appended footnotes can't over-scroll past the content), and a direct set is
+  // synchronous — scrollTo's smooth animation schedules an async scroll event that
+  // outlives a headless page and crashes the test runner.
+  previewEl.scrollTop = Math.max(0, Math.min(top, max));
+}
+// Re-pin an anchor jump across the next few frames. A single scrollToAnchor lands
+// correctly for the CURRENT layout, but content below shifts as it settles (HTML
+// embed iframes post their height back async; images decode after insertion), which
+// drifts the target off the top. Re-applying for a short window keeps it pinned —
+// this is why footnote/cross-file jumps felt accurate but a one-shot TOC click didn't.
+// pinToken cancels an in-flight pin when a newer jump (or a re-render) supersedes it,
+// so loops never fight each other or scroll a stale element.
+const PIN_FRAMES = 8;
+let pinToken = 0;
+function cancelPin() { pinToken++; }
+function pinAnchor(el) {
+  if (!el) return;
+  const my = ++pinToken;
+  scrollToAnchor(el);
+  if (typeof requestAnimationFrame !== 'function') return;
+  let n = 0;
+  const tick = () => {
+    if (my !== pinToken) return; // superseded by a newer jump / navigation
+    scrollToAnchor(el);
+    if (++n < PIN_FRAMES) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+// Transient target highlight: after a citation/anchor jump, flash the landing
+// element so it's obvious where you ended up, then fade out (CSS anim, ~10s).
+// Toggling the class with a forced reflow restarts the animation on re-clicks,
+// and only one target stays lit at a time.
+let flashEl = null, flashTimer = null;
+function flashTarget(el) {
+  if (!el) return;
+  if (flashEl && flashEl !== el) flashEl.classList.remove('anchor-flash');
+  if (flashTimer) clearTimeout(flashTimer);
+  el.classList.remove('anchor-flash');
+  void el.offsetWidth; // reflow so the animation restarts even on the same node
+  el.classList.add('anchor-flash');
+  flashEl = el;
+  flashTimer = setTimeout(() => { el.classList.remove('anchor-flash'); flashEl = flashTimer = null; }, 10000);
+}
+previewEl.addEventListener('click', (e) => {
+  const a = e.target.closest && e.target.closest('a');
+  if (!a) return;
+  e.preventDefault();
+  const href = a.getAttribute('href') || '';
+  if (/^(https?:|mailto:)/i.test(href)) {
+    const wv = window.chrome && window.chrome.webview;
+    if (wv) wv.postMessage({ __glimpse_open: href }); else window.open(href, '_blank');
+    return;
+  }
+  if (!currentRef || !href) return;
+  const hashAt = href.indexOf('#');
+  const filePart = hashAt >= 0 ? href.slice(0, hashAt) : href;
+  const hash = hashAt >= 0 ? decodeURIComponent(href.slice(hashAt + 1)) : '';
+  // Pure in-page anchor [x](#heading): scroll within the current doc (ids assigned
+  // by buildToc on every render). No re-render, so no scroll-restore to fight.
+  if (!filePart) {
+    const t = hash && document.getElementById(hash);
+    if (t) { pinAnchor(t); flashTarget(t); }
+    return;
+  }
+  const target = resolveRel(currentRef.f.path, filePart);
+  const pad = currentRef.pad;
+  const f = pad.files.find(x => x.path === target || x.path === filePart || x.path.endsWith('/' + target));
+  // Cross-file link: open the doc at its #fragment, or at the top for a plain link
+  // — following a link is a fresh read, NOT a resume (that's reserved for the nav).
+  if (f) { renderPreview(pad, f, hash ? { anchor: hash } : { top: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// Clickable task checkboxes. The viewer is read-only EXCEPT here: clicking a
+// rendered "- [ ]" / "- [x]" toggles that marker in the source FILE (not the
+// manifest). The edit is line-addressed — li.dataset.line is the source line —
+// and persists through the same channel fan-out as settings/comments
+// (WebView2 __scratch_checkbox / POST /checkbox). The TASK_MARKER regex mirrors
+// the host's (launch.ts persistFileCheckbox) so both flip the same char.
+const TASK_MARKER = /^(\s*[-*+]\s+\[)([ xX])(\].*)$/;
+function persistCheckbox(line, checked) {
+  if (!currentRef) return false;
+  const payload = { padDir: currentRef.pad.dir, filePath: currentRef.f.path, line: line, checked: checked };
+  return postToHost('__scratch_checkbox', '/checkbox', payload, () => showToast('Saving checkbox failed'));
+}
+previewEl.addEventListener('click', (e) => {
+  const chk = e.target.closest && e.target.closest('.md li.task .chk');
+  if (!chk) return;
+  const li = chk.closest('li.task');
+  const f = currentRef && currentRef.f;
+  if (!li || !f || f.kind !== 'markdown' || f.content == null) return;
+  const line = parseInt(li.dataset.line, 10);
+  if (isNaN(line)) return;
+  const checked = !li.classList.contains('done');
+  // Flip the marker in the embedded content too, so the raw view, a re-render,
+  // and a second click all stay in sync. Bail if the line drifted (file changed
+  // underneath) rather than edit the wrong line.
+  const lines = f.content.replace(/\r\n/g, '\n').split('\n');
+  const m = lines[line] != null && lines[line].match(TASK_MARKER);
+  if (!m) return;
+  lines[line] = m[1] + (checked ? 'x' : ' ') + m[3];
+  f.content = lines.join('\n');
+  li.classList.toggle('done', checked);
+  chk.textContent = checked ? '✓' : '';
+  chk.setAttribute('aria-checked', String(checked));
+  if (!persistCheckbox(line, checked)) showToast('Checkboxes cannot be saved from an exported page', 'info');
+});
+
+// ---------------------------------------------------------------------------
+// Inline comments. Quote-anchored margin notes on the RENDERED markdown view
+// (see _plans/SPEC.md): the manifest stores {quote, prefix, suffix} and we
+// re-find the quote in the preview's text on every render. Mutations replace
+// the file's whole comments array and persist through the same channel as
+// settings (WebView2 postMessage / POST /comments); the page updates in place.
+let commentsVisible = true;
+try { commentsVisible = localStorage.getItem('scratch.comments') !== '0'; } catch (_) {}
+let ORPHANS = []; // comments whose quote wasn't found in the current render
+
+function cmtNowIso() { return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'); }
+function nComments(n) { return n + ' comment' + (n > 1 ? 's' : ''); }
+function cmtId() {
+  if (window.crypto && window.crypto.randomUUID) { try { return window.crypto.randomUUID(); } catch (_) {} }
+  return 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+${CMT_MATCH_JS}
+
+// Always-visible concise note pill after the highlight. The text lives in a
+// data attribute rendered via CSS ::after, so it's not a DOM text node — it
+// can't be selected and never pollutes quote/prefix matching.
+function cmtNoteText(body) { return body.length > 48 ? body.slice(0, 48) + '…' : body; }
+function cmtAttachNote(c, lastSpan) {
+  const n = document.createElement('span');
+  n.className = 'cmt-note';
+  n.dataset.cid = c.id;
+  n.dataset.note = cmtNoteText(c.body);
+  n.title = c.body;
+  lastSpan.parentNode.insertBefore(n, lastSpan.nextSibling);
+}
+function cmtMark(found, c) {
+  const spans = cmtWrap(found, c.id);
+  if (spans.length) cmtAttachNote(c, spans[spans.length - 1]);
+}
+
+function cmtUnwrap(cid) {
+  document.querySelectorAll('.cmt-note').forEach(n => { if (n.dataset.cid === cid) n.remove(); });
+  cmtUnwrapIn(document, cid);
+}
+
+function findComment(cid) {
+  const f = currentRef && currentRef.f;
+  return f && (f.comments || []).find(c => c.id === cid);
+}
+
+// Persist the active file's full comment array (add/edit/delete all replace it
+// wholesale). Same channel fan-out as persistSettings; in an export there is no
+// host — the mutation already lives in DATA, so arm Save-a-copy instead: saving
+// the page file is what persists comments there.
+function persistComments() {
+  if (!currentRef) return;
+  if (EXPORT_MODE) {
+    setExportDirty(true);
+    showToast('Comment kept in this page — Save a copy to keep it in the file', 'info');
+    updateCommentsCount();
+    return;
+  }
+  const payload = { padDir: currentRef.pad.dir, filePath: currentRef.f.path, comments: currentRef.f.comments || [] };
+  const sent = postToHost('__scratch_comments', '/comments', payload, () => showToast('Saving comment failed'));
+  if (!sent) showToast('Comments cannot be saved from this page', 'info');
+  updateCommentsCount();
+}
+
+// --- Save a copy (static export only) ---
+// New/edited comments in an export live only in DATA until the user saves the
+// page itself. Saving = splice the current DATA into the boot-time PRISTINE
+// source (never the live DOM — hljs and comment marks have rewritten it) and
+// hand the result over as a real file (showSaveFilePicker) or a download.
+let exportDirty = false;
+function setExportDirty(v) {
+  exportDirty = v;
+  const d = document.getElementById('saveDot');
+  if (d) d.hidden = !v;
+  const b = document.getElementById('saveCopy');
+  if (b) b.title = v
+    ? 'Unsaved comments — save a copy of this file to keep them'
+    : 'Save a copy of this page — comments live in the saved file';
+}
+function builtExportHtml() {
+  // Saving from a live viewer turns the snapshot into a standalone export: mark
+  // <html> with data-export so the saved file opens in export mode (file is the
+  // comment store). Already present when re-saving an export — replace only the
+  // real opening tag, never an escaped <html in rendered content.
+  const src = EXPORT_MODE ? PRISTINE : PRISTINE.replace(/<html(?=[ >])/, '<html data-export');
+  const open = '<script id="data" type="application/json">';
+  const close = '</' + 'script>';
+  const i = src.indexOf(open);
+  const j = i === -1 ? -1 : src.indexOf(close, i);
+  if (j === -1) return null;
+  // payloadJson's escaping, so the island can never contain a closing script tag.
+  return src.slice(0, i + open.length) + JSON.stringify(DATA).replace(/</g, '\\u003c') + src.slice(j);
+}
+function saveCopyName() {
+  // Match the scratch export output name (baked onto <html> at render time).
+  const n = document.documentElement.getAttribute('data-export-name');
+  if (n) return n + '.html';
+  try {
+    const p = decodeURIComponent(location.pathname.split('/').pop() || '');
+    if (/\.html?$/i.test(p)) return p;
+  } catch (_) {}
+  return 'scratchpad.html';
+}
+// The native host echoes a save result here (it owns the real OS dialog).
+window.__scratchSaved = function (res) {
+  if (res && res.saved) { setExportDirty(false); showToast(res.path ? 'Saved → ' + res.path : 'Saved', 'success'); }
+};
+function saveCopy() {
+  const html = builtExportHtml();
+  if (html == null) { showToast('Save failed'); return; }
+  const name = saveCopyName();
+  // Native WebView2: setHTML's origin isn't a secure context, so showSaveFilePicker
+  // is unavailable — hand the bytes to the host, which opens a real OS save dialog
+  // and writes the file (it calls back via window.__scratchSaved).
+  const wv = window.chrome && window.chrome.webview;
+  if (wv) {
+    try { wv.postMessage({ __scratch_save: { html: html, name: name } }); showToast('Choose where to save…', 'info'); }
+    catch (_) { showToast('Save failed'); }
+    return;
+  }
+  const blob = new Blob([html], { type: 'text/html' });
+  const done = () => { setExportDirty(false); showToast('Saved — that file carries the comments', 'success'); };
+  if (window.showSaveFilePicker) {
+    // file:// counts as a secure context in Chromium, so exports get a real
+    // save dialog; everywhere else falls back to a plain download.
+    window.showSaveFilePicker({ suggestedName: name, types: [{ description: 'HTML page', accept: { 'text/html': ['.html'] } }] })
+      .then((h) => h.createWritable())
+      .then((w) => w.write(blob).then(() => w.close()))
+      .then(done)
+      .catch((e) => { if (!e || e.name !== 'AbortError') downloadCopy(blob, name, done); });
+    return;
+  }
+  downloadCopy(blob, name, done);
+}
+function downloadCopy(blob, name, done) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch (_) {} }, 10000);
+  done();
+}
+const saveCopyBtn = document.getElementById('saveCopy');
+if (saveCopyBtn) saveCopyBtn.addEventListener('click', saveCopy);
+// Don't let unsaved comments vanish with a casual tab close.
+if (EXPORT_MODE) window.addEventListener('beforeunload', (e) => {
+  if (exportDirty) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// --- popover (one at a time; view / edit / new / orphan-list modes) ---
+let cmtPopEl = null;
+function closeCmtPop() { if (cmtPopEl) { cmtPopEl.remove(); cmtPopEl = null; } }
+function openCmtPop(rect, build) {
+  closeCmtPop();
+  const el = document.createElement('div');
+  el.className = 'cmt-pop';
+  build(el);
+  document.body.appendChild(el);
+  // rect is in screen (viewport) px, but this fixed element sits inside the
+  // zoomed root, so its left/top get multiplied by zoom at layout — assign
+  // them in the root's own coordinate space or the popover lands away from
+  // the comment whenever zoom != 100%.
+  const z = SETTINGS.zoom || 1;
+  const w = el.offsetWidth || 300, h = el.offsetHeight || 120;
+  const vw = (window.innerWidth || 1280) / z, vh = (window.innerHeight || 800) / z;
+  const left = Math.min(Math.max(8, rect.left / z), Math.max(8, vw - w - 8));
+  let top = rect.bottom / z + 6;
+  if (top + h > vh - 8) top = Math.max(8, rect.top / z - h - 6);
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+  cmtPopEl = el;
+}
+function cmtBtn(label, onClick) {
+  const b = document.createElement('button');
+  b.className = 'pbtn';
+  b.textContent = label;
+  b.addEventListener('click', onClick);
+  return b;
+}
+function cmtViewPop(c, rect) {
+  openCmtPop(rect, (el) => {
+    const body = document.createElement('div'); body.className = 'cmt-body'; body.textContent = c.body; el.appendChild(body);
+    const when = document.createElement('div'); when.className = 'cmt-when';
+    when.textContent = 'created ' + fmtWhen(c.created) + (c.updated && c.updated !== c.created ? ' · updated ' + fmtWhen(c.updated) : '');
+    when.title = 'created ' + fmtFull(c.created) + (c.updated && c.updated !== c.created ? ' · updated ' + fmtFull(c.updated) : '');
+    el.appendChild(when);
+    const act = document.createElement('div'); act.className = 'cmt-actions';
+    act.appendChild(cmtBtn('edit', () => cmtEditPop(c, rect)));
+    act.appendChild(cmtBtn('delete', () => deleteComment(c.id)));
+    el.appendChild(act);
+  });
+}
+// Ctrl/Cmd+Enter in a comment textarea submits, like every commenting UI.
+function cmtCtrlEnter(ta, submit) {
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(); }
+  });
+}
+function cmtEditPop(c, rect) {
+  openCmtPop(rect, (el) => {
+    const ta = document.createElement('textarea'); ta.value = c.body; el.appendChild(ta);
+    const act = document.createElement('div'); act.className = 'cmt-actions';
+    act.appendChild(cmtBtn('cancel', () => cmtViewPop(c, rect)));
+    const save = () => {
+      const body = ta.value.trim();
+      if (!body) return;
+      c.body = body;
+      c.updated = cmtNowIso();
+      persistComments();
+      document.querySelectorAll('.cmt-note').forEach(n => {
+        if (n.dataset.cid === c.id) { n.dataset.note = cmtNoteText(c.body); n.title = c.body; }
+      });
+      syncFrameComments(); // in-frame marks carry the body as their tooltip
+      closeCmtPop();
+      showToast('Comment saved', 'success');
+    };
+    act.appendChild(cmtBtn('save', save));
+    el.appendChild(act);
+    cmtCtrlEnter(ta, save);
+    try { ta.focus(); } catch (_) {}
+  });
+}
+function cmtNewPop(anchor, rect) {
+  openCmtPop(rect, (el) => {
+    const ta = document.createElement('textarea'); ta.setAttribute('placeholder', 'Add a comment…'); el.appendChild(ta);
+    const act = document.createElement('div'); act.className = 'cmt-actions';
+    act.appendChild(cmtBtn('cancel', () => closeCmtPop()));
+    const add = () => {
+      const body = ta.value.trim();
+      if (!body || !currentRef) return;
+      const ts = cmtNowIso();
+      const c = { id: cmtId(), body, anchor, created: ts, updated: ts };
+      const f = currentRef.f;
+      f.comments = f.comments || [];
+      f.comments.push(c);
+      persistComments();
+      // Highlight in place — re-rendering the whole preview would lose scroll.
+      const md = previewEl.querySelector('.md');
+      const found = md && cmtFindAnchor(md, anchor);
+      if (found) cmtMark(found, c);
+      else if (!md && previewFrame()) syncFrameComments(); // the frame marks its own
+      else { ORPHANS.push(c); refreshOrphanPill(); }
+      closeCmtPop();
+      hideCmtAdd();
+      try { const sel = window.getSelection(); if (sel) sel.removeAllRanges(); } catch (_) {}
+      showToast('Comment added', 'success');
+    };
+    act.appendChild(cmtBtn('add', add));
+    el.appendChild(act);
+    cmtCtrlEnter(ta, add);
+    try { ta.focus(); } catch (_) {}
+  });
+}
+function openOrphansPop(pill) {
+  const rect = pill.getBoundingClientRect();
+  openCmtPop(rect, (el) => {
+    ORPHANS.forEach(c => {
+      const row = document.createElement('div'); row.className = 'cmt-orow';
+      const q = document.createElement('div'); q.className = 'cmt-quote';
+      const quote = c.anchor && c.anchor.quote || '';
+      q.textContent = '“' + (quote.length > 60 ? quote.slice(0, 60) + '…' : quote) + '”';
+      const body = document.createElement('div'); body.className = 'cmt-body'; body.textContent = c.body;
+      const act = document.createElement('div'); act.className = 'cmt-actions';
+      act.appendChild(cmtBtn('edit', () => cmtEditPop(c, rect)));
+      act.appendChild(cmtBtn('delete', () => deleteComment(c.id)));
+      row.appendChild(q); row.appendChild(body); row.appendChild(act);
+      el.appendChild(row);
+    });
+  });
+}
+
+// Pad-wide comments summary, anchored to the header toggle. Read-only list grouped
+// by file; clicking a row jumps to that comment. Visibility is toggled via 'c'.
+function openCommentsSummary(btn) {
+  const rect = btn.getBoundingClientRect();
+  const items = [];
+  (DATA.pads || []).forEach(pad => (pad.files || []).forEach(f =>
+    (f.comments || []).forEach(c => items.push({ pad, f, c }))));
+  openCmtPop(rect, (el) => {
+    el.classList.add('cmt-summary');
+    const head = document.createElement('div'); head.className = 'cmt-shead';
+    head.textContent = items.length ? nComments(items.length) : 'No comments';
+    el.appendChild(head);
+    if (!items.length) {
+      const hint = document.createElement('div'); hint.className = 'cmt-when';
+      hint.textContent = 'Select text in a file to add one.';
+      el.appendChild(hint);
+      return;
+    }
+    let lastFile = null;
+    items.forEach(({ pad, f, c }) => {
+      if (f !== lastFile) {
+        lastFile = f;
+        const fh = document.createElement('div'); fh.className = 'cmt-sfile';
+        fh.textContent = f.title || f.path;
+        el.appendChild(fh);
+      }
+      const row = document.createElement('div'); row.className = 'cmt-srow';
+      const body = document.createElement('div'); body.className = 'cmt-body'; body.textContent = c.body;
+      row.appendChild(body);
+      const quote = ((c.anchor && c.anchor.quote) || '').trim();
+      if (quote) {
+        const q = document.createElement('div'); q.className = 'cmt-quote';
+        q.textContent = quote.length > 80 ? quote.slice(0, 80) + '…' : quote;
+        row.appendChild(q);
+      }
+      const when = document.createElement('div'); when.className = 'cmt-when';
+      when.textContent = fmtWhen(c.created);
+      when.title = fmtFull(c.created);
+      row.appendChild(when);
+      row.addEventListener('click', () => gotoComment(pad, f, c));
+      el.appendChild(row);
+    });
+  });
+}
+
+// Open a comment's file from the summary and surface it (scroll + popover when
+// the quote still resolves in the render; orphans just navigate).
+function gotoComment(pad, f, c) {
+  closeCmtPop();
+  if (!currentRef || currentRef.f !== f) renderPreview(pad, f);
+  const hl = document.querySelector('.cmt-hl[data-cid="' + c.id + '"]');
+  if (hl) {
+    try { hl.scrollIntoView({ block: 'center' }); } catch (_) {}
+    if (commentsVisible) cmtViewPop(c, hl.getBoundingClientRect());
+    return;
+  }
+  // No host-side mark: an .html preview keeps its marks inside the frame, which
+  // reveals the comment and reports back through the click path.
+  pendingGoto = c.id;
+  flushGoto();
+}
+
+function deleteComment(cid) {
+  const f = currentRef && currentRef.f;
+  if (!f) return;
+  f.comments = (f.comments || []).filter(c => c.id !== cid);
+  ORPHANS = ORPHANS.filter(c => c.id !== cid);
+  persistComments();
+  cmtUnwrap(cid);
+  syncFrameComments();
+  refreshOrphanPill();
+  closeCmtPop();
+  showToast('Comment deleted', 'success');
+}
+
+// Clear every comment on the active file in one shot (current-file scope only —
+// persistComments writes just this file's array). Unwraps all highlights/notes
+// and orphans, then persists the now-empty array through the same channel.
+function deleteAllComments() {
+  const f = currentRef && currentRef.f;
+  if (!f || !f.comments || !f.comments.length) return;
+  const n = f.comments.length;
+  const ids = f.comments.map(c => c.id);
+  f.comments = [];
+  ORPHANS = [];
+  persistComments();
+  ids.forEach(cmtUnwrap);
+  syncFrameComments();
+  refreshOrphanPill();
+  closeCmtPop();
+  showToast(nComments(n) + ' deleted', 'success');
+}
+
+function refreshOrphanPill() {
+  let pill = document.getElementById('cmtOrphans');
+  if (!ORPHANS.length) { if (pill) pill.remove(); return; }
+  const label = '⚠ ' + ORPHANS.length + ' orphaned comment' + (ORPHANS.length > 1 ? 's' : '');
+  if (pill) { pill.textContent = label; return; }
+  // Mounts above whichever body the preview rendered — the markdown pane, or the
+  // frame of a standalone .html file (whose orphans the frame reports back).
+  const md = previewEl.querySelector('.md, iframe.htmlframe');
+  if (!md) return;
+  pill = document.createElement('div');
+  pill.id = 'cmtOrphans';
+  pill.className = 'cmt-orphans';
+  pill.title = 'Comments whose quoted text was not found in the file';
+  pill.textContent = label;
+  pill.addEventListener('click', () => { if (commentsVisible) openOrphansPop(pill); });
+  md.parentNode.insertBefore(pill, md);
+}
+
+// (Re)apply all of the current file's comments to a fresh preview render.
+// Orphans (quote not found) are kept and surfaced via the pill — never dropped.
+function applyComments() {
+  closeCmtPop();
+  hideCmtAdd();
+  ORPHANS = [];
+  const old = document.getElementById('cmtOrphans');
+  if (old) old.remove();
+  const f = currentRef && currentRef.f;
+  const md = previewEl.querySelector('.md');
+  // Standalone .html preview: the frame marks its own document and reports back
+  // which quotes it could not find. Best-effort here (a frame still loading has no
+  // listener yet) — its ready ping re-triggers this. Sync before the empty-list
+  // bail: an emptied list is exactly what tells the frame to drop its marks.
+  if (!md) { syncFrameComments(); return; }
+  if (!f || !f.comments || !f.comments.length) return;
+  f.comments.forEach(c => {
+    const found = cmtFindAnchor(md, c.anchor);
+    if (found) cmtMark(found, c);
+    else ORPHANS.push(c);
+  });
+  refreshOrphanPill();
+}
+
+// --- add affordance: floating button near a fresh selection ---
+let cmtAddEl = null, pendingSel = null;
+function hideCmtAdd() { if (cmtAddEl) cmtAddEl.style.display = 'none'; pendingSel = null; }
+function ensureCmtAdd() {
+  if (cmtAddEl) return cmtAddEl;
+  cmtAddEl = document.createElement('button');
+  cmtAddEl.id = 'cmtAdd';
+  cmtAddEl.className = 'cmt-add';
+  cmtAddEl.textContent = '✎ comment';
+  cmtAddEl.style.display = 'none';
+  document.body.appendChild(cmtAddEl);
+  // mousedown would collapse the selection before click fires — keep it alive.
+  cmtAddEl.addEventListener('mousedown', (e) => e.preventDefault());
+  cmtAddEl.addEventListener('click', () => {
+    if (!pendingSel) return;
+    const s = pendingSel;
+    cmtAddEl.style.display = 'none';
+    cmtNewPop(s.anchor, s.rect);
+  });
+  return cmtAddEl;
+}
+document.addEventListener('mouseup', (e) => {
+  if (!commentsVisible) return;
+  if (e.target && e.target.closest && e.target.closest('.cmt-pop, .cmt-add')) return;
+  const md = previewEl.querySelector('.md');
+  if (!md || !currentRef) { hideCmtAdd(); return; }
+  let sel = null;
+  try { sel = window.getSelection(); } catch (_) {}
+  if (!sel || sel.isCollapsed || !sel.rangeCount) { hideCmtAdd(); return; }
+  const range = sel.getRangeAt(0);
+  if (!md.contains(range.commonAncestorContainer)) { hideCmtAdd(); return; }
+  const anchor = cmtAnchorFromRange(md, range);
+  if (!anchor) { hideCmtAdd(); return; }
+  let rect = { left: e.clientX || 0, top: e.clientY || 0, bottom: (e.clientY || 0) };
+  try { const r = range.getBoundingClientRect(); if (r && (r.width || r.height || r.left || r.top)) rect = r; } catch (_) {}
+  armCmtAdd(anchor, rect);
+});
+
+function armCmtAdd(anchor, rect) {
+  pendingSel = { anchor, rect };
+  const btn = ensureCmtAdd();
+  // Same zoom-space conversion as openCmtPop: rect is screen px, the fixed
+  // button lives inside the zoomed root.
+  const z = SETTINGS.zoom || 1;
+  btn.style.left = Math.max(8, rect.left / z) + 'px';
+  btn.style.top = (rect.bottom / z + 6) + 'px';
+  btn.style.display = '';
+}
+
+// --- comments inside a standalone .html preview frame --------------------------
+// That frame is its own document behind an opaque origin, so it captures, matches
+// and marks on its own (CMT_FRAME_SCRIPT) while the host keeps everything that
+// needs pad data: the add button, the popovers, the orphan bookkeeping.
+function previewFrame() { return previewEl.querySelector('iframe.htmlframe'); }
+// Frame rects are in the FRAME's viewport, which host zoom scales; the iframe's own
+// box is already in screen px. So scale the inner offsets, then add the box.
+function cmtRectFromFrame(w, d) {
+  const f = frameByWindow(w);
+  const o = f ? f.getBoundingClientRect() : { left: 0, top: 0 };
+  const z = SETTINGS.zoom || 1;
+  return {
+    left: o.left + (d.left || 0) * z, top: o.top + (d.top || 0) * z,
+    bottom: o.top + (d.bottom || 0) * z,
+    width: (d.width || 0) * z, height: (d.height || 0) * z,
+  };
+}
+function onFrameSelection(w, d) {
+  // Only the full-file preview frame, never an inline ![](x.html) embed: a comment
+  // there would anchor to text the note's own entry has no record of.
+  if (!commentsVisible || !currentRef || frameByWindow(w) !== previewFrame()) { hideCmtAdd(); return; }
+  if (!d.quote || !d.quote.trim()) { hideCmtAdd(); return; }
+  armCmtAdd({ quote: d.quote, prefix: d.prefix || '', suffix: d.suffix || '' }, cmtRectFromFrame(w, d));
+}
+// Push the current file's comments in for (re)marking. Called on the frame's ready
+// ping and after every mutation — a frame that reloads (author script, focus mode)
+// pings again, so marks come back without the host tracking frame lifecycle.
+function syncFrameComments(w) {
+  const f = w ? frameByWindow(w) : previewFrame();
+  if (!f || f !== previewFrame() || !f.contentWindow) return;
+  const cur = currentRef && currentRef.f;
+  // The frame carries its own mark CSS, so the host's data-comments-off rules can't
+  // reach it — hidden is expressed as "no comments" and the marks come back on show.
+  const list = commentsVisible ? (cur && cur.comments) || [] : [];
+  f.contentWindow.postMessage({ __scratchCmt: 1, comments: list }, '*');
+}
+// A goto can be asked for before the frame's script exists (switching files renders
+// a fresh iframe), so hold the id until that frame says it is ready. Tracking the
+// ELEMENT rather than a boolean means a re-rendered preview invalidates readiness
+// on its own.
+let readyFrame = null;
+let pendingGoto = null;
+function onFrameReady(w) {
+  readyFrame = frameByWindow(w);
+  syncFrameComments(w);
+  flushGoto();
+}
+function flushGoto() {
+  const f = previewFrame();
+  if (!pendingGoto) return;
+  // No frame at all (a markdown file's orphan) → nothing will ever reveal it; drop
+  // the id rather than let it fire at the next .html frame that reports ready.
+  if (!f) { pendingGoto = null; return; }
+  if (f !== readyFrame || !f.contentWindow) return;
+  f.contentWindow.postMessage({ __scratchCmtGoto: 1, cid: pendingGoto }, '*');
+  pendingGoto = null;
+}
+function onFrameMisses(w, ids) {
+  const cur = currentRef && currentRef.f;
+  // A reply from the PREVIOUS file's frame can land after the switch; adopting its
+  // ids would rewrite the new file's orphan list from a stale answer.
+  if (!cur || frameByWindow(w) !== previewFrame()) return;
+  ORPHANS = (cur.comments || []).filter(c => ids.indexOf(c.id) >= 0);
+  refreshOrphanPill();
+}
+
+// Click a highlight or its note pill → view popover.
+previewEl.addEventListener('click', (e) => {
+  if (!commentsVisible) return;
+  const hl = e.target.closest && e.target.closest('.cmt-hl, .cmt-note');
+  if (!hl) return;
+  const c = findComment(hl.dataset.cid);
+  if (c) cmtViewPop(c, hl.getBoundingClientRect());
+});
+// Click elsewhere → dismiss the popover.
+document.addEventListener('mousedown', (e) => {
+  if (!cmtPopEl) return;
+  const t = e.target;
+  if (t && t.closest && t.closest('.cmt-pop, .cmt-hl, .cmt-note, .cmt-add, .cmt-orphans, #commentsToggle')) return;
+  closeCmtPop();
+});
+// Fixed-position popovers drift when the preview scrolls under them.
+previewEl.addEventListener('scroll', () => { closeCmtPop(); hideCmtAdd(); });
+
+// Global show/hide. Highlights stay in the DOM; CSS neutralizes them (and the
+// orphan pill) when off, and the handlers above guard on commentsVisible.
+// Persisted per-session in localStorage like scratch.raw.
+// Pad-wide comment tally on the header toggle. Recomputed from DATA on every
+// render (buildTree) and every live mutation (persistComments). Hidden at zero.
+function updateCommentsCount() {
+  let n = 0;
+  (DATA.pads || []).forEach(p => (p.files || []).forEach(f => { n += (f.comments && f.comments.length) || 0; }));
+  const el = document.getElementById('cmtCount');
+  if (!el) return;
+  el.textContent = n > 99 ? '99+' : String(n);
+  el.hidden = n === 0;
+}
+function applyCommentsVisibility() {
+  document.documentElement.toggleAttribute('data-comments-off', !commentsVisible);
+  const b = document.getElementById('commentsToggle');
+  if (b) b.classList.toggle('muted', !commentsVisible);
+  syncFrameComments(); // CSS can't reach into the frame; it re-marks or clears
+}
+function setCommentsVisible(v) {
+  commentsVisible = v;
+  try { localStorage.setItem('scratch.comments', v ? '1' : '0'); } catch (_) {}
+  applyCommentsVisibility();
+  if (!v) { closeCmtPop(); hideCmtAdd(); }
+  showToast(v ? 'Comments shown' : 'Comments hidden', 'info');
+}
+// Click shows the pad-wide summary; visibility toggle moved to the 'c' shortcut.
+document.getElementById('commentsToggle').addEventListener('click', (e) => {
+  const btn = e.currentTarget;
+  if (cmtPopEl && cmtPopEl.classList.contains('cmt-summary')) { closeCmtPop(); return; }
+  openCommentsSummary(btn);
+});
+applyCommentsVisibility();
+
+buildTree();
+
+// Offline (--offline) export: vendor libs decompress asynchronously (see VENDOR_BOOT),
+// so the first render above ran without them (code unhighlighted, mermaid/math left as
+// source). Once they land — or fail (no DecompressionStream → reject) — clear the
+// pending flag and re-render the current file so highlighting/diagrams/math apply (or
+// degrade for good). No-op when not an offline export (__vendorReady is undefined).
+if (window.__vendorReady) {
+  const vendorDone = () => {
+    window.__vendorPending = false;
+    if (currentRef) renderPreview(currentRef.pad, currentRef.f);
+  };
+  window.__vendorReady.finally(vendorDone);
+}
+`;

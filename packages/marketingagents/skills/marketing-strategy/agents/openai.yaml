@@ -1,0 +1,4 @@
+interface:
+  display_name: "Marketing Strategy"
+  short_description: "Build a stage-aware full-funnel strategy"
+  default_prompt: "Build a focused marketing strategy for this startup."

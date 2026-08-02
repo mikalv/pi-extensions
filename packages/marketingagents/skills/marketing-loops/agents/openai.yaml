@@ -1,0 +1,4 @@
+interface:
+  display_name: "Marketing Loops"
+  short_description: "Design safe repeatable marketing review loops"
+  default_prompt: "Design a safe recurring marketing loop with clear state and approval gates."

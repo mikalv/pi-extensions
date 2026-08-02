@@ -1,0 +1,228 @@
+# Copy this file to `vstack.settings.toml` and commit it when the values are
+# safe to share with everyone working in the project. Keep secrets in
+# `.env.local`.
+#
+# vstack skill scripts read only the `[env]` table. Keys intentionally match
+# the historical environment variable names so existing scripts and docs remain
+# compatible.
+
+[env]
+
+# WORKTREE / SHARED WORKFLOW PATHS
+
+WORKTREE_DEFAULT_BRANCH = "main"
+# Used by: worktree, orch
+
+# WORKTREE_BASE_DIR = "~/dev/.worktrees/myproject"
+# Used by: worktree. Omit to use the default: <parent-of-checkout>/.worktrees/<checkout-name>,
+# an external per-repo dir beside the checkout. Relative paths resolve from the
+# main checkout. Do not point it inside the repo root: worktree build outputs
+# under the repo can exhaust recursive file-watcher (inotify) budgets.
+
+WORKTREE_SYMLINKS = ".env.local opencode.json .agents .cursor .codex .opencode .pi .claude/settings.json .claude/agents .claude/hooks .claude/skills"
+# Used by: worktree. Include `.env.local` only when worktrees should share local secrets.
+
+WORKTREE_RELATIVE_SYMLINKS = ".claude/CLAUDE.md=../AGENTS.md .claude/AGENTS.md=../AGENTS.md"
+# Used by: worktree.
+
+WORKTREE_COPIES = ".vstack-lock.json"
+# Used by: worktree.
+
+WORKTREE_MKDIRS = "tmp"
+# Used by: worktree. Intended for gitignored scratch dirs.
+
+ORCH_STATE_DIR = "tmp"
+# Used by: orch.
+
+ORCH_CACHE_DIR = ".cache/orch"
+# Used by: orch (`parallel-groups`).
+
+CI_WAIT_NO_CHECKS_GRACE = "180"
+# Used by: orch (`ci-wait`). Seconds to keep polling before failing when no CI
+# checks have registered yet. Raise for repos whose CI dispatches only after a
+# review approval (approval-gated jobs / merge queue) with slow dispatch.
+
+PR_REVIEW_REFIX_MAX_LINES = "200"
+# Used by: orch (`review-pr`, via `refix-route`). Total changed lines
+# (insertions + deletions) a support-scope fix round may reach before it is
+# re-reviewed anyway. A round that cleared blockers is always re-reviewed
+# regardless of this value; this is the backstop for large rounds that no
+# blocker prompted.
+
+CI_FIX_MAX_CYCLES = "6"
+# Used by: orch (`submit-pr` / `merge-pr`). Max automated ci-fix cycles per PR
+# submission or merge recovery before reporting the persistent CI failure back
+# to the user.
+
+ORCH_DECISION_MODE = "ask"
+# Used by: orch (`review-pr` § 4/§ 7, `dev-fix` § 1). How workflow decision
+# points behave. "ask" (default) presents every decision to the user.
+# "auto-recommended" executes the workflow's recommended option and logs
+# "auto-selected: [option] — [reason]" in the round record (workflow-state
+# auto_decisions) — for fleet launchers whose workers would otherwise
+# serialize on one supervisor. Decision-record revisits, scope expansion
+# beyond the issue, anything touching benchmark-host protocol, and merge
+# ALWAYS ask, in every mode.
+
+REVIEWER_SLOT_BUDGET = "0"
+# Used by: orch (`review-pr` / `review` / `review-codebase`). Total concurrent
+# agent-session budget of the harness runtime, counting the primary
+# orchestrator session. "0" = unlimited: every reviewer launches up front and
+# persists through fix/re-review cycles. When the reviewer set exceeds the
+# available slots (budget minus the primary minus live dev/QA sessions),
+# review workflows run reviewers in bounded sequential waves, retiring each
+# completed session to release its slot. The Codex collaboration runtime's
+# cap is MultiAgentV2's configurable default of 4 total threads including the
+# primary (features.multi_agent_v2.max_concurrent_threads_per_session in
+# ~/.codex/config.toml; the legacy agents.max_threads is silently ignored
+# under V2, and a session must restart to pick up a change) -> set whatever
+# cap the machine config declares ("4" on a default config).
+
+# Reviewer merge gate mode: "approval" requires a GitHub-native review
+# approval before merge (orch submit-pr/merge-pr); "review" requires a formal
+# review of the current head from a non-author reviewer plus zero unresolved
+# threads — the right mode for review bots that comment but never approve.
+# Set "off" ONLY for repos with no review bots and no reviewer policy — the
+# review wait is skipped entirely. Legacy PR_APPROVAL_GATE ("on"/"off") is
+# still honored when this key is unset.
+PR_REVIEW_GATE = "approval"
+# Used by: orch (`submit-pr` / `merge-pr`).
+
+PR_REVIEW_NUDGE_SECS = "600"
+# Used by: orch (`approval-wait`). Seconds of reviewer silence for the current
+# head before the wait nudges — once per head SHA; a push restarts the clock.
+# "0" disables nudging.
+
+PR_REVIEW_NUDGE = ""
+# Used by: orch (`approval-wait`). PR comment body posted as the nudge — set
+# it to whatever summons the project's reviewer (e.g. "@your-bot review").
+# Empty = no comment; the nudge falls back to a GitHub-native re-review
+# request to the PR's requested and past reviewers.
+
+PR_REVIEW_CHECK = ""
+# Used by: orch (`approval-wait --mode review`). Exact name of the check-run
+# the repo's trusted review bot publishes on analyzed heads (e.g. "Devin
+# Review"). When set, a "success" conclusion of that check on the current
+# head counts as review evidence — for bots that submit a review object only
+# when they have findings, whose clean re-analyses would otherwise never
+# satisfy the review gate. SECURITY: check-runs are matched by NAME, and any
+# GitHub App or Actions workflow can publish a check under any name — name
+# only a check produced by the trusted review bot. Empty = review objects
+# only.
+
+PR_REVIEW_ON_TIMEOUT = "block"
+# Used by: orch (`approval-wait`, submit-pr / merge-pr / ci-fix). Deadline
+# behavior when the review gate signal never arrives — the reviewer posted
+# nothing (e.g. its credits are exhausted). "block" (default) reports a timeout
+# and the caller prompts or keeps waiting. "proceed" instead records a
+# reviewer-down override and moves to CI/merge, but ONLY when zero threads are
+# unresolved (an open thread always blocks — it returns "comments" first — so a
+# real comment is never bypassed); CI and comment-hygiene gates still apply. On
+# multi-reviewer repos this only fires when EVERY reviewer is silent.
+
+PR_REVIEW_OUTAGE_CONTEXT = ""
+# Used by: orch (`approval-wait`, review mode). Makes PR_REVIEW_ON_TIMEOUT=proceed
+# end-to-end on repos whose CI/branch-protection gate independently blocks
+# merges on review evidence. When this names a commit-status context, a
+# review-mode proceed posts that context as `success` on the proceeded head; the repo's CI gate can
+# accept it as an extra review-evidence surface and its status re-fire bridge
+# re-runs the gate. Empty (default) = orch-side-only (no marker; the repo-side
+# gate is untouched). SECURITY: a branch-protection relaxation — the status
+# lets a merge proceed with no review; bounded by the genuine-silence proceed
+# predicate + bot-only status trust, matched by context, so name it ONLY where
+# every status publisher is trusted. See orch DEVELOPMENT.md "Reviewer-outage
+# recognition".
+
+# BOT / COMMIT IDENTITY
+
+BOT_NAME = "automation-bot"
+# Used by: worktree.
+
+BOT_EMAIL = "you+bot@example.com"
+# Used by: worktree.
+
+BOT_REMOTE_NAME = "bot-remote"
+# Used by: worktree.
+
+# DECIDER
+
+DECISIONS_DIR = "docs/decisions"
+# Used by: decider. Auto-discovered when omitted.
+
+# LINEAR
+
+LINEAR_TEAM = ""
+# Used by: linear. The team every write targets - set it to this project's own
+# team. No default: a team name resolves inside whatever workspace
+# LINEAR_API_KEY reaches, so an empty value refuses Linear writes instead of
+# guessing a target (reads just drop the team filter). Only the create actions
+# that take a team (issues, projects, cycles, labels) accept `--team <name>` as
+# a per-call override; every other write needs this key. Confirm the resolved
+# target with `linear.sh auth-check --strict`.
+
+LINEAR_FORMAT = "safe"
+# Used by: linear. Values: safe, table, ids, raw.
+
+LINEAR_TEAM_PREFIX = "PROJ"
+# Used by: linear.
+
+# GITHUB
+
+GH_BOT_USERNAME = "automation[bot]"
+# Used by: github.
+
+GH_ISSUE_PATTERN = "[A-Z]+-[0-9]+"
+# Used by: github, orch.
+
+GH_VERIFY_CMD = "make verify"
+# Used by: github (`pr-cross-check --verify`).
+
+VSTACK_GITHUB_OP_TIMEOUT = "10"
+# Used by: github (`pr-view` / bot token 1Password resolution).
+
+VSTACK_GITHUB_AUTH_TIMEOUT = "10"
+# Used by: github (`pr-view` auth preflight).
+
+VSTACK_GITHUB_PR_VIEW_TIMEOUT = "30"
+# Used by: github (`pr-view`).
+
+# SECOND OPINION
+
+SECOND_OPINION_TARGET = "codex"
+# Used by: second-opinion. Values: claude, codex.
+
+SECOND_OPINION_TIMEOUT = "300"
+# Used by: second-opinion.
+
+SECOND_OPINION_CLAUDE_CMD = "claude -p --no-session-persistence --model opus --effort max --allowedTools Bash(read-only:true),Read,Glob,Grep"
+# Used by: second-opinion.
+
+SECOND_OPINION_CODEX_CMD = "codex exec -m gpt-5.6-sol -s read-only -c model_reasoning_effort=xhigh --ephemeral"
+# Used by: second-opinion.
+
+# PRE-COMMIT HOOK
+
+# VSTACK_PRE_COMMIT_RUST_CLIPPY = "off"
+# Used by: hooks/pre-commit-check.sh (the Clippy lane for staged Rust files).
+# Three tiers:
+#   unset (default) — the hook runs `cargo clippy --all-targets -- -D warnings`
+#     once per crate manifest owning a staged .rs file (`--manifest-path`, so
+#     workspace-excluded crates lint against their own manifest), falling back
+#     to `--workspace` when no owning manifest resolves.
+#   "off" — skip the hook's Clippy lane entirely. Use when repo-owned
+#     validation (feature-matrix lanes, a project validator) is authoritative
+#     and the hook's default-feature lane could flag pre-existing warnings the
+#     staged change didn't introduce.
+#   any other value — run it verbatim via `bash -c` from the repo root as the
+#     Clippy check; its exit status decides. Use to pin the hook to the repo's
+#     canonical lint command, e.g. "cargo clippy --workspace --all-features
+#     --all-targets -- -D warnings" or "tools/validate --clippy".
+# The environment variable takes precedence over this file.
+
+# DEBUG / OVERRIDE HOOKS
+
+WORKTREE_CLI = ".agents/skills/worktree/scripts/worktree"
+# Used by: orch (`open-terminal`).
+
+GIT_HOST_CLI = ".agents/skills/github/scripts/github.sh"
+# Used by: orch (`ci-wait`).

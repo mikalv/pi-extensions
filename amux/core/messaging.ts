@@ -1,0 +1,349 @@
+/**
+ * amux — File-Based Messaging (Crash-Safe)
+ *
+ * Message lifecycle:
+ *   1. Sender writes .json to target's inbox (durable)
+ *   2. Watcher picks up → appends to history → renames to .delivered
+ *   3. pi.sendUserMessage() queues for processing
+ *   4. agent_end → deletes .delivered files
+ *
+ * Crash recovery:
+ *   - .json files → never picked up → deliver
+ *   - .delivered files → queued but unconfirmed → redeliver
+ *
+ * History: all messages appended to messages.log (JSONL)
+ */
+
+import {
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+  renameSync,
+  mkdirSync,
+} from "node:fs";
+import { watch, type FSWatcher } from "node:fs";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+
+import {
+  sessionFile,
+  appendJsonlSync,
+  readJson,
+  withJsonFile,
+  truncatePreview,
+} from "./storage.ts";
+
+// ─── Types ───────────────────────────────────────────────────
+
+export interface InboxMessage {
+  id: string; // message UUID
+  from: string; // sender agent UUID
+  fromName: string; // sender display name
+  fromRole?: string; // sender role (if any)
+  fromSession: string; // sender session
+  timestamp: string; // ISO 8601
+  message: string; // message content
+  category?: string; // intent hint: "urgent", "fyi", "brainstorm", "task-comment"
+  taskId?: string; // optional related task ID for context
+  discussionId?: string; // optional related discussion ID for discussion notifications
+  notificationType?: string; // e.g. "task-comment", "discussion-post"
+  commentId?: string; // related task comment ID, when applicable
+  preview?: string; // short preview for notification UIs/logs
+  requiresAttention?: boolean; // whether recipient should reassess state
+  responseRequired?: boolean; // sender expects a reply
+  inReplyTo?: string; // pending reply ID being answered
+}
+
+export interface PendingReply {
+  id: string;
+  messageId: string;
+  fromId: string;
+  fromName: string;
+  toSession: string;
+  toId: string;
+  toName: string;
+  createdAt: string;
+  messagePreview: string;
+  category?: string;
+  taskId?: string;
+  status: "pending" | "replied";
+  repliedAt?: string;
+  replyMessageId?: string;
+  replyFromName?: string;
+}
+
+/**
+ * Format a message's age relative to now.
+ * Returns a human-readable string like "2m ago", "3h ago", "1d ago".
+ * Used by adapters to display staleness context on delivered messages.
+ */
+export function formatMessageAge(timestamp: string): string {
+  const ms = Date.now() - new Date(timestamp).getTime();
+  if (ms < 0) return "just now";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// ─── Paths ───────────────────────────────────────────────────
+
+function inboxDir(session: string, agentId: string): string {
+  return sessionFile(session, "inbox", agentId);
+}
+
+function historyPath(session: string): string {
+  return sessionFile(session, "messages.log");
+}
+
+function pendingRepliesPath(session: string): string {
+  return sessionFile(session, "pending-replies.json");
+}
+
+// ─── Inbox Operations ────────────────────────────────────────
+
+/** Ensure the inbox directory exists. */
+export function ensureInbox(session: string, agentId: string): void {
+  mkdirSync(inboxDir(session, agentId), { recursive: true });
+}
+
+/**
+ * Send a message to an agent's inbox.
+ * Uses atomic write (tmp + rename) so watchers never see partial files.
+ */
+export function sendToInbox(
+  session: string,
+  targetId: string,
+  message: InboxMessage
+): void {
+  const dir = inboxDir(session, targetId);
+  mkdirSync(dir, { recursive: true });
+
+  const base = `${Date.now()}-${message.id}`;
+  const tmpFile = join(dir, `${base}.tmp`);
+  const jsonFile = join(dir, `${base}.json`);
+
+  writeFileSync(tmpFile, JSON.stringify(message, null, 2), "utf8");
+  renameSync(tmpFile, jsonFile);
+}
+
+/**
+ * Mark a message as delivered (rename .json → .delivered).
+ * Prevents the watcher from picking it up again.
+ */
+export function markAsDelivered(
+  session: string,
+  agentId: string,
+  filename: string
+): void {
+  const dir = inboxDir(session, agentId);
+  const deliveredName = filename.replace(/\.json$/, ".delivered");
+  try {
+    renameSync(join(dir, filename), join(dir, deliveredName));
+  } catch {
+    // File may have been processed already
+  }
+}
+
+/**
+ * Get all pending messages (.json) and unconfirmed messages (.delivered).
+ * Used on startup for crash recovery.
+ */
+export function getRecoverableMessages(
+  session: string,
+  agentId: string
+): Array<{ msg: InboxMessage; filename: string }> {
+  const dir = inboxDir(session, agentId);
+  try {
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith(".json") || f.endsWith(".delivered"))
+      .sort();
+    return files.map((f) => ({
+      msg: JSON.parse(readFileSync(join(dir, f), "utf8")) as InboxMessage,
+      filename: f,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Confirm all delivered messages — delete .delivered files.
+ * Called on agent_end after processing completes.
+ */
+export function confirmDelivered(session: string, agentId: string): void {
+  const dir = inboxDir(session, agentId);
+  try {
+    const files = readdirSync(dir).filter((f) => f.endsWith(".delivered"));
+    for (const f of files) {
+      try {
+        unlinkSync(join(dir, f));
+      } catch {
+        // Already cleaned up
+      }
+    }
+  } catch {
+    // Inbox doesn't exist yet
+  }
+}
+
+// ─── History ─────────────────────────────────────────────────
+
+/**
+ * Append a message to the session's history log (JSONL format).
+ * Called when a message is first picked up (before processing).
+ */
+export function appendToHistory(session: string, message: InboxMessage): void {
+  appendJsonlSync(historyPath(session), message);
+}
+
+// ─── Pending Replies ─────────────────────────────────────────
+
+export function messagePreview(text: string, maxLength = 160): string {
+  return truncatePreview(text, maxLength);
+}
+
+export function taskCommentNotificationMessage(args: {
+  taskId: string;
+  taskTitle?: string;
+  authorName: string;
+  preview: string;
+}): string {
+  const title = args.taskTitle ? ` (${args.taskTitle})` : "";
+  const preview = messagePreview(args.preview, 180);
+  return `Comment on ${args.taskId}${title} by ${args.authorName}: “${preview}”\nDetails if needed: amutix_task show ${args.taskId} (full:true for thread).`;
+}
+
+export function assignmentNotificationMessage(tasks: Array<{ id: string; title: string }>): string {
+  if (tasks.length === 1) {
+    const task = tasks[0]!;
+    return `Assigned: ${task.id} — ${task.title}\nStart: amutix_task pick ${task.id}; details: amutix_task show ${task.id}.`;
+  }
+  const lines = tasks.map((task) => `- ${task.id}: ${task.title}`).join("\n");
+  return `Assigned ${tasks.length} tasks:\n${lines}\nStart next: amutix_task pick; overview: amutix_task summary.`;
+}
+
+/** Phrasing for each lifecycle transition in a notification. */
+const TRANSITION_VERBS: Record<"pick" | "review" | "done" | "drop" | "block", string> = {
+  pick: "picked",
+  review: "marked ready for review",
+  done: "completed",
+  drop: "dropped — back in queue",
+  block: "blocked",
+};
+
+/**
+ * Build a notification message for a task lifecycle transition
+ * (review/block/pick/drop/done). Used when an agent explicitly requests a
+ * targeted wake-up via `notifyTarget`/`notifyAgents`. Lifecycle transitions
+ * stay silent by default; this builder is only invoked when a notify target
+ * is supplied. Assignment and task comments use their own dedicated builders.
+ */
+export function transitionNotificationMessage(args: {
+  action: "pick" | "review" | "done" | "drop" | "block";
+  taskId: string;
+  taskTitle?: string;
+  authorName: string;
+  preview?: string;
+}): string {
+  const title = args.taskTitle ? ` (${args.taskTitle})` : "";
+  const detail = args.preview ? `: ${messagePreview(args.preview, 200)}` : "";
+  const verb = TRANSITION_VERBS[args.action];
+  return `${args.taskId}${title} ${verb} by ${args.authorName}${detail}\nDetails if needed: amutix_task show ${args.taskId} (full:true for thread).`;
+}
+
+export function discussionNotificationMessage(args: {
+  action: "started" | "post" | "closed";
+  discussionId: string;
+  topic: string;
+  authorName: string;
+  preview?: string;
+}): string {
+  if (args.action === "started") {
+    return `Discussion ${args.discussionId} started by ${args.authorName}: “${messagePreview(args.topic, 180)}”\nDetails: amutix_discussion show ${args.discussionId}.`;
+  }
+  if (args.action === "closed") {
+    const summary = args.preview ? ` Summary: “${messagePreview(args.preview, 180)}”` : "";
+    return `Discussion ${args.discussionId} closed by ${args.authorName}: “${messagePreview(args.topic, 180)}”.${summary}\nOutcome: amutix_discussion show ${args.discussionId}.`;
+  }
+  const preview = args.preview ? ` “${messagePreview(args.preview, 180)}”` : "";
+  return `Discussion ${args.discussionId} post by ${args.authorName}: “${messagePreview(args.topic, 180)}”.${preview}\nDetails if needed: amutix_discussion show ${args.discussionId}.`;
+}
+
+export async function createPendingReply(
+  session: string,
+  entry: Omit<PendingReply, "status">
+): Promise<PendingReply> {
+  const pending: PendingReply = { ...entry, status: "pending" };
+  await withJsonFile<PendingReply[]>(pendingRepliesPath(session), [], (items) => {
+    const existing = items.find((item) => item.id === pending.id);
+    if (!existing) items.push(pending);
+    return items;
+  });
+  return pending;
+}
+
+export async function markPendingReplyReplied(
+  session: string,
+  pendingId: string,
+  replyMessageId: string,
+  replyFromName: string,
+): Promise<PendingReply | null> {
+  let found: PendingReply | null = null;
+  await withJsonFile<PendingReply[]>(pendingRepliesPath(session), [], (items) => {
+    const item = items.find((p) => p.id === pendingId);
+    if (item) {
+      item.status = "replied";
+      item.repliedAt = new Date().toISOString();
+      item.replyMessageId = replyMessageId;
+      item.replyFromName = replyFromName;
+      found = item;
+    }
+    return items;
+  });
+  return found;
+}
+
+export async function readPendingReplies(session: string, agentId?: string): Promise<PendingReply[]> {
+  const items = await readJson<PendingReply[]>(pendingRepliesPath(session), []);
+  return agentId ? items.filter((item) => item.fromId === agentId && item.status === "pending") : items;
+}
+
+// ─── Watcher ─────────────────────────────────────────────────
+
+/**
+ * Watch an inbox for new .json messages.
+ * Calls onMessage when a new .json file appears.
+ * Returns the FSWatcher (call .close() to stop).
+ */
+export function watchInbox(
+  session: string,
+  agentId: string,
+  onMessage: (msg: InboxMessage, filename: string) => void
+): FSWatcher {
+  const dir = inboxDir(session, agentId);
+  mkdirSync(dir, { recursive: true });
+
+  return watch(dir, (eventType, filename) => {
+    // Only process new .json files (not .tmp, .delivered)
+    if (!filename || !filename.endsWith(".json")) return;
+
+    try {
+      const content = readFileSync(join(dir, filename), "utf8");
+      const msg = JSON.parse(content) as InboxMessage;
+      onMessage(msg, filename);
+    } catch {
+      // File may have been renamed/deleted already
+    }
+  });
+}
+
+/** Generate a unique message ID (128-bit UUID). */
+export function newMessageId(): string {
+  return randomUUID();
+}

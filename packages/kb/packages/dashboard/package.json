@@ -1,0 +1,49 @@
+{
+  "name": "@kb/dashboard",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "vite build && tsc",
+    "build:client": "vite build",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.app.json"
+  },
+  "dependencies": {
+    "@kb/core": "workspace:*",
+    "@types/multer": "^2.1.0",
+    "express": "^5.1.0",
+    "lucide-react": "^1.7.0",
+    "multer": "^2.1.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "jsdom": "^29.0.1",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^4.1.1"
+  },
+  "private": true
+}

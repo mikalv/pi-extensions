@@ -1,0 +1,60 @@
+working/
+HT-AGENTS.md
+.env.local
+.env.npm
+.cache/
+ht/
+cli/target/
+target/
+tmp/
+trees/
+docs/work-in-progress/
+docs/plans/
+
+# Harness install/runtime mirrors; canonical source lives elsewhere.
+# Match files, directories, and symlinks so worktree links stay invisible.
+/.agents
+/.agents/**
+/.claude
+/.claude/**
+/.cursor
+/.cursor/**
+/.codex/**
+!/.codex/environments/
+!/.codex/environments/environment.toml
+/.opencode
+/.opencode/**
+/.pi/**
+!/.pi/prompts/
+!/.pi/prompts/*.md
+/opencode.json
+
+# npm artifacts (pi-extensions are published to npm)
+node_modules/
+*.tgz
+npm-debug.log*
+yarn-error.log
+.pnpm-debug.log
+
+# Stray tsc emit next to pi-extension TS sources (Pi loads .ts directly).
+# Intentional bundles (pi-claude-bridge/bundle, pi-session-bridge/bin) are
+# whitelisted below.
+pi-extensions/*/extensions/**/*.js
+pi-extensions/*/extensions/**/*.js.map
+pi-extensions/*/extensions/**/*.d.ts
+!pi-extensions/pi-claude-bridge/bundle/**
+!pi-extensions/pi-session-bridge/bin/**
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local vstack install state (per-checkout absolute paths; do not commit)
+.vstack-lock.json
+vstack-local.toml
+
+# Cross-repo mailbox log — machine-local session coordination, never committed
+# (docs/cross-repo.md, the curated contract, IS tracked on purpose)
+docs/cross-repo-notes.md

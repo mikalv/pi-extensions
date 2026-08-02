@@ -1,0 +1,43 @@
+{
+  "name": "@meeh/mm-memory",
+  "version": "0.1.0",
+  "description": "Pi LTM surface on Prism — remember/recall for durable facts and session summaries (observational-memory promote target).",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "memory",
+    "ltm",
+    "prism",
+    "observational-memory"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.20.5",
+    "typebox": "^1.3.9",
+    "typescript": "^7.0.2"
+  }
+}

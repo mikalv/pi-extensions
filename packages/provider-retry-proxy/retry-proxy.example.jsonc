@@ -1,0 +1,29 @@
+// Example configuration for Provider Retry Proxy
+// Copy this file to ~/.omp/agent/retry-proxy.json and adjust values.
+//
+// Fields:
+//   listen.host        - bind address (default: 127.0.0.1)
+//   listen.port        - listen port (default: 7878)
+//   idleTimeoutMs      - auto-exit after this many ms with no requests (default: 1800000 = 30 min)
+//   targets.<key>      - one entry per provider; <key> is used in the proxy URL path
+//   targets.<key>.upstream - the real provider base URL (no trailing slash)
+//   retry.enabled      - enable retry for this provider (default: true)
+//   retry.maxAttempts  - max retries; -1 = infinite (30-min elapsed guard); 0 = disabled
+//   retry.initialDelayMs - first retry delay in ms
+//   retry.maxDelayMs    - per-attempt delay cap in ms
+
+{
+  "listen": { "host": "127.0.0.1", "port": 7878 },
+  "idleTimeoutMs": 1800000,
+  "targets": {
+    // "my-provider": {
+    //   "upstream": "https://your-provider-host/api-path",
+    //   "retry": {
+    //     "enabled": true,
+    //     "maxAttempts": -1,
+    //     "initialDelayMs": 20,
+    //     "maxDelayMs": 50
+    //   }
+    // }
+  }
+}

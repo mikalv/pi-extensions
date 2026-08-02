@@ -1,0 +1,9 @@
+{
+  "name": "core-team",
+  "description": "Lead architect plus developer and reviewer",
+  "roles": [
+    { "name": "lead-architect", "template": "lead-architect", "agentName": "Lead", "workspace": "current" },
+    { "name": "developer", "template": "developer", "agentName": "Developer", "workspace": "worktree" },
+    { "name": "reviewer", "template": "reviewer", "agentName": "Reviewer", "workspace": "worktree" }
+  ]
+}

@@ -1,0 +1,154 @@
+# vstack.toml — skill/hook mapping configuration (vstack source repo catalog)
+# The CLI reads this from the source repo root during installation.
+#
+# `is_source_catalog = true` marks this file as the canonical catalog. The CLI
+# routes per-project install state (auto-populated `[agent-skills]` merges,
+# per-agent `[agent-frontmatter.<harness>]` scaffolding, etc.) to a sibling
+# `vstack-local.toml` instead of mutating this file. That keeps downstream
+# projects from inheriting whatever the vstack maintainer has installed for
+# local testing. Downstream projects' `vstack.toml` files omit this key and
+# behave normally.
+is_source_catalog = true
+#
+# Source item discovery defaults to agents/, skills/, hooks/, pi-extensions/,
+# and extras/. Repos with a different package layout can opt in per kind; any
+# omitted key keeps its default. Paths are repo-root-relative; packaged items
+# use item dirs, while agents/hooks may also name one `.md`/`.sh` file. `*` is
+# supported on the final segment only.
+#
+# [catalog]
+# agents = ["agents"]
+# skills = ["skills", "packages/skills/*", "one-offs/specific-skill"]
+# hooks = ["hooks"]
+# pi_extensions = ["pi-extensions", "pkgs/plugins/pi-*"]
+# extras = ["extras"]
+#
+# [agent-skills] is the single source of truth for which skills appear in each
+# agent's frontmatter.  When an agent has an explicit entry here, prefix matching
+# is skipped — only the listed skills plus role-skills are attached.
+# Removing a skill from an agent's list and running `vstack refresh` removes it
+# from that agent's frontmatter.
+#
+# Agents without an entry here still use automatic prefix matching (agent "foo" → skills "foo-*").
+#
+# Project-level `vstack.toml` files also support generated-frontmatter overrides.
+# Use these for installed vstack agents instead of editing generated agent files.
+# Values are harness-specific; changing one table affects only that harness.
+#
+# [agent-frontmatter.claude]
+# planner = { color = "blue", model = "inherit", effort = "xhigh", deny-tools = ["Agent"], background = false, isolation = "none", memory = "none" }
+#
+# [agent-frontmatter.opencode]
+# planner = { color = "#3b82f6", model = "openai/gpt-5.6-sol", model-reasoning-effort = "xhigh", deny-tools = ["task"], mode = "subagent" }
+#
+# [agent-frontmatter.codex]
+# planner = { nickname-candidates = ["Planner-Atlas", "Planner-Delta"], model = "gpt-5.6-sol", model-reasoning-effort = "xhigh", sandbox-mode = "workspace-write" }
+#
+# [agent-frontmatter.pi]
+# planner = { color = "blue", model = "inherit", deny-tools = ["subagent", "get_subagent_result", "steer_subagent", "stop_subagent"], allowed-subagents = ["scout"], pane = true }
+#
+# Claude/Pi `opus` agents default to `inherit`; cheaper agents such as scout
+# may pin an explicit model. Override per-agent models in these tables.
+#
+# `allowed-subagents` is the Pi restricted-delegation allowlist for the
+# `delegate_subagent` tool. Engineer agents default to `["scout"]`; set
+# `allowed-subagents = []` to disable. Non-engineer roles default to empty.
+# Accepted aliases: `allowedSubagents`, `subagent-agents`, `subagent_agents`.
+#
+# The Pi `/agents` popup can edit model/deny-tools/color for vstack-managed project
+# agents and writes those changes into `[agent-frontmatter.pi]` automatically.
+
+# Skill mappings per agent — always loaded into context
+[agent-skills]
+rust = [
+    "github",
+    "linear",
+]
+
+iced = ["iced-rs"]
+
+reviewer-arch = ["reviewer"]
+
+reviewer-correctness = ["reviewer"]
+
+reviewer-quality = ["reviewer"]
+
+reviewer-perf = ["reviewer"]
+
+reviewer-safety = ["reviewer"]
+
+reviewer-structure = ["reviewer"]
+
+reviewer-test = ["reviewer"]
+
+generalist = [
+    "decider",
+    "github",
+    "dev",
+    "linear",
+    "dep-radar",
+]
+
+planner = [
+    "github",
+    "linear",
+]
+
+scout = [
+    "github",
+    "linear",
+]
+
+reviewer-doc = ["reviewer"]
+
+reviewer-error = ["reviewer"]
+
+reviewer-security = ["reviewer"]
+
+tpm = [
+    "decider",
+    "github",
+    "dev",
+    "linear",
+    "project-management",
+]
+
+researcher = [
+    "deep-research",
+    "decider",
+    "github",
+    "linear",
+]
+
+# Skills given to all agents of a role
+[role-skills]
+analyst = ["linear", "github"]
+engineer = ["dev", "github", "decider", "linear"]
+manager = ["dev", "github", "project-management", "linear", "decider"]
+reviewer = ["reviewer"]
+
+# Hook assignment by event:matcher → roles
+# "all" assigns to every role. Otherwise list specific roles.
+[hook-events]
+"PreToolUse:Bash" = "all"
+"PostToolUse:Edit|Write" = ["engineer"]
+"TaskCompleted:" = ["engineer"]
+
+# Per-harness frontmatter defaults. These act as a baseline beneath any
+# project-level `[agent-frontmatter.<harness>]` overrides in a consuming
+# project's `vstack.toml`. Only fields you set here take effect — unset
+# fields fall through to the canonical agent .md frontmatter.
+#
+# Claude accepts `max` effort on Opus 4.8/4.7 for the deepest reasoning. Use it
+# for engineer + research roles where wall-clock cost is acceptable. Scout uses
+# a Claude-only high override while other harnesses keep medium reasoning.
+[agent-frontmatter.claude]
+iced = { effort = "max" }
+
+planner = { effort = "max" }
+
+researcher = { effort = "max" }
+
+rust = { effort = "max" }
+
+scout = { effort = "high" }

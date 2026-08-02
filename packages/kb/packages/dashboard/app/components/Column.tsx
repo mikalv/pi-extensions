@@ -1,0 +1,126 @@
+import { useState, useCallback } from "react";
+import { useFlashOnIncrease } from "../hooks/useFlashOnIncrease";
+import type { Task, TaskDetail, TaskCreateInput, Column as ColumnType } from "@kb/core";
+import { COLUMN_LABELS, COLUMN_DESCRIPTIONS } from "@kb/core";
+import { TaskCard } from "./TaskCard";
+import { WorktreeGroup } from "./WorktreeGroup";
+import { InlineCreateCard } from "./InlineCreateCard";
+import { groupByWorktree } from "../utils/worktreeGrouping";
+import type { ToastType } from "../hooks/useToast";
+
+interface ColumnProps {
+  column: ColumnType;
+  tasks: Task[];
+  allTasks: Task[];
+  maxConcurrent: number;
+  onMoveTask: (id: string, column: ColumnType) => Promise<Task>;
+  onOpenDetail: (task: TaskDetail) => void;
+  addToast: (message: string, type?: ToastType) => void;
+  isCreating?: boolean;
+  onCancelCreate?: () => void;
+  onCreateTask?: (input: TaskCreateInput) => Promise<Task>;
+  onNewTask?: () => void;
+  autoMerge?: boolean;
+  onToggleAutoMerge?: () => void;
+  globalPaused?: boolean;
+}
+
+export function Column({ column, tasks, allTasks, maxConcurrent, onMoveTask, onOpenDetail, addToast, isCreating, onCancelCreate, onCreateTask, onNewTask, autoMerge, onToggleAutoMerge, globalPaused }: ColumnProps) {
+  const [dragOver, setDragOver] = useState(false);
+  const countFlashing = useFlashOnIncrease(tasks.length);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    const el = e.currentTarget as HTMLElement;
+    if (!el.contains(e.relatedTarget as Node)) {
+      setDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const taskId = e.dataTransfer.getData("text/plain");
+    if (!taskId) return;
+
+    try {
+      await onMoveTask(taskId, column);
+    } catch (err: any) {
+      addToast(err.message, "error");
+    }
+  }, [column, onMoveTask, addToast]);
+
+  return (
+    <div
+      className={`column${dragOver ? " drag-over" : ""}`}
+      data-column={column}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      <div className="column-header">
+        <div className={`column-dot dot-${column}`} />
+        <h2>{COLUMN_LABELS[column]}</h2>
+        <span className={`column-count${countFlashing ? " count-flash" : ""}`}>{tasks.length}</span>
+        {column === "in-review" && onToggleAutoMerge && (
+          <label className="auto-merge-toggle" title={autoMerge ? "Auto-merge enabled" : "Auto-merge disabled"}>
+            <input
+              type="checkbox"
+              checked={!!autoMerge}
+              onChange={onToggleAutoMerge}
+            />
+            <span className="toggle-slider" />
+            <span className="toggle-label">Auto-merge</span>
+          </label>
+        )}
+        {onNewTask && (
+          <button className="btn btn-primary btn-sm" onClick={onNewTask}>
+            + New Task
+          </button>
+        )}
+      </div>
+      <p className="column-desc">{COLUMN_DESCRIPTIONS[column]}</p>
+      <div className="column-body">
+        {column === "triage" && isCreating && onCancelCreate && onCreateTask && (
+          <InlineCreateCard
+            tasks={allTasks}
+            onSubmit={onCreateTask}
+            onCancel={onCancelCreate}
+            addToast={addToast}
+          />
+        )}
+        {column === "in-progress" ? (
+          (() => {
+            const groups = groupByWorktree(tasks, allTasks, maxConcurrent);
+            return groups.length === 0 ? (
+              <div className="empty-column">No tasks</div>
+            ) : (
+              groups.map((group) => (
+                <WorktreeGroup
+                  key={group.label}
+                  label={group.label}
+                  activeTasks={group.activeTasks}
+                  queuedTasks={group.queuedTasks}
+                  onOpenDetail={onOpenDetail}
+                  addToast={addToast}
+                  globalPaused={globalPaused}
+                />
+              ))
+            );
+          })()
+        ) : tasks.length === 0 ? (
+          <div className="empty-column">No tasks</div>
+        ) : (
+          tasks.map((task) => (
+            <TaskCard key={task.id} task={task} onOpenDetail={onOpenDetail} addToast={addToast} globalPaused={globalPaused} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}

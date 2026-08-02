@@ -1,0 +1,634 @@
+import * as childProcess from 'node:child_process'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import {
+  clearIncompatibleBridge,
+  clearUnavailable,
+  connectionCache,
+  emitStatusChange,
+  invalidateCache,
+  markIncompatibleBridge,
+  markUnavailable
+} from '#src/connection/status.ts'
+import { recordDiagnostic, withDiagnosticSpan } from '#src/diagnostics.ts'
+import { elixirRuntimeProblem } from '#src/mix/runtime.ts'
+import { decodeStdioMessage } from '#src/protocol/stdio.ts'
+import type {
+  BridgeBusEvent,
+  BridgeEvent,
+  BridgeInfo,
+  BridgeRequestMessage,
+  BridgeUIEvent,
+  PendingToolCall,
+  StdioMessage,
+  ToolArgs,
+  ToolResult
+} from '#src/protocol/types.ts'
+import { bridgeHandshakeProblem } from '#src/version.ts'
+
+const START_STDIO_EXPR = 'Pi.Transport.Stdio.start()'
+const BUNDLED_BRIDGE_CWD = fileURLToPath(new URL('../../../bridge', import.meta.url))
+const TOOL_CALL_TIMEOUT_MS = 120_000
+const STARTUP_OUTPUT_PREVIEW_CHARS = 8_000
+const STARTUP_OUTPUT_CHUNK_CHARS = 2_000
+const STDERR_PREVIEW_CHARS = 2_000
+const STDERR_PREVIEW_CHUNK_CHARS = 500
+const DEPS_GET_TIMEOUT_MS = 120_000
+const SHUTDOWN_FORCE_MS = 1_000
+
+interface EmbeddedProcess {
+  proc: childProcess.ChildProcess
+  ready: boolean
+  url: string
+  buffer: string
+  nextId: number
+  pending: Map<number, PendingToolCall>
+  startedAt: number
+  stderrBytes: number
+  stderrPreview: string[]
+  startupOutputPreview: string[]
+  restartAttempts: number
+}
+
+export type { BridgeInfo, BridgeUIEvent }
+
+type UIEventListener = (cwd: string, event: BridgeUIEvent) => void
+type BusEventListener = (cwd: string, event: BridgeBusEvent) => void
+export interface BridgeRequestResponder {
+  llmChunk: (id: string, delta: string) => void
+  llmDone: (id: string, result: unknown) => void
+  llmError: (id: string, error: string) => void
+}
+
+type BridgeRequestHandler = (
+  cwd: string,
+  message: BridgeRequestMessage,
+  responder: BridgeRequestResponder
+) => Promise<Record<string, unknown> | null | undefined>
+
+const bridgeInfo = new Map<string, BridgeInfo>()
+const uiEventListeners = new Set<UIEventListener>()
+const busEventListeners = new Set<BusEventListener>()
+const requestHandlers = new Set<BridgeRequestHandler>()
+
+export function getBridgeInfo(cwd: string): BridgeInfo | undefined {
+  return bridgeInfo.get(cwd)
+}
+
+export function onBridgeUIEvent(listener: UIEventListener): () => void {
+  uiEventListeners.add(listener)
+  return () => {
+    uiEventListeners.delete(listener)
+  }
+}
+
+export function onBridgeBusEvent(listener: BusEventListener): () => void {
+  busEventListeners.add(listener)
+  return () => {
+    busEventListeners.delete(listener)
+  }
+}
+
+export function onBridgeRequest(handler: BridgeRequestHandler): () => void {
+  requestHandlers.add(handler)
+  return () => {
+    requestHandlers.delete(handler)
+  }
+}
+
+function emitUIEvent(cwd: string, event: BridgeUIEvent): void {
+  for (const listener of uiEventListeners) {
+    try {
+      listener(cwd, event)
+    } catch {
+      // UI event listeners are best-effort.
+    }
+  }
+}
+
+function emitBusEvent(cwd: string, event: BridgeBusEvent): void {
+  for (const listener of busEventListeners) {
+    try {
+      listener(cwd, event)
+    } catch {
+      // Bus event listeners are best-effort.
+    }
+  }
+}
+
+const embeddedProcesses = new Map<string, EmbeddedProcess>()
+const embeddedFailed = new Set<string>()
+
+export function hasEmbeddedFailed(cwd: string): boolean {
+  return embeddedFailed.has(cwd)
+}
+
+export function clearEmbeddedFailed(cwd: string): void {
+  embeddedFailed.delete(cwd)
+  clearUnavailable(cwd)
+}
+
+export function embeddedUrl(cwd: string): string {
+  return `stdio:${encodeURIComponent(cwd)}`
+}
+
+export function cwdFromEmbeddedUrl(url: string): string {
+  return decodeURIComponent(url.slice('stdio:'.length))
+}
+
+function failPending(entry: EmbeddedProcess, error: Error): void {
+  for (const pending of entry.pending.values()) {
+    pending.reject(error)
+  }
+  entry.pending.clear()
+}
+
+function parseMessage(line: string): StdioMessage | null {
+  try {
+    return decodeStdioMessage(JSON.parse(line) as unknown)
+  } catch {
+    return null
+  }
+}
+
+function markReady(cwd: string, entry: EmbeddedProcess, url?: string): void {
+  if (url) entry.url = url
+  entry.ready = true
+  recordDiagnostic('embedded_ready', cwd, {
+    durationMs: Date.now() - entry.startedAt,
+    url: entry.url,
+    stderrBytes: entry.stderrBytes,
+    stderrPreview: entry.stderrPreview.join('\n')
+  })
+  clearIncompatibleBridge(cwd)
+  clearUnavailable(cwd)
+  invalidateCache(cwd)
+  emitStatusChange(cwd, 'embedded')
+}
+
+function writeToBeam(entry: EmbeddedProcess, message: ToolArgs): void {
+  entry.proc.stdin?.write(JSON.stringify(message) + '\n')
+}
+
+function sendResponse(entry: EmbeddedProcess, id: string, response: ToolArgs): void {
+  writeToBeam(entry, { type: 'response', id, ...response })
+}
+
+async function handleBridgeRequest(
+  cwd: string,
+  entry: EmbeddedProcess,
+  message: BridgeRequestMessage
+): Promise<void> {
+  const responder: BridgeRequestResponder = {
+    llmChunk: (id, delta) => writeToBeam(entry, { type: 'llm_chunk', id, delta }),
+    llmDone: (id, result) => writeToBeam(entry, { type: 'llm_done', id, result }),
+    llmError: (id, error) => writeToBeam(entry, { type: 'llm_error', id, error })
+  }
+
+  const responses = await withDiagnosticSpan(
+    'bridge_request_handlers',
+    cwd,
+    { op: message.op },
+    async () =>
+      Promise.all(Array.from(requestHandlers, (handler) => handler(cwd, message, responder)))
+  )
+  const response = responses.find((candidate) => candidate !== undefined)
+  if (response === null) return
+  if (response) {
+    sendResponse(entry, message.id, response)
+    return
+  }
+
+  if (message.op === 'llm_complete') {
+    const fakeResponse = process.env.PI_TEST_LLM_COMPLETE_RESPONSE
+    if (fakeResponse) {
+      sendResponse(entry, message.id, { ok: true, result: fakeResponse })
+      return
+    }
+
+    sendResponse(entry, message.id, {
+      ok: false,
+      error: 'Pi LLM completion is not available from this extension runtime yet.',
+      cwd
+    })
+    return
+  }
+
+  if (message.op === 'llm_stream') {
+    const fakeStream = process.env.PI_TEST_LLM_STREAM_RESPONSE
+    if (fakeStream) {
+      for (const delta of fakeStream.split('|')) {
+        writeToBeam(entry, { type: 'llm_chunk', id: message.id, delta })
+      }
+      writeToBeam(entry, { type: 'llm_done', id: message.id, result: '' })
+      return
+    }
+
+    writeToBeam(entry, {
+      type: 'llm_error',
+      id: message.id,
+      error: 'Pi LLM streaming is not available from this extension runtime yet.'
+    })
+    return
+  }
+
+  sendResponse(entry, message.id, {
+    ok: false,
+    error: `Unknown bridge request: ${message.op ?? 'unknown'}`
+  })
+}
+
+function handleMessage(cwd: string, entry: EmbeddedProcess, message: StdioMessage): void {
+  if (message.type === 'ready') {
+    const info = message.info
+    const problem = bridgeHandshakeProblem(info)
+    if (problem) {
+      if (info) bridgeInfo.set(cwd, info)
+
+      if (entry.restartAttempts === 0) {
+        recordDiagnostic('embedded_stale_restart', cwd, { error: problem })
+        stopEmbedded(cwd)
+        startEmbeddedInBackground(cwd, 1)
+        return
+      }
+
+      markIncompatibleBridge(cwd, problem)
+      embeddedFailed.add(cwd)
+      recordDiagnostic('embedded_incompatible', cwd, {
+        build: info?.build,
+        protocol: info?.protocol,
+        capabilities: info?.capabilities,
+        error: problem
+      })
+      emitStatusChange(cwd, 'incompatible')
+      stopEmbedded(cwd)
+      return
+    }
+
+    if (!info) return
+    bridgeInfo.set(cwd, info)
+    markReady(cwd, entry)
+    return
+  }
+
+  if (message.type === 'ui') {
+    emitUIEvent(cwd, message)
+    return
+  }
+
+  if (message.type === 'event') {
+    emitBusEvent(cwd, message)
+    return
+  }
+
+  if (message.type === 'request') {
+    void handleBridgeRequest(cwd, entry, message)
+    return
+  }
+
+  if (message.type !== 'result') return
+
+  const pending = entry.pending.get(message.id)
+  if (!pending) return
+
+  entry.pending.delete(message.id)
+  pending.resolve({ text: message.text, isError: message.isError })
+}
+
+function appendStartupOutput(entry: EmbeddedProcess, text: string): void {
+  if (entry.ready) return
+  if (entry.startupOutputPreview.join('\n').length >= STARTUP_OUTPUT_PREVIEW_CHARS) return
+  const cleaned = text.trimEnd()
+  if (cleaned) entry.startupOutputPreview.push(cleaned.slice(0, STARTUP_OUTPUT_CHUNK_CHARS))
+}
+
+function handleStdout(cwd: string, entry: EmbeddedProcess, chunk: Buffer): void {
+  entry.buffer += chunk.toString()
+
+  while (true) {
+    const newline = entry.buffer.indexOf('\n')
+    if (newline === -1) return
+
+    const line = entry.buffer.slice(0, newline).trim()
+    entry.buffer = entry.buffer.slice(newline + 1)
+    if (!line) continue
+
+    const message = parseMessage(line)
+    if (message) handleMessage(cwd, entry, message)
+    else appendStartupOutput(entry, line)
+  }
+}
+
+export function embeddedStartupTranscript(cwd: string): string | null {
+  const entry = embeddedProcesses.get(cwd)
+  if (!entry || entry.ready) return null
+
+  const output = [...entry.startupOutputPreview, ...entry.stderrPreview].join('\n').trim()
+  return output ? `$ mix run -e '<stdio-start>'\n\n${output}` : null
+}
+
+function ensureBundledBridgeDeps(projectCwd: string, bridgeCwd: string): string | null {
+  try {
+    childProcess.execFileSync('mix', ['deps.get'], {
+      cwd: bridgeCwd,
+      env: mixChildEnv(projectCwd),
+      stdio: 'pipe',
+      timeout: DEPS_GET_TIMEOUT_MS
+    })
+    return null
+  } catch (error) {
+    const childError = error as {
+      stdout?: Buffer | string
+      stderr?: Buffer | string
+      message?: string
+    }
+    const output = [childError.stdout, childError.stderr]
+      .map((chunk) => chunk?.toString().trim())
+      .filter(Boolean)
+      .join('\n')
+    return output || childError.message || 'mix deps.get failed for bundled pi_bridge'
+  }
+}
+
+function mixChildEnv(projectCwd: string): NodeJS.ProcessEnv {
+  const mixHome = path.join(os.homedir(), '.mix')
+  return {
+    ...process.env,
+    MIX_ENV: process.env.PI_ELIXIR_BRIDGE_MIX_ENV || 'dev',
+    MIX_HOME: mixHome,
+    MIX_ARCHIVES: path.join(mixHome, 'archives'),
+    PI_ELIXIR_PROJECT_CWD: projectCwd
+  }
+}
+
+function bundledBridgeCwd(): string {
+  return process.env.PI_ELIXIR_BRIDGE_CWD || BUNDLED_BRIDGE_CWD
+}
+
+interface Unrefable {
+  unref: () => void
+}
+
+function unrefIfSupported(value: unknown): void {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'unref' in value &&
+    typeof value.unref === 'function'
+  ) {
+    ;(value as Unrefable).unref()
+  }
+}
+
+function unrefChildProcess(proc: childProcess.ChildProcess): void {
+  unrefIfSupported(proc)
+  unrefIfSupported(proc.stdin)
+  unrefIfSupported(proc.stdout)
+  unrefIfSupported(proc.stderr)
+}
+
+export function startEmbeddedInBackground(cwd: string, restartAttempts = 0): void {
+  if (embeddedProcesses.has(cwd)) {
+    recordDiagnostic('embedded_start_skipped', cwd, { reason: 'already_started' })
+    return
+  }
+
+  const runtimeProblem = elixirRuntimeProblem()
+  if (runtimeProblem) {
+    markUnavailable(cwd, runtimeProblem)
+    embeddedFailed.add(cwd)
+    recordDiagnostic('embedded_start_skipped', cwd, {
+      reason: 'elixir_runtime_unavailable',
+      message: runtimeProblem
+    })
+    emitStatusChange(cwd, 'unavailable')
+    return
+  }
+
+  const bridgeCwd = bundledBridgeCwd()
+  const depsError = ensureBundledBridgeDeps(cwd, bridgeCwd)
+  if (depsError) {
+    markUnavailable(cwd, depsError)
+    embeddedFailed.add(cwd)
+    recordDiagnostic('embedded_start_skipped', cwd, {
+      reason: 'bundled_bridge_deps_unavailable',
+      bridgeCwd,
+      error: depsError
+    })
+    emitStatusChange(cwd, 'unavailable')
+    return
+  }
+
+  recordDiagnostic('embedded_start', cwd, {
+    command: 'mix run -e <stdio-start>',
+    bridgeCwd,
+    projectCwd: cwd,
+    mixEnv: mixChildEnv(cwd).MIX_ENV
+  })
+  const proc = childProcess.spawn('mix', ['run', '-e', START_STDIO_EXPR], {
+    cwd: bridgeCwd,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: mixChildEnv(cwd)
+  })
+  unrefChildProcess(proc)
+
+  const entry: EmbeddedProcess = {
+    proc,
+    ready: false,
+    url: embeddedUrl(cwd),
+    buffer: '',
+    nextId: 0,
+    pending: new Map(),
+    startedAt: Date.now(),
+    stderrBytes: 0,
+    stderrPreview: [],
+    startupOutputPreview: [],
+    restartAttempts
+  }
+  embeddedProcesses.set(cwd, entry)
+
+  proc.stdout?.on('data', (chunk: Buffer) => {
+    if (embeddedProcesses.get(cwd) === entry) handleStdout(cwd, entry, chunk)
+  })
+
+  proc.stderr?.on('data', (chunk: Buffer) => {
+    entry.stderrBytes += chunk.length
+    if (entry.stderrPreview.join('\n').length < STDERR_PREVIEW_CHARS) {
+      entry.stderrPreview.push(chunk.toString().slice(0, STDERR_PREVIEW_CHUNK_CHARS))
+    }
+    // Drain stderr so verbose Mix/BEAM output cannot block the child process.
+    // Keep stderr in diagnostics only; streaming it into the styled TUI widget can
+    // include child terminal resets such as Mix build-lock notices.
+  })
+
+  proc.on('error', (error) => {
+    if (embeddedProcesses.get(cwd) !== entry) return
+    recordDiagnostic('embedded_error', cwd, {
+      durationMs: Date.now() - entry.startedAt,
+      error: error.message,
+      stderrBytes: entry.stderrBytes,
+      stderrPreview: entry.stderrPreview.join('\n')
+    })
+    embeddedProcesses.delete(cwd)
+    embeddedFailed.add(cwd)
+    failPending(entry, error)
+    emitStatusChange(cwd, null)
+  })
+
+  proc.on('exit', (code, signal) => {
+    if (embeddedProcesses.get(cwd) !== entry) return
+    recordDiagnostic('embedded_exit', cwd, {
+      durationMs: Date.now() - entry.startedAt,
+      code,
+      signal,
+      ready: entry.ready,
+      stderrBytes: entry.stderrBytes,
+      stderrPreview: entry.stderrPreview.join('\n')
+    })
+    embeddedProcesses.delete(cwd)
+    connectionCache.delete(cwd)
+    failPending(entry, new Error('Embedded BEAM process exited'))
+    if (!entry.ready) {
+      embeddedFailed.add(cwd)
+      const stderr = entry.stderrPreview.join('\n').trim()
+      markUnavailable(
+        cwd,
+        stderr
+          ? `Embedded BEAM exited before ready: ${stderr}`
+          : `Embedded BEAM exited before ready with code ${code ?? 'unknown'}`
+      )
+    }
+    emitStatusChange(cwd, null)
+  })
+}
+
+function terminateProcess(proc: childProcess.ChildProcess): void {
+  if (proc.exitCode !== null && proc.exitCode !== undefined) return
+
+  proc.stdin?.end()
+  proc.kill('SIGTERM')
+  const force = setTimeout(() => proc.kill('SIGKILL'), SHUTDOWN_FORCE_MS)
+  const clearTimers = () => clearTimeout(force)
+  proc.once('exit', clearTimers)
+}
+
+export function stopEmbedded(cwd: string): void {
+  const entry = embeddedProcesses.get(cwd)
+  if (!entry) return
+  recordDiagnostic('embedded_stop', cwd, { ready: entry.ready })
+  terminateProcess(entry.proc)
+  embeddedProcesses.delete(cwd)
+  connectionCache.delete(cwd)
+  failPending(entry, new Error('Embedded BEAM process stopped'))
+}
+
+export function stopAllEmbedded(): void {
+  for (const [cwd] of embeddedProcesses) stopEmbedded(cwd)
+}
+
+export function getEmbeddedKind(cwd: string) {
+  const embedded = embeddedProcesses.get(cwd)
+  if (embedded?.ready) return 'embedded'
+  if (embedded) return 'starting'
+  return null
+}
+
+export function isEmbeddedReady(cwd: string): boolean {
+  return embeddedProcesses.get(cwd)?.ready ?? false
+}
+
+export function getEmbeddedUrl(cwd: string): string {
+  return embeddedProcesses.get(cwd)?.url ?? embeddedUrl(cwd)
+}
+
+export function sendEmbeddedEvent(cwd: string, event: BridgeEvent): Promise<void> {
+  if (!isEmbeddedReady(cwd)) return Promise.resolve()
+
+  void callEmbeddedTool(cwd, 'pi_event', event).catch(() => {
+    // Bridge events are notifications. They must never block agent tool completion.
+  })
+  return Promise.resolve()
+}
+
+export function callEmbeddedTool(
+  cwd: string,
+  name: string,
+  args: ToolArgs,
+  signal?: AbortSignal
+): Promise<ToolResult> {
+  const entry = embeddedProcesses.get(cwd)
+  if (!entry?.ready || !entry.proc.stdin) {
+    return Promise.resolve({ text: 'Embedded BEAM is not ready.', isError: true })
+  }
+
+  const stdin = entry.proc.stdin
+  const id = ++entry.nextId
+  const payload = JSON.stringify({ type: 'call', id, name, arguments: args }) + '\n'
+
+  return withDiagnosticSpan(
+    'embedded_tool_call',
+    cwd,
+    { name, id },
+    async () =>
+      new Promise((resolve, reject) => {
+        let settled = false
+        const startedAt = Date.now()
+        const timeout = setTimeout(() => {
+          const elapsedMs = Date.now() - startedAt
+          const pendingCalls = Array.from(entry.pending.entries()).map(([pendingId, pending]) => ({
+            id: pendingId,
+            name: pending.name ?? 'unknown',
+            elapsedMs: pending.startedAt ? Date.now() - pending.startedAt : undefined
+          }))
+          recordDiagnostic('embedded_tool_call_timeout', cwd, {
+            name,
+            id,
+            elapsedMs,
+            timeoutMs: TOOL_CALL_TIMEOUT_MS,
+            pendingCalls,
+            stderrBytes: entry.stderrBytes,
+            stderrPreview: entry.stderrPreview.join('\n')
+          })
+          resolveOnce({
+            text: `Embedded BEAM tool call timed out after ${elapsedMs}ms while waiting for ${name}.`,
+            isError: true
+          })
+        }, TOOL_CALL_TIMEOUT_MS)
+
+        const cleanup = () => {
+          clearTimeout(timeout)
+          signal?.removeEventListener('abort', abort)
+          entry.pending.delete(id)
+        }
+
+        const resolveOnce = (result: ToolResult) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve(result)
+        }
+
+        const rejectOnce = (error: Error) => {
+          if (settled) return
+          settled = true
+          cleanup()
+          reject(error)
+        }
+
+        const abort = () => {
+          resolveOnce({ text: 'Tool call aborted.', isError: true })
+        }
+
+        if (signal?.aborted) return abort()
+
+        entry.pending.set(id, { resolve: resolveOnce, reject: rejectOnce, name, startedAt })
+        signal?.addEventListener('abort', abort, { once: true })
+        stdin.write(payload, (error) => {
+          if (!error) return
+          rejectOnce(error)
+        })
+      })
+  )
+}

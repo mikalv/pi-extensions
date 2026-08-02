@@ -1,0 +1,4 @@
+interface:
+  display_name: "Marketing Context"
+  short_description: "Create the shared startup marketing foundation"
+  default_prompt: "Create or update the shared marketing context for this startup."

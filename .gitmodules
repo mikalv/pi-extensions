@@ -1,0 +1,6 @@
+[submodule "external/plannotator"]
+	path = external/plannotator
+	url = https://github.com/blazed/plannotator
+[submodule "external/scratchpad"]
+	path = external/scratchpad
+	url = https://github.com/NikiforovAll/scratchpad

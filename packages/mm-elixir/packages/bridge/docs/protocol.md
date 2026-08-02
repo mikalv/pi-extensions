@@ -1,0 +1,249 @@
+# pi_bridge protocol examples
+
+The bridge keeps protocol data as JSONCodec structs internally. These examples show the JSON shape at process/HTTP boundaries.
+
+## Stdio ready
+
+```json
+{
+  "type": "ready",
+  "info": {
+    "project": "my_app",
+    "version": "0.8.0",
+    "build": "pi_bridge@0.8.0/protocol-2",
+    "protocol": 2,
+    "transport": "stdio",
+    "capabilities": [
+      "stdio_jsonl",
+      "bridge_requests",
+      "project_eval_worker",
+      "application_eval_worker",
+      "attached_runtime_eval",
+      "structured_diagnostics",
+      "project_context"
+    ],
+    "skills": [],
+    "plugins": [],
+    "apis": {
+      "runtime": [
+        {
+          "name": "llm",
+          "module": "Elixir.Pi.LLM",
+          "functions": [{ "name": "complete", "arity": 1 }]
+        }
+      ],
+      "extensions": []
+    }
+  }
+}
+```
+
+The extension accepts ready state only when `build`, `protocol`, and every required capability match. On a stale handshake it atomically replaces the child once, then reports incompatibility if the replacement still fails.
+
+## Stdio tool call/result
+
+`target` is decoded once by `JSONCodec` into the canonical enum `project | application | runtime | bridge`; internal dispatch never accepts duplicate string/atom representations. `project` is the default dependencyless persistent target. `application` starts the target application, `runtime` attaches to `PI_ELIXIR_NODE`, and `bridge` evaluates control-plane helpers.
+
+```json
+{ "type": "call", "id": 1, "name": "project_eval", "arguments": { "code": "1 + 1", "target": "project" } }
+```
+
+```json
+{ "type": "result", "id": 1, "text": "2", "isError": false }
+```
+
+## BEAM-initiated LLM completion
+
+pi owns provider/model selection, credentials, streaming, cancellation, usage, and transcript UI. BEAM code sends structured requests over the active bridge and receives structured results.
+
+```json
+{
+  "type": "request",
+  "id": "llm_123_1",
+  "op": "llm_complete",
+  "payload": {
+    "messages": [{ "role": "user", "content": "hello" }],
+    "opts": {}
+  }
+}
+```
+
+```json
+{
+  "type": "response",
+  "id": "llm_123_1",
+  "ok": true,
+  "result": {
+    "text": "hello from pi",
+    "usage": null,
+    "model": "gpt-5.5",
+    "provider": "openai"
+  }
+}
+```
+
+## BEAM-initiated LLM streaming
+
+```json
+{
+  "type": "request",
+  "id": "llm_456_2",
+  "op": "llm_stream",
+  "payload": {
+    "messages": [{ "role": "user", "content": "stream" }],
+    "opts": {}
+  }
+}
+```
+
+```json
+{ "type": "llm_chunk", "id": "llm_456_2", "delta": "first " }
+{ "type": "llm_chunk", "id": "llm_456_2", "delta": "second" }
+{
+  "type": "llm_done",
+  "id": "llm_456_2",
+  "result": {
+    "text": "first second",
+    "usage": null,
+    "model": "gpt-5.5",
+    "provider": "openai"
+  }
+}
+```
+
+Cancellation from BEAM to pi:
+
+```json
+{ "type": "llm_cancel", "id": "llm_456_2", "reason": "closed" }
+```
+
+## BEAM session snapshot event
+
+`Pi.Session` workers emit structured snapshots as `pi_session` events. Field names are camelCase at the JSON boundary via `JSONCodec`.
+
+```json
+{
+  "type": "event",
+  "name": "pi_session",
+  "data": {
+    "session": {
+      "id": "session_1",
+      "parentId": null,
+      "name": "reviewer",
+      "status": "done",
+      "result": "passed",
+      "error": null,
+      "startedAt": "2026-06-09T09:00:00Z",
+      "updatedAt": "2026-06-09T09:00:01Z",
+      "completedAt": "2026-06-09T09:00:01Z",
+      "durationMs": 1000,
+      "prompt": "review this change",
+      "response": "passed",
+      "latest": "passed",
+      "current": null,
+      "runCount": 1,
+      "messageCount": 2,
+      "recentOutput": [],
+      "events": [
+        { "type": "started", "at": "2026-06-09T09:00:00Z", "data": {} },
+        { "type": "llm", "at": "2026-06-09T09:00:00Z", "data": {} },
+        { "type": "done", "at": "2026-06-09T09:00:01Z", "data": {} }
+      ]
+    }
+  }
+}
+```
+
+Running or streaming sessions may include live activity and recent output without requiring TS renderers to parse event blobs:
+
+```json
+{
+  "status": "running",
+  "current": "streaming",
+  "recentOutput": ["first ", "second"],
+  "runCount": 1
+}
+```
+
+Reruns increment `runCount` and update `completedAt`. Cancelled sessions also set `completedAt` and clear `current` before the terminal snapshot is emitted.
+
+## Private BEAM session controls
+
+The extension exposes session control through private bridge-native MCP tools and slash commands, not model-facing tools. The slash commands dispatch to these calls:
+
+```json
+{
+  "type": "call",
+  "id": 10,
+  "name": "pi_session_rerun",
+  "arguments": { "id": "session_131" }
+}
+```
+
+```json
+{ "type": "result", "id": 10, "text": "ok", "isError": false }
+```
+
+```json
+{
+  "type": "call",
+  "id": 11,
+  "name": "pi_session_cancel",
+  "arguments": { "id": "session_163" }
+}
+```
+
+```json
+{ "type": "result", "id": 11, "text": "ok", "isError": false }
+```
+
+A rerun emits fresh `pi_session` snapshots for the same session id with an incremented `runCount`. A cancel emits one terminal cancelled snapshot.
+
+## UI status event
+
+```json
+{ "type": "ui", "op": "status", "key": "ecto", "text": "ecto 1/1" }
+```
+
+## BEAM-to-pi extension event bus
+
+```json
+{ "type": "event", "name": "pi-elixir:demo", "data": { "events": 1 } }
+```
+
+## Plugin command and tool hooks
+
+Plugin commands are called by the TypeScript extension after it registers `/elixir:<name>` commands from the ready inventory:
+
+```json
+{ "type": "call", "id": 2, "name": "pi_plugin_command", "arguments": { "name": "demo_plugin_status", "args": "smoke" } }
+```
+
+Tool hooks use strict hook payload shapes before dispatching to plugin callbacks. `pi_plugin_tool_call` responses patch tool input only; result hook responses may patch result `content` or `isError`.
+
+```json
+{ "type": "call", "id": 3, "name": "pi_plugin_tool_call", "arguments": { "toolName": "bash", "toolCallId": "tool_1", "input": { "command": "pwd" } } }
+```
+
+```json
+{ "type": "result", "id": 3, "text": "{\"block\":\"blocked by plugin\"}", "isError": false }
+```
+
+## MCP JSON-RPC
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": { "name": "project_eval", "arguments": { "code": "1 + 1" } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": { "content": [{ "type": "text", "text": "2" }] }
+}
+```

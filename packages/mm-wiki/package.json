@@ -1,0 +1,61 @@
+{
+  "name": "@meeh/mm-wiki",
+  "version": "0.1.0",
+  "description": "Compiled topical wiki layer for Pi — local markdown filesystem that sits between observational memory (STM) and Prism LTM.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mikal Villa",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikalv/pi-extensions",
+    "directory": "packages/mm-wiki"
+  },
+  "homepage": "https://github.com/mikalv/pi-extensions/tree/main/packages/mm-wiki",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-skill",
+    "wiki",
+    "memory",
+    "observational-memory"
+  ],
+  "files": [
+    "src",
+    "skills",
+    "docs",
+    "extras",
+    "scripts",
+    "tests",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@types/node": "^26.1.2",
+    "typebox": "^1.3.9",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
