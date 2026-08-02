@@ -52,7 +52,8 @@
       "./packages/todos/index.ts",
       "./packages/token-rate/index.ts",
       "./packages/usage-extension/index.ts",
-      "./packages/pi-atelier/extensions/index.ts"
+      "./packages/pi-atelier/extensions/index.ts",
+      "./packages/pi-backoffice-reporter/src/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
