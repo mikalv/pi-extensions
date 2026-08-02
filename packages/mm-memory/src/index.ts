@@ -1,6 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { installAmbientSync, memoryStartupGuidance } from "./ambient.js";
 import { checkpointBeforeCompact } from "./checkpoint.js";
 import { formatMemoryStatus, loadMemoryConfig, saveMemoryConfig } from "./config.js";
 import { projectFromCwd, type MemoryKind } from "./documents.js";
@@ -43,6 +44,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				"status",
 				"recall ",
 				"remember ",
+				"sessions ",
 				"mine ",
 				"assess ",
 				"gap ",
@@ -50,6 +52,8 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				"inject off",
 				"checkpoint on",
 				"checkpoint off",
+				"sync on",
+				"sync off",
 				"help",
 			];
 			const needle = prefix.trim().toLowerCase();
@@ -68,27 +72,31 @@ export default function mmMemory(pi: ExtensionAPI): void {
 						[
 							"/memory status — Prism LTM config + health",
 							"/memory recall <query> — scoped semantic search",
+							"/memory sessions <query> — search past session summaries (ltm-sessions)",
 							"/memory remember <text> — index a durable memory",
 							"/memory mine [path] — ingest files into Prism (default: cwd)",
 							"/memory assess <topic> — coverage/confidence over wiki + Prism",
 							"/memory gap <description> — record a known knowledge gap",
 							"/memory inject on|off — session-start Prism inject (default off)",
 							"/memory checkpoint on|off — precompact LTM checkpoint (default on)",
-							"Tools: memory_remember, memory_recall, memory_mine, memory_assess, memory_gap",
+							"/memory sync on|off — ambient session sync to ltm-sessions (default on)",
+							"Tools: memory_remember, memory_recall, memory_sessions, memory_mine, memory_assess, memory_gap",
 						].join("\n"),
 						"info",
 					);
 					return;
 				}
 
-				if (verb === "inject" || verb === "checkpoint") {
+				if (verb === "inject" || verb === "checkpoint" || verb === "sync") {
 					const mode = rest[0]?.toLowerCase();
 					if (mode !== "on" && mode !== "off") {
 						ctx.ui.notify(`Usage: /memory ${verb} on|off`, "error");
 						return;
 					}
 					if (verb === "inject") saveMemoryConfig({ injectOnStart: mode === "on" });
-					else saveMemoryConfig({ checkpointOnCompact: mode === "on" });
+					else if (verb === "checkpoint")
+						saveMemoryConfig({ checkpointOnCompact: mode === "on" });
+					else saveMemoryConfig({ ambientSync: mode === "on" });
 					ctx.ui.notify(formatMemoryStatus(loadMemoryConfig()), "info");
 					return;
 				}
@@ -116,6 +124,19 @@ export default function mmMemory(pi: ExtensionAPI): void {
 					const result = await recall(query, {
 						cwd: ctx.cwd,
 						project: projectFromCwd(ctx.cwd),
+					});
+					ctx.ui.notify(formatRecallResult(result), "info");
+					return;
+				}
+
+				if (verb === "sessions") {
+					const query = rest.join(" ").trim() || projectFromCwd(ctx.cwd);
+					const result = await recall(query, {
+						cwd: ctx.cwd,
+						project: projectFromCwd(ctx.cwd),
+						scope: "sessions",
+						kind: "session_summary",
+						limit: 10,
 					});
 					ctx.ui.notify(formatRecallResult(result), "info");
 					return;
@@ -152,7 +173,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 
 				if (verb !== "status") {
 					ctx.ui.notify(
-						`Unknown /memory action: ${verb}. Try status|recall|remember|mine|assess|gap|inject|checkpoint|help`,
+						`Unknown /memory action: ${verb}. Try status|recall|sessions|remember|mine|assess|gap|inject|checkpoint|sync|help`,
 						"error",
 					);
 					return;
@@ -186,7 +207,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		name: "memory_remember",
 		label: "Remember (Prism LTM)",
 		description:
-			"Store a durable long-term memory in Prism (facts, preferences, decisions, session summaries). Prefer this for lasting knowledge; short-lived observations belong in observational-memory; curated topics belong in mm-wiki.",
+			"Store a durable long-term memory in Prism (facts, preferences, decisions, insights). Prefer this for lasting knowledge; short-lived observations belong in observational-memory; curated topics belong in mm-wiki. Search with memory_recall first — prefer one strong memory over near-duplicates.",
 		parameters: Type.Object({
 			text: Type.String({ description: "Memory text to store" }),
 			kind: Type.Optional(KIND_ENUM),
@@ -215,7 +236,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		name: "memory_recall",
 		label: "Recall (Prism LTM)",
 		description:
-			"Semantic recall from Prism LTM with optional scopes: project (wing), kind (room), and tags. Use when asking what is known durably about a topic across sessions.",
+			"Semantic recall from Prism LTM. Use scope=memories (default) for durable facts; scope=sessions for past conversation summaries (ambient sync + precompact checkpoints); scope=both when unsure. Optional filters: project (wing), kind (room), tags.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Natural-language recall query" }),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
@@ -232,6 +253,28 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				project: params.project ?? projectFromCwd(ctx.cwd),
 				kind: params.kind,
 				tags: params.tags,
+			});
+			return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "memory_sessions",
+		label: "Search session memory",
+		description:
+			"Search past Pi session summaries in Prism ltm-sessions (nmem thread-search pattern, Prism-backed). Use when the user asks about previous conversations or prior work in this project.",
+		parameters: Type.Object({
+			query: Type.String({ description: "What to find in past sessions" }),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+			project: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const result = await recall(params.query, {
+				cwd: ctx.cwd,
+				limit: params.limit ?? 10,
+				scope: "sessions",
+				kind: "session_summary",
+				project: params.project ?? projectFromCwd(ctx.cwd),
 			});
 			return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
 		},
@@ -301,15 +344,16 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		},
 	});
 
-	// Optional: inject top-N at agent start only when explicitly enabled.
+	// Guidance always on; optional Prism hit inject when injectOnStart=true.
 	pi.on("before_agent_start", async (event, ctx) => {
+		const parts = [event.systemPrompt, memoryStartupGuidance()];
 		try {
 			const block = await recallForInjection(event.prompt ?? "", { cwd: ctx.cwd });
-			if (!block) return;
-			return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
+			if (block) parts.push(block);
 		} catch {
-			return;
+			// inject is best-effort
 		}
+		return { systemPrompt: parts.join("\n\n") };
 	});
 
 	// Pre-compaction checkpoint → ltm-sessions (MemPalace-inspired pattern, Prism-backed).
@@ -333,4 +377,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			}
 		}
 	});
+
+	// Ambient rolling session sync (nmem pattern → Prism ltm-sessions).
+	installAmbientSync(pi);
 }

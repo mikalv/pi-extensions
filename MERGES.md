@@ -78,7 +78,7 @@ Kartlegging av `inspirations/` og `insp2/` med foreslåtte merge-mål.
 
 **Fra MemPalace (mønstre, ikke port):** `memory_mine` (ingest), scoped recall (`project`/`kind`/`tags`), precompact-checkpoint til `ltm-sessions`. `mempalace-pi` er fjernet.
 
-**Producers:** `mm-observational-memory` promoterer reflections → Prism + wiki etter reflector. `nmem` kan kobles senere. `Pi-Mythic-Memory` er fjernet (erstattet av `mm-wiki`). Soul-spesifikke lag er utenfor Pi-sporet.
+**Producers:** `mm-observational-memory` promoterer reflections → Prism + wiki etter reflector. Verdifulle **nmem**-mønstre er bakket inn i `mm-memory` (ambient session-sync, session-søk, always-on guidance, save-discipline). `packages/nmem` er fjernet. `Pi-Mythic-Memory` er fjernet (erstattet av `mm-wiki`). Soul-spesifikke lag er utenfor Pi-sporet.
 
 | Repo | Foreslått merged-into | Begrunnelse | Behold separat? | Prioritet |
 |---|---|---|---|---|
@@ -96,13 +96,13 @@ Kartlegging av `inspirations/` og `insp2/` med foreslåtte merge-mål.
 | insp2/pi-condense | pi-context-system | Tool-output compression | Nei | Høy |
 | insp2/pi-distill | pi-context-system | Output distillation | Nei | Medium |
 | insp2/pi-model-agents | pi-context-system | Model-specific AGENTS context | Kandidat | Medium |
-| insp2/pi-observational-memory | packages/mm-observational-memory | STM + promote til wiki/Prism | Portet (kilde slettet fra insp2) | Medium |
-| insp2/pi-persistent-intelligence | pi-context-system | Long-term memory | Kandidat | Medium |
-| insp2/pi-recall | pi-context-system | Recall history/memory | Nei | Medium |
-| insp2/pi-session-recall | pi-context-system | Recall history/memory | Nei | Medium |
-| insp2/pi-mnemosyne | pi-context-system | Local-first memory | Kandidat | Medium |
-| inspirations/pi-mindplace | pi-context-system | Knowledge graph memory | Kandidat | Medium |
-| insp2/pi-mindplace | pi-context-system | Dedup / same family | Kandidat | Medium |
+| insp2/pi-observational-memory | packages/mm-observational-memory | STM + promote til wiki/Prism | Portet (kilde slettet) | Medium |
+| insp2/pi-persistent-intelligence | — | Long-term memory (erstattet av mm-memory/Prism) | Slettet fra insp2 | — |
+| insp2/pi-recall | — | Recall history/memory | Slettet fra insp2 | — |
+| insp2/pi-session-recall | — | Recall history/memory | Slettet fra insp2 | — |
+| insp2/pi-mnemosyne | — | Local-first memory | Slettet fra insp2 | — |
+| inspirations/pi-mindplace | — | Knowledge graph memory | Slettet fra inspirations | — |
+| insp2/pi-mindplace | — | Dedup / same family | Slettet fra insp2 | — |
 
 ## 4. Multi-agent / orchestration / teams → `pi-agent-orchestrator`
 

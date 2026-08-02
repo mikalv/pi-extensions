@@ -40,7 +40,6 @@
       "./packages/mm-wiki/src/index.ts",
       "./packages/mm-qq/extensions",
       "./packages/mm-usage-center/index.ts",
-      "./packages/nmem/extensions",
       "./packages/notify/extensions/index.ts",
       "./packages/pi-prism/src/index.ts",
       "./packages/powerline-footer/index.ts",

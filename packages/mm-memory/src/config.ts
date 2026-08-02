@@ -18,6 +18,11 @@ export interface MemoryConfig {
 	injectCollection: "memories" | "sessions" | "both";
 	/** When true, index a session checkpoint into ltm-sessions before compaction. */
 	checkpointOnCompact: boolean;
+	/**
+	 * When true, sync a rolling session summary into ltm-sessions on agent_end
+	 * (debounced) and hard-flush on compact/switch/shutdown. Pattern from nmem.
+	 */
+	ambientSync: boolean;
 }
 
 function agentDir(): string {
@@ -112,6 +117,7 @@ export function loadMemoryConfig(): MemoryConfig {
 	let injectLimit = 5;
 	let injectCollection: MemoryConfig["injectCollection"] = "memories";
 	let checkpointOnCompact = true;
+	let ambientSync = true;
 
 	const path = mmMemoryConfigPath();
 	if (existsSync(path)) {
@@ -128,6 +134,7 @@ export function loadMemoryConfig(): MemoryConfig {
 			if (typeof parsed.checkpointOnCompact === "boolean") {
 				checkpointOnCompact = parsed.checkpointOnCompact;
 			}
+			if (typeof parsed.ambientSync === "boolean") ambientSync = parsed.ambientSync;
 		} catch {
 			// ignore
 		}
@@ -141,6 +148,7 @@ export function loadMemoryConfig(): MemoryConfig {
 		injectLimit,
 		injectCollection,
 		checkpointOnCompact,
+		ambientSync,
 	};
 }
 
@@ -153,6 +161,7 @@ export function saveMemoryConfig(patch: Partial<Omit<MemoryConfig, "connection">
 		injectLimit: patch.injectLimit ?? current.injectLimit,
 		injectCollection: patch.injectCollection ?? current.injectCollection,
 		checkpointOnCompact: patch.checkpointOnCompact ?? current.checkpointOnCompact,
+		ambientSync: patch.ambientSync ?? current.ambientSync,
 	};
 	const path = mmMemoryConfigPath();
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -167,10 +176,11 @@ export function formatMemoryStatus(config: MemoryConfig): string {
 		`sessionsCollection: ${config.sessionsCollection}`,
 		`injectOnStart: ${config.injectOnStart} (limit=${config.injectLimit}, collection=${config.injectCollection})`,
 		`checkpointOnCompact: ${config.checkpointOnCompact}`,
+		`ambientSync: ${config.ambientSync}`,
 		`configFile: ${mmMemoryConfigPath()}`,
 		`prismConfig: ${prismConfigPath()}`,
 		"",
 		"Layer model: STM (observational) → wiki (mm-wiki) → Prism LTM (this package).",
-		"Patterns: memory_mine (ingest), scoped recall (project/kind/tags), precompact checkpoint.",
+		"Patterns: mine, scoped recall, precompact checkpoint, ambient session sync (from nmem).",
 	].join("\n");
 }

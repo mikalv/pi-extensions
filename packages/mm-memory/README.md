@@ -19,11 +19,14 @@ long-term    Prism collections via mm-memory  ← this package
 
 Document fields: `id`, `kind`, `text`, `project`, `tags[]`, `created_at`, `source`.
 
-## Patterns (inspired by MemPalace, Prism-backed)
+## Patterns (MemPalace + nmem, Prism-backed)
 
 1. **Mine** — `memory_mine` / `/memory mine [path]` ingests project text files into Prism.
 2. **Scoped recall** — `memory_recall` filters by `project` (wing), `kind` (room), and `tags`.
 3. **Precompact checkpoint** — on `session_before_compact`, writes a session summary into `ltm-sessions` (default on).
+4. **Ambient session sync** (from nmem) — debounced upsert of the live session into `ltm-sessions` on `agent_end`, hard flush on compact/switch/shutdown (default on; `/memory sync off` to disable).
+5. **Session search** — `memory_sessions` / `/memory sessions <query>` searches past session summaries.
+6. **Startup guidance** — always injected; optional hit inject via `/memory inject on`.
 
 ## Config
 
@@ -36,7 +39,8 @@ Document fields: `id`, `kind`, `text`, `project`, `tags[]`, `created_at`, `sourc
   "injectOnStart": false,
   "injectLimit": 5,
   "injectCollection": "memories",
-  "checkpointOnCompact": true
+  "checkpointOnCompact": true,
+  "ambientSync": true
 }
 ```
 
@@ -48,8 +52,10 @@ Document fields: `id`, `kind`, `text`, `project`, `tags[]`, `created_at`, `sourc
 | `/memory remember\|recall\|mine` | Write / search / ingest |
 | `/memory inject on\|off` | Start inject (default off) |
 | `/memory checkpoint on\|off` | Precompact checkpoint (default on) |
+| `/memory sync on\|off` | Ambient session sync (default on) |
 | `memory_remember` | Store durable LTM doc |
 | `memory_recall` | Scoped semantic recall |
+| `memory_sessions` | Search past session summaries |
 | `memory_mine` | Ingest files into Prism |
 | `/memory assess` / `memory_assess` | Coverage confidence (wiki + Prism + gaps) |
 | `/memory gap` / `memory_gap` | Record a known knowledge gap |
