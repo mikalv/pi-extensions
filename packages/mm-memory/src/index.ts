@@ -380,4 +380,23 @@ export default function mmMemory(pi: ExtensionAPI): void {
 
 	// Ambient rolling session sync (nmem pattern → Prism ltm-sessions).
 	installAmbientSync(pi);
+
+	// Atelier sidebar status — show Prism connection state
+	const MEM_STATUS_KEY = "mm-memory";
+
+	pi.on("session_start", (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		const config = loadMemoryConfig();
+		const connected = Boolean(config.connection.baseUrl && config.connection.apiKey);
+		ctx.ui.setStatus(MEM_STATUS_KEY, connected ? "💾 ltm: ready" : "💾 ltm: —");
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		const config = loadMemoryConfig();
+		const connected = Boolean(config.connection.baseUrl && config.connection.apiKey);
+		const sync = config.ambientSync ? " · sync✓" : "";
+		const inject = config.injectOnStart ? " · inject✓" : "";
+		ctx.ui.setStatus(MEM_STATUS_KEY, connected ? `💾 ltm: ready${sync}${inject}` : "💾 ltm: —");
+	});
 }

@@ -17,7 +17,6 @@
       "./packages/agent-guidance/agent-guidance.ts",
       "./packages/agent-loop-reflection/extensions",
       "./packages/amphetamine/src/index.ts",
-      "./packages/amux/pi/index.ts",
       "./packages/ask-user-question/index.ts",
       "./packages/auto-naming-session/extensions",
       "./packages/auto-retry/src/index.ts",
@@ -30,7 +29,6 @@
       "./packages/files-widget/index.ts",
       "./packages/gemini-search.ts",
       "./packages/macos-notify.ts",
-      "./packages/marketingagents/extensions",
       "./packages/mm-adhd/src/index.ts",
       "./packages/mm-btw/src/index.ts",
       "./packages/mm-elixir/packages/extension/src/index.ts",
@@ -53,10 +51,10 @@
       "./packages/tab-status/tab-status.ts",
       "./packages/todos/index.ts",
       "./packages/token-rate/index.ts",
-      "./packages/usage-extension/index.ts"
+      "./packages/usage-extension/index.ts",
+      "./packages/pi-atelier/extensions/index.ts"
     ],
     "skills": [
-      "./packages/marketingagents/skills",
       "./packages/mm-elixir/packages/extension/skills",
       "./packages/mm-wiki/skills"
     ],

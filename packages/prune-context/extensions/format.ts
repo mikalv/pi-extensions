@@ -74,6 +74,7 @@ export function formatSummary(
   totalMessageCount: number,
   files?: string[],
   previousSummary?: string,
+  stateBlock?: string,
 ): string {
   // 首行统计
   let header = `Pruned ${totalMessageCount} messages.`;
@@ -85,6 +86,10 @@ export function formatSummary(
 
   if (previousSummary) {
     lines.push(previousSummary, "");
+  }
+
+  if (stateBlock?.trim()) {
+    lines.push(stateBlock.trim(), "");
   }
 
   for (const entry of entries) {

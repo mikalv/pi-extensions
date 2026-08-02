@@ -1,0 +1,19 @@
+{
+  "name": "@meeh/auth-providers-suite",
+  "version": "0.1.0",
+  "description": "Shared provider/account/auth foundation for Pi runtimes, orchestration, and TUI control-plane work.",
+  "keywords": [
+    "pi-package"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "Mikal / Meeh",
+  "files": [
+    "index.ts",
+    "src/",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

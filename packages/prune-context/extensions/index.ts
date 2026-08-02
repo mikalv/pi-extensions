@@ -15,8 +15,12 @@ import type {
   ExtensionAPI,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { installContextTrim } from "./context-trim.ts";
+import { installToolResultCrop } from "./crop.ts";
+import { extractStateCatalog, formatStateCatalog } from "./extract-state.ts";
 import { formatSummary } from "./format.ts";
 import { extractFiles, type MessageLike, pruneMessages } from "./prune.ts";
+import { installRtkRewrite } from "./rtk.ts";
 import { recallTool } from "./tool.ts";
 
 /** /prune 命令的 customInstructions 标记，用于在钩子中识别来源。 */
@@ -181,15 +185,17 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // prune → format 管线
+    // prune → format 管线 (+ deterministic state catalog from smart-compact)
     const messages = liveMessages.map((lm) => lm.message);
     const entries = pruneMessages(messages, messageLineNumbers);
     const files = extractFiles(messages);
+    const stateBlock = formatStateCatalog(extractStateCatalog(messages));
     const summary = formatSummary(
       entries,
       messages.length,
       files,
       preparation.previousSummary,
+      stateBlock,
     );
 
     return {
@@ -205,4 +211,9 @@ export default function (pi: ExtensionAPI) {
       },
     };
   });
+
+  // Cheap-context ingestion / mid-session reclaim (from nmem-adjacent insp ports)
+  installRtkRewrite(pi);
+  installToolResultCrop(pi);
+  installContextTrim(pi);
 }

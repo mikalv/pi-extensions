@@ -1,4 +1,0 @@
-interface:
-  display_name: "Customer Research"
-  short_description: "Ground marketing in real customer evidence"
-  default_prompt: "Analyze or plan customer research for this startup."
