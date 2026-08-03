@@ -76,6 +76,44 @@ export default (pi: ExtensionAPI) => {
   let currentSessionId: string | null = null;
   const getCtx = () => lastCtx;
 
+  const registerCursorProvider = () => {
+    pi.registerProvider("cursor", {
+      baseUrl: CURSOR_API_URL,
+      apiKey: "CURSOR_ACCESS_TOKEN",
+      api: "cursor-agent" as unknown as Api,
+      streamSimple: (model, context, options) =>
+        streamCursorAgent(pi, getCtx, state, model, context, options),
+      models: getCachedPiModels(),
+      oauth: {
+        name: "Cursor",
+        login: async (callbacks) => {
+          const creds = await login(callbacks);
+          registerCursorProvider();
+          return creds;
+        },
+        refreshToken: async (creds) => {
+          const refreshed = await refreshToken(creds);
+          registerCursorProvider();
+          return refreshed;
+        },
+        getApiKey: (cred) => cred.access,
+      },
+    });
+  };
+
+  const updateCachedModelsFromContextInBackground = (ctx: ExtensionContext) => {
+    void (async () => {
+      const accessToken =
+        await ctx.modelRegistry.getApiKeyForProvider("cursor");
+      if (!accessToken) {
+        return;
+      }
+
+      await updateCachedPiModelsIfStale(createAiService(accessToken));
+      registerCursorProvider();
+    })().catch(() => {}); // ignore
+  };
+
   const state = createStateStore((type, data) => {
     pi.appendEntry(type, data);
   });
@@ -113,16 +151,19 @@ export default (pi: ExtensionAPI) => {
   pi.on("model_select", async (event, ctx) => {
     lastCtx = ctx;
     if (event.model.provider === "cursor") {
+      registerCursorProvider();
       updateCachedModelsFromContextInBackground(ctx);
     }
   });
 
   pi.on("session_start", async (_, ctx) => {
+    registerCursorProvider();
     await refreshBranchState(ctx);
     updateCachedModelsFromContextInBackground(ctx);
   });
 
   pi.on("session_switch", async (_, ctx) => {
+    registerCursorProvider();
     await refreshBranchState(ctx);
     updateCachedModelsFromContextInBackground(ctx);
   });
@@ -143,18 +184,5 @@ export default (pi: ExtensionAPI) => {
     });
   });
 
-  pi.registerProvider("cursor", {
-    baseUrl: CURSOR_API_URL,
-    apiKey: "CURSOR_ACCESS_TOKEN",
-    api: "cursor-agent" as unknown as Api,
-    streamSimple: (model, context, options) =>
-      streamCursorAgent(pi, getCtx, state, model, context, options),
-    models: getCachedPiModels(),
-    oauth: {
-      name: "Cursor",
-      login,
-      refreshToken,
-      getApiKey: (cred) => cred.access,
-    },
-  });
+  registerCursorProvider();
 };
