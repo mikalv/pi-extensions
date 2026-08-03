@@ -82,7 +82,8 @@ function normalizeTaskFile(scope: TaskScope): void {
     const line = lines[i] || "";
     const parsed = parseTaskLine(line, scope, index);
     if (!parsed) continue;
-    const nextLine = formatTaskLine({ ...parsed, id: parsed.id.includes("-") ? parsed.id : generateTaskId(scope) });
+    const hasStableId = /<!--\s*pi-task:[^\s]+\s*-->/.test(line);
+    const nextLine = formatTaskLine({ ...parsed, id: hasStableId ? parsed.id : generateTaskId(scope) });
     if (line.trimEnd() !== nextLine) {
       lines[i] = nextLine;
       changed = true;
@@ -171,6 +172,40 @@ export function moveTask(id: string, from: TaskScope, to: TaskScope): boolean {
   }
   removeTask(from, id);
   return true;
+}
+
+function reorderWithinScope(scope: TaskScope, id: string, computeTargetIndex: (currentIndex: number, total: number) => number): boolean {
+  const raw = readTaskFile(scope);
+  const lines = raw.split(/\r?\n/);
+  const tasks = parseTasks(scope);
+  const currentIndex = tasks.findIndex((entry) => entry.id === id);
+  if (currentIndex === -1) return false;
+  const targetIndex = computeTargetIndex(currentIndex, tasks.length);
+  if (targetIndex === currentIndex || targetIndex < 0 || targetIndex >= tasks.length) return true;
+
+  const lineIndexes = tasks.map((task) => task.line - 1);
+  const taskLines = lineIndexes.map((index) => lines[index] || "");
+  const [movedLine] = taskLines.splice(currentIndex, 1);
+  taskLines.splice(targetIndex, 0, movedLine || "");
+
+  lineIndexes.forEach((lineIndex, i) => {
+    lines[lineIndex] = taskLines[i] || "";
+  });
+
+  writeTaskFile(scope, `${lines.join("\n")}\n`);
+  return true;
+}
+
+export function moveTaskToTop(scope: TaskScope, id: string): boolean {
+  return reorderWithinScope(scope, id, () => 0);
+}
+
+export function moveTaskUp(scope: TaskScope, id: string): boolean {
+  return reorderWithinScope(scope, id, (currentIndex) => Math.max(0, currentIndex - 1));
+}
+
+export function moveTaskDown(scope: TaskScope, id: string): boolean {
+  return reorderWithinScope(scope, id, (currentIndex, total) => Math.min(total - 1, currentIndex + 1));
 }
 
 export function listAllTasks(): { session: MarkdownTask[]; project: MarkdownTask[] } {

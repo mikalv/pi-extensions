@@ -1,17 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
-
-const REMINDER_INTERVAL = 4;
-let turnsSinceTaskTouch = 0;
-
-function markTaskTouch(): void {
-  turnsSinceTaskTouch = 0;
-}
 import {
   appendTask,
   getCurrentSessionId,
   listAllTasks,
   moveTask,
+  moveTaskDown,
+  moveTaskToTop,
+  moveTaskUp,
   pathForScope,
   removeTask,
   replaceTaskText,
@@ -19,6 +15,13 @@ import {
   setTaskStatus,
 } from "./store.ts";
 import type { TaskScope } from "./types.ts";
+
+const REMINDER_INTERVAL = 4;
+let turnsSinceTaskTouch = 0;
+
+function markTaskTouch(): void {
+  turnsSinceTaskTouch = 0;
+}
 
 function renderList(scope: TaskScope): string[] {
   const all = listAllTasks();
@@ -35,11 +38,10 @@ function updateWidget(ctx: any): void {
   if (!ctx.hasUI) return;
   const { session, project } = listAllTasks();
   const lines = [
-    `● ${session.length} todo${session.length === 1 ? "" : "s"} · ${project.length} task${project.length === 1 ? "" : "s"}`,
-    `  Session (${getCurrentSessionId()})`,
-    ...session.slice(0, 4).map((t) => `    ${t.status === "done" ? "[*]" : "[ ]"} ${t.text}`),
-    `  Project`,
-    ...project.slice(0, 4).map((t) => `    ${t.status === "done" ? "[*]" : "[ ]"} ${t.text}`),
+    `● ${session.length} todo${session.length === 1 ? "" : "s"} · session ${getCurrentSessionId()} · ${project.length} project`,
+    ...(session.length > 0
+      ? session.slice(0, 5).map((t) => `  ${t.status === "done" ? "[*]" : "[ ]"} ${t.text}`)
+      : ["  No session todos."]),
   ];
   ctx.ui.setWidget("pi-adhd-tasks", lines);
 }
@@ -108,6 +110,21 @@ function handleMove(from: TaskScope, id: string, ctx: any): void {
   updateWidget(ctx);
 }
 
+function handleReorder(scope: TaskScope, id: string, mode: "top" | "up" | "down", ctx: any): void {
+  if (!id) {
+    ctx.ui.notify(`Usage: /${scope === "session" ? "todo" : "task"} ${mode} <id>`, "warning");
+    return;
+  }
+  const ok = mode === "top"
+    ? moveTaskToTop(scope, id)
+    : mode === "up"
+      ? moveTaskUp(scope, id)
+      : moveTaskDown(scope, id);
+  if (ok) markTaskTouch();
+  ctx.ui.notify(ok ? `${id} reordered (${mode})` : `${id} not found`, ok ? "info" : "warning");
+  updateWidget(ctx);
+}
+
 function taskText(scope: TaskScope): string {
   return renderList(scope).join("\n");
 }
@@ -141,7 +158,7 @@ function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: T
 
       if (!action || action === "list") return handleList(scope, ctx);
       if (action === "help") {
-        ctx.ui.notify(`/${name} list | add <text> | done <id> | undo <id> | edit <id> <text> | remove <id> | move <id>`, "info");
+        ctx.ui.notify(`/${name} list | add <text> | done <id> | undo <id> | edit <id> <text> | remove <id> | move <id> | top <id> | up <id> | down <id>`, "info");
         return;
       }
       if (action === "add") return handleAdd(scope, [first, ...rest].join(" "), ctx);
@@ -150,6 +167,9 @@ function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: T
       if (action === "edit") return handleEdit(scope, first || "", remainder, ctx);
       if (action === "remove") return handleRemove(scope, first || "", ctx);
       if (action === "move" || action === "promote" || action === "demote") return handleMove(scope, first || "", ctx);
+      if (action === "top") return handleReorder(scope, first || "", "top", ctx);
+      if (action === "up") return handleReorder(scope, first || "", "up", ctx);
+      if (action === "down") return handleReorder(scope, first || "", "down", ctx);
 
       ctx.ui.notify(`Unknown /${name} action: ${action}`, "warning");
     },
@@ -200,14 +220,21 @@ export default function (pi: ExtensionAPI) {
       status: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("done")], { description: "Optional status change." })),
       text: Type.Optional(Type.String({ description: "Optional replacement text." })),
       moveTo: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("project")], { description: "Optionally move the task to the other list." })),
+      reorder: Type.Optional(Type.Union([Type.Literal("top"), Type.Literal("up"), Type.Literal("down")], { description: "Optionally reorder the task within its current list." })),
       remove: Type.Optional(Type.Boolean({ description: "If true, remove the task." })),
     }),
-    async execute(_id, params: { scope: TaskScope; id: string; status?: "pending" | "done"; text?: string; moveTo?: TaskScope; remove?: boolean }, _signal, _onUpdate, ctx) {
+    async execute(_id, params: { scope: TaskScope; id: string; status?: "pending" | "done"; text?: string; moveTo?: TaskScope; reorder?: "top" | "up" | "down"; remove?: boolean }, _signal, _onUpdate, ctx) {
       let ok = false;
       if (params.remove) {
         ok = removeTask(params.scope, params.id);
       } else if (params.moveTo && params.moveTo !== params.scope) {
         ok = moveTask(params.id, params.scope, params.moveTo);
+      } else if (params.reorder) {
+        ok = params.reorder === "top"
+          ? moveTaskToTop(params.scope, params.id)
+          : params.reorder === "up"
+            ? moveTaskUp(params.scope, params.id)
+            : moveTaskDown(params.scope, params.id);
       } else {
         ok = true;
         if (params.status) ok = setTaskStatus(params.scope, params.id, params.status) && ok;
