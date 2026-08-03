@@ -40,6 +40,7 @@ export default function piAuthExtension(pi: ExtensionAPI): void {
     pi.registerProvider("kilo", {
       name: "Kilo",
       baseUrl: KILO_GATEWAY_BASE_URL,
+      apiKey: "KILO_API_KEY",
       api: "openai-completions",
       models: getKiloProviderModels(),
       oauth: {
