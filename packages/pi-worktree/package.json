@@ -1,0 +1,48 @@
+{
+	"name": "@narumitw/pi-worktree",
+	"version": "0.46.0",
+	"description": "Pi extension for safe interactive Git worktree management and workspace switching.",
+	"type": "module",
+	"license": "MIT",
+	"private": false,
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"git",
+		"worktree",
+		"workspace"
+	],
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"check": "biome check --vcs-use-ignore-file=false src test package.json README.md tsconfig.json && npm run typecheck",
+		"format": "biome check --write --vcs-use-ignore-file=false src test package.json README.md tsconfig.json",
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.6",
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@types/node": "26.1.2",
+		"typescript": "7.0.2"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/narumiruna/pi-extensions",
+		"directory": "extensions/pi-worktree"
+	},
+	"dependencies": {
+		"@narumitw/pi-tui-kit": "^0.40.0"
+	}
+}
