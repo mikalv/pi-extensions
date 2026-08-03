@@ -44,6 +44,13 @@ Priority is determined by order in the file.
 6. Promote / demote between session and project
 7. Gentle reminder injection nudging the agent to keep using todos/tasks during longer work
 
+## Agent usage
+
+This package also ships a skill so Pi is more likely to:
+- capture reminders into `/todo`
+- promote durable work into `/task`
+- understand that only project tasks are shared across sessions
+
 ## Notes
 
 This is intentionally not a direct 1:1 port of `pi-tasks`.

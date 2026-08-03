@@ -60,7 +60,8 @@
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
-      "./packages/mm-wiki/skills"
+      "./packages/mm-wiki/skills",
+      "./packages/pi-adhd-tasks/skills"
     ],
     "peerDependencies": {},
     "devDependencies": {},
