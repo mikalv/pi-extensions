@@ -4,7 +4,7 @@ import {
   refreshCursorCredentials,
 } from "../../auth-providers-suite/src/providers/cursor/oauth.ts";
 import {
-  getCachedCursorModelIds,
+  readCursorModelCache,
 } from "../../auth-providers-suite/src/providers/cursor/models.ts";
 import {
   updateCursorModelCache,
@@ -32,108 +32,157 @@ import {
   GOOGLE_ANTIGRAVITY_PROD_ENDPOINT,
   getGoogleAntigravityHeaders,
 } from "../../auth-providers-suite/src/providers/google-antigravity/protocol.ts";
+
+function getCursorModels() {
+  return (readCursorModelCache()?.models ?? []).map((model) => ({
+    id: model.modelId,
+    name: model.displayName || model.modelId,
+    reasoning: false,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 16_384,
+  }));
+}
+
+function getKiloProviderModels() {
+  return getCachedKiloModels().map((m) => ({
+    id: m.id,
+    name: m.name,
+    reasoning: m.reasoning,
+    input: m.input,
+    cost: m.cost,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+  }));
+}
+
 export default function piAuthExtension(pi: ExtensionAPI): void {
-  // ── Cursor ──────────────────────────────────────────────────────────────────
-  pi.registerProvider("cursor", {
-    name: "Cursor",
-    baseUrl: "https://api2.cursor.sh",
-    api: "openai-completions",
-    models: getCachedCursorModelIds().map((id) => ({
-      id,
-      name: id,
-      reasoning: false,
-      input: ["text" as const],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128_000,
-      maxTokens: 16_384,
-    })),
-    oauth: {
+  const registerCursorProvider = () => {
+    pi.registerProvider("cursor", {
       name: "Cursor",
-      async login(callbacks) {
-        let resolvedUrl = "";
-        const creds = await loginCursor({
-          onAuth: ({ url, instructions }) => {
-            resolvedUrl = url;
-            callbacks.onAuth({ url });
-            if (instructions) callbacks.onProgress?.(instructions);
-          },
-          onProgress: (msg) => callbacks.onProgress?.(msg),
-          signal: callbacks.signal,
-        });
-        // Refresh model cache after login
-        try { await updateCursorModelCache(creds.access); } catch {}
-        return {
-          access: creds.access,
-          refresh: creds.refresh,
-          expires: creds.expires,
-        };
+      baseUrl: "https://api2.cursor.sh",
+      api: "openai-completions",
+      models: getCursorModels(),
+      oauth: {
+        name: "Cursor",
+        async login(callbacks) {
+          const creds = await loginCursor({
+            onAuth: ({ url, instructions }) => {
+              callbacks.onAuth({ url });
+              if (instructions) callbacks.onProgress?.(instructions);
+            },
+            onProgress: (msg) => callbacks.onProgress?.(msg),
+            signal: callbacks.signal,
+          });
+          try {
+            await updateCursorModelCache(creds.access);
+            registerCursorProvider();
+          } catch {}
+          return {
+            access: creds.access,
+            refresh: creds.refresh,
+            expires: creds.expires,
+          };
+        },
+        async refreshToken(credentials) {
+          const creds = await refreshCursorCredentials({
+            access: credentials.access,
+            refresh: credentials.refresh,
+          });
+          return {
+            access: creds.access,
+            refresh: creds.refresh,
+            expires: creds.expires,
+          };
+        },
+        getApiKey(credentials) {
+          return credentials.access;
+        },
       },
-      async refreshToken(credentials) {
-        const creds = await refreshCursorCredentials({
-          access: credentials.access,
-          refresh: credentials.refresh,
-        });
-        return {
-          access: creds.access,
-          refresh: creds.refresh,
-          expires: creds.expires,
-        };
+    });
+  };
+
+  const registerKiloProvider = () => {
+    pi.registerProvider("kilo", {
+      name: "Kilo",
+      baseUrl: KILO_GATEWAY_BASE_URL,
+      api: "openai-completions",
+      models: getKiloProviderModels(),
+      oauth: {
+        name: "Kilo",
+        async login(callbacks) {
+          const creds = await loginKilo({
+            onAuth: ({ url, instructions }) => {
+              callbacks.onAuth({ url });
+              if (instructions) callbacks.onProgress?.(instructions);
+            },
+            onProgress: (msg) => callbacks.onProgress?.(msg),
+            onPrompt: async ({ message }) => {
+              return (await callbacks.onPrompt?.({ message })) ?? "";
+            },
+            signal: callbacks.signal,
+          });
+          try {
+            await updateCachedKiloModelsIfStale();
+            registerKiloProvider();
+          } catch {}
+          return {
+            access: creds.access,
+            refresh: creds.refresh,
+            expires: creds.expires,
+          };
+        },
+        async refreshToken(credentials) {
+          const creds = await refreshKiloToken(credentials);
+          return {
+            access: creds.access,
+            refresh: creds.refresh,
+            expires: creds.expires,
+          };
+        },
+        getApiKey(credentials) {
+          return getKiloApiKey(credentials);
+        },
       },
-      getApiKey(credentials) {
-        return credentials.access;
-      },
-    },
+    });
+  };
+
+  registerCursorProvider();
+  registerKiloProvider();
+
+  pi.on("session_start", async (_event, ctx: any) => {
+    try {
+      const cursorToken = await ctx.modelRegistry?.getApiKeyForProvider?.("cursor");
+      if (cursorToken) {
+        await updateCursorModelCache(cursorToken);
+        registerCursorProvider();
+      }
+    } catch {}
+    try {
+      const kiloToken = await ctx.modelRegistry?.getApiKeyForProvider?.("kilo");
+      if (kiloToken) {
+        await updateCachedKiloModelsIfStale();
+        registerKiloProvider();
+      }
+    } catch {}
   });
 
-  // ── Kilo ─────────────────────────────────────────────────────────────────────
-  const kiloModels = getCachedKiloModels();
-  pi.registerProvider("kilo", {
-    name: "Kilo",
-    baseUrl: KILO_GATEWAY_BASE_URL,
-    api: "openai-completions",
-    models: kiloModels.map((m) => ({
-      id: m.id,
-      name: m.name,
-      reasoning: m.reasoning,
-      input: m.input,
-      cost: m.cost,
-      contextWindow: m.contextWindow,
-      maxTokens: m.maxTokens,
-    })),
-    oauth: {
-      name: "Kilo",
-      async login(callbacks) {
-        const creds = await loginKilo({
-          onAuth: ({ url, instructions }) => {
-            callbacks.onAuth({ url });
-            if (instructions) callbacks.onProgress?.(instructions);
-          },
-          onProgress: (msg) => callbacks.onProgress?.(msg),
-          onPrompt: async ({ message }) => {
-            return (await callbacks.onPrompt?.({ message })) ?? "";
-          },
-          signal: callbacks.signal,
-        });
-        // Refresh model cache after login
-        try { await updateCachedKiloModelsIfStale(); } catch {}
-        return {
-          access: creds.access,
-          refresh: creds.refresh,
-          expires: creds.expires,
-        };
-      },
-      async refreshToken(credentials) {
-        const creds = await refreshKiloToken(credentials);
-        return {
-          access: creds.access,
-          refresh: creds.refresh,
-          expires: creds.expires,
-        };
-      },
-      getApiKey(credentials) {
-        return getKiloApiKey(credentials);
-      },
-    },
+  pi.on("session_switch", async (_event, ctx: any) => {
+    try {
+      const cursorToken = await ctx.modelRegistry?.getApiKeyForProvider?.("cursor");
+      if (cursorToken) {
+        await updateCursorModelCache(cursorToken);
+        registerCursorProvider();
+      }
+    } catch {}
+    try {
+      const kiloToken = await ctx.modelRegistry?.getApiKeyForProvider?.("kilo");
+      if (kiloToken) {
+        await updateCachedKiloModelsIfStale();
+        registerKiloProvider();
+      }
+    } catch {}
   });
 
   // ── Google Antigravity ───────────────────────────────────────────────────────
