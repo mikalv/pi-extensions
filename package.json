@@ -7,10 +7,14 @@
     "pi-package"
   ],
   "dependencies": {
+    "@bufbuild/protobuf": "^1.10.0",
+    "@connectrpc/connect": "^1.7.0",
+    "@connectrpc/connect-node": "^1.7.0",
     "@narumitw/pi-tui-kit": "^0.42.0",
     "@toon-format/toon": "^2.3.1",
     "croner": "10.0.1",
-    "dedent": "^1.7.2"
+    "dedent": "^1.7.2",
+    "yaml": "^2.9.0"
   },
   "pi": {
     "extensions": [
@@ -53,6 +57,7 @@
       "./packages/token-rate/index.ts",
       "./packages/usage-extension/index.ts",
       "./packages/pi-auth-extension/src/index.ts",
+      "./packages/cursor-runtime/src/index.ts",
       "./packages/pi-atelier/extensions/index.ts",
       "./packages/pi-backoffice-reporter/src/index.ts",
       "./packages/pi-copy-code/src/index.ts",

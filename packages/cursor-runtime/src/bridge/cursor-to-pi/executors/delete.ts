@@ -1,0 +1,79 @@
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import type {
+  DeleteArgs,
+  DeleteResult,
+} from "../../../__generated__/agent/v1/delete_exec_pb.ts";
+import {
+  DeleteError,
+  DeleteRejected,
+  DeleteResult as DeleteResultClass,
+  DeleteSuccess,
+} from "../../../__generated__/agent/v1/delete_exec_pb.ts";
+import type { Executor } from "../../../vendor/agent-exec/index.ts";
+import { toolResultToText } from "../../shared/tool-result.ts";
+import {
+  decodeToolCallId,
+  type PiToolContext,
+} from "../local-resource-provider/types.ts";
+import { requestToolExecution, shellQuote } from "../tool-bridge.ts";
+
+function buildDeleteResultFromToolResult(
+  path: string,
+  result: ToolResultMessage,
+): DeleteResult {
+  const text = toolResultToText(result);
+  if (result.isError) {
+    return new DeleteResultClass({
+      result: {
+        case: "error",
+        value: new DeleteError({ path, error: text || "Delete failed" }),
+      },
+    });
+  }
+  return new DeleteResultClass({
+    result: {
+      case: "success",
+      value: new DeleteSuccess({
+        path,
+        deletedFile: path,
+        fileSize: BigInt(0),
+        prevContent: "",
+      }),
+    },
+  });
+}
+
+function buildDeleteRejectedResult(path: string, reason: string): DeleteResult {
+  return new DeleteResultClass({
+    result: { case: "rejected", value: new DeleteRejected({ path, reason }) },
+  });
+}
+
+export class LocalDeleteExecutor implements Executor<DeleteArgs, DeleteResult> {
+  private readonly ctx: PiToolContext;
+
+  constructor(ctx: PiToolContext) {
+    this.ctx = ctx;
+  }
+
+  async execute(_ctx: unknown, args: DeleteArgs): Promise<DeleteResult> {
+    const toolCallId = decodeToolCallId(args.toolCallId);
+
+    if (!this.ctx.getActiveTools().has("write")) {
+      return buildDeleteRejectedResult(args.path, "Tool not available");
+    }
+
+    // Delete via bash rm — pi doesn't have a delete tool
+    const piResult = await requestToolExecution(
+      this.ctx.getChannel?.() ?? null,
+      {
+        toolCallId,
+        cursorExecType: "delete",
+        piToolName: "bash",
+        piToolArgs: { command: `rm ${shellQuote(args.path)}` },
+      },
+    );
+
+    return buildDeleteResultFromToolResult(args.path, piResult);
+  }
+}

@@ -1,15 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  loginCursor,
-  refreshCursorCredentials,
-} from "../../auth-providers-suite/src/providers/cursor/oauth.ts";
-import {
-  readCursorModelCache,
-} from "../../auth-providers-suite/src/providers/cursor/models.ts";
-import {
-  updateCursorModelCache,
-} from "../../auth-providers-suite/src/providers/cursor/catalog.ts";
-import {
   loginKilo,
   refreshKiloToken,
   getKiloApiKey,
@@ -33,18 +23,6 @@ import {
   getGoogleAntigravityHeaders,
 } from "../../auth-providers-suite/src/providers/google-antigravity/protocol.ts";
 
-function getCursorModels() {
-  return (readCursorModelCache()?.models ?? []).map((model) => ({
-    id: model.modelId,
-    name: model.displayName || model.modelId,
-    reasoning: false,
-    input: ["text" as const],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128_000,
-    maxTokens: 16_384,
-  }));
-}
-
 function getKiloProviderModels() {
   return getCachedKiloModels().map((m) => ({
     id: m.id,
@@ -58,51 +36,6 @@ function getKiloProviderModels() {
 }
 
 export default function piAuthExtension(pi: ExtensionAPI): void {
-  const registerCursorProvider = () => {
-    pi.registerProvider("cursor", {
-      name: "Cursor",
-      baseUrl: "https://api2.cursor.sh",
-      api: "openai-completions",
-      models: getCursorModels(),
-      oauth: {
-        name: "Cursor",
-        async login(callbacks) {
-          const creds = await loginCursor({
-            onAuth: ({ url, instructions }) => {
-              callbacks.onAuth({ url });
-              if (instructions) callbacks.onProgress?.(instructions);
-            },
-            onProgress: (msg) => callbacks.onProgress?.(msg),
-            signal: callbacks.signal,
-          });
-          try {
-            await updateCursorModelCache(creds.access);
-            registerCursorProvider();
-          } catch {}
-          return {
-            access: creds.access,
-            refresh: creds.refresh,
-            expires: creds.expires,
-          };
-        },
-        async refreshToken(credentials) {
-          const creds = await refreshCursorCredentials({
-            access: credentials.access,
-            refresh: credentials.refresh,
-          });
-          return {
-            access: creds.access,
-            refresh: creds.refresh,
-            expires: creds.expires,
-          };
-        },
-        getApiKey(credentials) {
-          return credentials.access;
-        },
-      },
-    });
-  };
-
   const registerKiloProvider = () => {
     pi.registerProvider("kilo", {
       name: "Kilo",
@@ -148,17 +81,9 @@ export default function piAuthExtension(pi: ExtensionAPI): void {
     });
   };
 
-  registerCursorProvider();
   registerKiloProvider();
 
   pi.on("session_start", async (_event, ctx: any) => {
-    try {
-      const cursorToken = await ctx.modelRegistry?.getApiKeyForProvider?.("cursor");
-      if (cursorToken) {
-        await updateCursorModelCache(cursorToken);
-        registerCursorProvider();
-      }
-    } catch {}
     try {
       const kiloToken = await ctx.modelRegistry?.getApiKeyForProvider?.("kilo");
       if (kiloToken) {
@@ -169,13 +94,6 @@ export default function piAuthExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_switch", async (_event, ctx: any) => {
-    try {
-      const cursorToken = await ctx.modelRegistry?.getApiKeyForProvider?.("cursor");
-      if (cursorToken) {
-        await updateCursorModelCache(cursorToken);
-        registerCursorProvider();
-      }
-    } catch {}
     try {
       const kiloToken = await ctx.modelRegistry?.getApiKeyForProvider?.("kilo");
       if (kiloToken) {
