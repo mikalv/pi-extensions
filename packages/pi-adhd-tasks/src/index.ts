@@ -1,8 +1,11 @@
+import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
 import {
   appendTask,
   getCurrentSessionId,
+  getCurrentTask,
+  getNextTask,
   listAllTasks,
   moveTask,
   moveTaskDown,
@@ -16,18 +19,52 @@ import {
 } from "./store.ts";
 import type { TaskScope } from "./types.ts";
 
-const REMINDER_INTERVAL = 4;
+const SESSION_REMINDER_INTERVAL = 1;
+const PROJECT_REMINDER_INTERVAL = 6;
 let turnsSinceTaskTouch = 0;
+let remindAfterTaskTouch = false;
+let lastSessionTaskSnapshot = "";
+let lastProjectTaskSnapshot = "";
 
 function markTaskTouch(): void {
   turnsSinceTaskTouch = 0;
+  remindAfterTaskTouch = true;
+  captureTaskSnapshots();
+}
+
+function readSnapshot(scope: TaskScope): string {
+  const path = pathForScope(scope);
+  if (!existsSync(path)) return "";
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function captureTaskSnapshots(): void {
+  lastSessionTaskSnapshot = readSnapshot("session");
+  lastProjectTaskSnapshot = readSnapshot("project");
+}
+
+function detectExternalTaskChange(): boolean {
+  const sessionSnapshot = readSnapshot("session");
+  const projectSnapshot = readSnapshot("project");
+  const changed = sessionSnapshot !== lastSessionTaskSnapshot || projectSnapshot !== lastProjectTaskSnapshot;
+  lastSessionTaskSnapshot = sessionSnapshot;
+  lastProjectTaskSnapshot = projectSnapshot;
+  if (changed) {
+    turnsSinceTaskTouch = 0;
+    remindAfterTaskTouch = true;
+  }
+  return changed;
 }
 
 function renderList(scope: TaskScope): string[] {
   const all = listAllTasks();
   const tasks = scope === "session" ? all.session : all.project;
   if (tasks.length === 0) return [scope === "session" ? "No session todos." : "No project tasks."];
-  return tasks.map((task) => `${task.status === "done" ? "[*]" : "[ ]"} ${task.id} ${task.text}`);
+  return tasks.map((task) => `${task.status === "done" ? "[*]" : task.status === "in_progress" ? "[~]" : "[ ]"} ${task.id} ${task.text}`);
 }
 
 function parseCommandArgs(args: string | undefined): string[] {
@@ -37,10 +74,15 @@ function parseCommandArgs(args: string | undefined): string[] {
 function updateWidget(ctx: any): void {
   if (!ctx.hasUI) return;
   const { session, project } = listAllTasks();
+  const current = getCurrentTask("session");
+  const next = getNextTask("session");
+  const backlog = session.filter((task) => task.status === "pending" && task.id !== next?.id).length;
   const lines = [
     `● ${session.length} todo${session.length === 1 ? "" : "s"} · session ${getCurrentSessionId()} · ${project.length} project`,
+    current ? `  Now: ${current.text}` : "  Now: none",
+    next && next.id !== current?.id ? `  Next: ${next.text}` : backlog > 0 ? `  Next: ${backlog} more pending` : "  Next: none",
     ...(session.length > 0
-      ? session.slice(0, 5).map((t) => `  ${t.status === "done" ? "[*]" : "[ ]"} ${t.text}`)
+      ? session.slice(0, 3).map((t) => `  ${t.status === "done" ? "[*]" : t.status === "in_progress" ? "[~]" : "[ ]"} ${t.text}`)
       : ["  No session todos."]),
   ];
   ctx.ui.setWidget("pi-adhd-tasks", lines);
@@ -65,12 +107,13 @@ function handleAdd(scope: TaskScope, text: string, ctx: any): void {
   updateWidget(ctx);
 }
 
-function handleDone(scope: TaskScope, id: string, done: boolean, ctx: any): void {
+function handleDone(scope: TaskScope, id: string, done: boolean, ctx: any, explicitStatus?: "pending" | "in_progress"): void {
   if (!id) {
-    ctx.ui.notify(`Usage: /${scope === "session" ? "todo" : "task"} ${done ? "done" : "undo"} <id>`, "warning");
+    ctx.ui.notify(`Usage: /${scope === "session" ? "todo" : "task"} ${done ? "done" : explicitStatus === "in_progress" ? "start" : "undo"} <id>`, "warning");
     return;
   }
-  const ok = setTaskStatus(scope, id, done ? "done" : "pending");
+  const status = done ? "done" : explicitStatus || "pending";
+  const ok = setTaskStatus(scope, id, status);
   if (ok) markTaskTouch();
   ctx.ui.notify(ok ? `${id} updated` : `${id} not found`, ok ? "info" : "warning");
   updateWidget(ctx);
@@ -129,23 +172,31 @@ function taskText(scope: TaskScope): string {
   return renderList(scope).join("\n");
 }
 
-function buildTaskReminder(): string | undefined {
+function buildTaskReminder(options?: { includeProject?: boolean; emphasizeFreshChange?: boolean }): string | undefined {
   const { session, project } = listAllTasks();
-  const pendingSession = session.filter((task) => task.status === "pending");
-  const pendingProject = project.filter((task) => task.status === "pending");
-  if (pendingSession.length === 0 && pendingProject.length === 0) return undefined;
+  const currentSession = getCurrentTask("session");
+  const nextSession = getNextTask("session");
+  const pendingProject = project.filter((task) => task.status !== "done");
+  if (!currentSession && pendingProject.length === 0) return undefined;
   return [
     "<system-reminder>",
-    "Remember to actively use /todo, /task, or the ADHD task tools to keep your working set explicit.",
-    pendingSession.length > 0
-      ? `Session todos: ${pendingSession.slice(0, 5).map((task) => task.text).join(" | ")}`
-      : "Session todos: none",
-    pendingProject.length > 0
-      ? `Project tasks: ${pendingProject.slice(0, 5).map((task) => task.text).join(" | ")}`
-      : "Project tasks: none",
-    "If current work is drifting, capture the next concrete step as a todo or task before continuing.",
+    options?.emphasizeFreshChange
+      ? "The todo/task list was just updated. Re-anchor on it before continuing."
+      : "Use the todo/task list as your active working set, not just as a note.",
+    currentSession
+      ? `Current session todo: ${currentSession.text}`
+      : "Current session todo: none",
+    nextSession && nextSession.id !== currentSession?.id
+      ? `Next session todo: ${nextSession.text}`
+      : "Next session todo: none",
+    options?.includeProject && pendingProject.length > 0
+      ? `Project tasks: ${pendingProject.slice(0, 3).map((task) => task.text).join(" | ")}`
+      : undefined,
+    currentSession
+      ? "Before starting unrelated work, either finish, update, or reprioritize the current session todo."
+      : "If a new concrete step appears, capture it in /todo or /task immediately.",
     "</system-reminder>",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: TaskScope): void {
@@ -163,6 +214,7 @@ function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: T
         return;
       }
       if (action === "add") return handleAdd(scope, [first, ...rest].join(" "), ctx);
+      if (action === "start") return handleDone(scope, first || "", false, ctx, "in_progress");
       if (action === "done") return handleDone(scope, first || "", true, ctx);
       if (action === "undo") return handleDone(scope, first || "", false, ctx);
       if (action === "edit") return handleEdit(scope, first || "", remainder, ctx);
@@ -219,13 +271,13 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       scope: Type.Union([Type.Literal("session"), Type.Literal("project")], { description: "Current list containing the task." }),
       id: Type.String({ description: "Task id such as session-1 or project-2." }),
-      status: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("done")], { description: "Optional status change." })),
+      status: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("in_progress"), Type.Literal("done")], { description: "Optional status change." })),
       text: Type.Optional(Type.String({ description: "Optional replacement text." })),
       moveTo: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("project")], { description: "Optionally move the task to the other list." })),
       reorder: Type.Optional(Type.Union([Type.Literal("top"), Type.Literal("up"), Type.Literal("down")], { description: "Optionally reorder the task within its current list." })),
       remove: Type.Optional(Type.Boolean({ description: "If true, remove the task." })),
     }),
-    async execute(_id, params: { scope: TaskScope; id: string; status?: "pending" | "done"; text?: string; moveTo?: TaskScope; reorder?: "top" | "up" | "down"; remove?: boolean }, _signal, _onUpdate, ctx) {
+    async execute(_id, params: { scope: TaskScope; id: string; status?: "pending" | "in_progress" | "done"; text?: string; moveTo?: TaskScope; reorder?: "top" | "up" | "down"; remove?: boolean }, _signal, _onUpdate, ctx) {
       let ok = false;
       if (params.remove) {
         ok = removeTask(params.scope, params.id);
@@ -252,23 +304,41 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (event: any, ctx) => {
     setCurrentSessionId(event?.sessionId || process.env.PI_SESSION_ID || process.env.PI_SESSION || undefined);
     turnsSinceTaskTouch = 0;
+    remindAfterTaskTouch = false;
+    captureTaskSnapshots();
     updateWidget(ctx);
   });
 
   pi.on("user_message", (_event, ctx) => {
+    detectExternalTaskChange();
     updateWidget(ctx);
   });
 
   pi.on("assistant_message", (_event, ctx) => {
+    detectExternalTaskChange();
     updateWidget(ctx);
   });
 
   pi.on("context", (event: any) => {
+    detectExternalTaskChange();
     turnsSinceTaskTouch += 1;
-    if (turnsSinceTaskTouch < REMINDER_INTERVAL) return;
-    const reminder = buildTaskReminder();
+    const { session, project } = listAllTasks();
+    const hasSession = session.some((task) => task.status !== "done");
+    const hasProject = project.some((task) => task.status !== "done");
+
+    let reminder: string | undefined;
+    if (remindAfterTaskTouch) {
+      reminder = buildTaskReminder({ includeProject: hasProject, emphasizeFreshChange: true });
+      remindAfterTaskTouch = false;
+    } else if (hasSession && turnsSinceTaskTouch >= SESSION_REMINDER_INTERVAL) {
+      reminder = buildTaskReminder({ includeProject: false, emphasizeFreshChange: false });
+      turnsSinceTaskTouch = 0;
+    } else if (!hasSession && hasProject && turnsSinceTaskTouch >= PROJECT_REMINDER_INTERVAL) {
+      reminder = buildTaskReminder({ includeProject: true, emphasizeFreshChange: false });
+      turnsSinceTaskTouch = 0;
+    }
+
     if (!reminder) return;
-    turnsSinceTaskTouch = 0;
     const messages = Array.isArray(event?.messages) ? event.messages : [];
     return {
       messages: [

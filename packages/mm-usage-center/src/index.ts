@@ -95,7 +95,8 @@ function renderLiveRows(rows: LiveUsageState[]): string[] {
   return rows.map((row) => {
     if (row.status === "ready" && row.snapshot) {
       const summary = row.snapshot.windows.slice(0, 2).map(formatWindow).join(" · ");
-      return `  ${row.providerName}: ${summary || "live data available"}`;
+      const metricSummary = row.snapshot.metrics.slice(0, 2).map((metric) => `${metric.label} ${metric.value}`).join(" · ");
+      return `  ${row.providerName}: ${summary || metricSummary || row.snapshot.source}`;
     }
     if (row.status === "unavailable") return `  ${row.providerName}: auth unavailable`;
     return `  ${row.providerName}: ${row.message || "error"}`;

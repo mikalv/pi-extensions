@@ -1,4 +1,4 @@
-export type MarkdownTaskStatus = "pending" | "done";
+export type MarkdownTaskStatus = "pending" | "in_progress" | "done";
 export type TaskScope = "session" | "project";
 
 export interface MarkdownTask {

@@ -110,6 +110,18 @@ function makeBorder(theme: Theme, width: number): string {
   return theme.fg("border", "─".repeat(Math.max(0, width)));
 }
 
+function panelFill(theme: Theme, text: string, width: number): string {
+  return theme.bg("customMessageBg", padLine(text, width));
+}
+
+function panelBorder(theme: Theme, width: number, left: string, right: string): string {
+  return theme.fg("border", left) + theme.bg("customMessageBg", "─".repeat(Math.max(0, width))) + theme.fg("border", right);
+}
+
+function panelRow(theme: Theme, text: string, width: number): string {
+  return theme.fg("border", "│") + panelFill(theme, text, width) + theme.fg("border", "│");
+}
+
 function cycle<T>(items: T[], current: T, delta: 1 | -1): T {
   const index = items.indexOf(current);
   if (index === -1) return items[0]!;
@@ -300,7 +312,8 @@ class UsageDashboardComponent {
     for (const row of this.snapshot.live) {
       if (row.status === "ready" && row.snapshot) {
         const summary = row.snapshot.windows.slice(0, 2).map(formatWindow).join(" · ");
-        lines.push(`• ${row.providerName}: ${summary || "live data available"}`);
+        const metricSummary = row.snapshot.metrics.slice(0, 2).map((metric) => `${metric.label} ${metric.value}`).join(" · ");
+        lines.push(`• ${row.providerName}: ${summary || metricSummary || row.snapshot.source}`);
       } else if (row.status === "unavailable") {
         lines.push(`• ${row.providerName}: auth unavailable`);
       } else {
@@ -429,23 +442,26 @@ class UsageDashboardComponent {
   render(width: number): string[] {
     if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 
-    const bodyWidth = Math.max(20, width);
-    const lines = this.renderHeader(bodyWidth);
+    const panelWidth = Math.max(20, width - 2);
+    const lines = [panelBorder(this.theme, panelWidth, "╭", "╮")];
+    const header = this.renderHeader(panelWidth);
     const body = this.view === "overview"
-      ? this.renderOverview(bodyWidth)
+      ? this.renderOverview(panelWidth)
       : this.view === "live"
-        ? this.renderLive(bodyWidth)
+        ? this.renderLive(panelWidth)
         : this.view === "providers"
-          ? this.renderProviders(bodyWidth)
+          ? this.renderProviders(panelWidth)
           : this.view === "tools"
-            ? this.renderTools(bodyWidth)
+            ? this.renderTools(panelWidth)
             : this.view === "graph"
-              ? this.renderGraph(bodyWidth)
-              : this.renderInsights(bodyWidth);
+              ? this.renderGraph(panelWidth)
+              : this.renderInsights(panelWidth);
 
-    lines.push(...body);
-    lines.push(makeBorder(this.theme, bodyWidth));
-    lines.push(padLine(this.theme.fg(this.loading ? "warning" : "dim", this.message), bodyWidth));
+    lines.push(...header.map((line) => panelRow(this.theme, line, panelWidth)));
+    lines.push(...body.map((line) => panelRow(this.theme, line, panelWidth)));
+    lines.push(panelBorder(this.theme, panelWidth, "├", "┤"));
+    lines.push(panelRow(this.theme, this.theme.fg(this.loading ? "warning" : "dim", this.message), panelWidth));
+    lines.push(panelBorder(this.theme, panelWidth, "╰", "╯"));
 
     this.cachedWidth = width;
     this.cachedLines = lines.map((line) => truncateToWidth(line, width));

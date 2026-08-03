@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export type SupportedLiveProvider = "openai-codex" | "anthropic" | "github-copilot" | "openrouter" | "cursor" | "kilo" | "google-antigravity" | "zai";
@@ -10,6 +13,8 @@ type RequestAuth = {
   headers?: Record<string, string>;
   accountId?: string;
 };
+
+let cachedPiAuthFile: Record<string, unknown> | null | undefined;
 
 export interface LiveUsageWindow {
   key: string;
@@ -45,7 +50,7 @@ const PROVIDERS: Array<{ id: SupportedLiveProvider; name: string; endpoint: stri
   { id: "openrouter", name: "OpenRouter", endpoint: "https://openrouter.ai/api/v1/key" },
   { id: "cursor", name: "Cursor", endpoint: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage", method: "POST", body: {} },
   { id: "kilo", name: "Kilo", endpoint: "https://api.kilo.ai/api/profile/balance" },
-  { id: "google-antigravity", name: "Google Antigravity", endpoint: "https://api.cloudcode-pa.googleapis.com/v1internal:describeSubscription" },
+  { id: "google-antigravity", name: "Google Antigravity", endpoint: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", method: "POST", body: { metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" } } },
   { id: "zai", name: "Z.ai", endpoint: "https://api.z.ai/api/monitor/usage/quota/limit" },
 ];
 
@@ -138,6 +143,41 @@ function copyAllowedHeaders(source: Record<string, string> | undefined): Record<
   return out;
 }
 
+function readPiAuthFile(): Record<string, unknown> | null {
+  if (cachedPiAuthFile !== undefined) return cachedPiAuthFile;
+  try {
+    const path = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "auth.json");
+    if (!existsSync(path)) {
+      cachedPiAuthFile = null;
+      return cachedPiAuthFile;
+    }
+    cachedPiAuthFile = asRecord(JSON.parse(readFileSync(path, "utf8")));
+    return cachedPiAuthFile;
+  } catch {
+    cachedPiAuthFile = null;
+    return cachedPiAuthFile;
+  }
+}
+
+function providerAuthKey(providerId: SupportedLiveProvider): string {
+  return providerId;
+}
+
+function authFromPiAuthFile(providerId: SupportedLiveProvider): RequestAuth | undefined {
+  const authFile = readPiAuthFile();
+  const entry = asRecord(authFile?.[providerAuthKey(providerId)]);
+  const access = asString(entry.access);
+  const refresh = asString(entry.refresh);
+  const key = asString(entry.key);
+  const token = providerId === "github-copilot" ? refresh || access || key : access || key;
+  if (!token) return undefined;
+  return {
+    apiKey: token,
+    accountId: asString(entry.accountId),
+    headers: {},
+  };
+}
+
 function candidateModels(ctx: ExtensionContext, providerId: SupportedLiveProvider): PiModelLike[] {
   const models: PiModelLike[] = [];
   const seen = new Set<string>();
@@ -175,10 +215,16 @@ async function resolveProviderAuth(ctx: ExtensionContext, providerId: SupportedL
     }
   }
 
-  if (typeof registry?.getProviderAuth !== "function") return undefined;
-  const providerResult = await registry.getProviderAuth(providerId);
-  const auth = providerResult?.auth as RequestAuth | undefined;
-  if (!auth || !authHasOfficialOrigin(auth, providerId)) return undefined;
+  let auth: RequestAuth | undefined;
+  if (typeof registry?.getProviderAuth === "function") {
+    const providerResult = await registry.getProviderAuth(providerId);
+    const candidate = providerResult?.auth as RequestAuth | undefined;
+    if (candidate && authHasOfficialOrigin(candidate, providerId)) {
+      auth = candidate;
+    }
+  }
+  if (!auth) auth = authFromPiAuthFile(providerId);
+  if (!auth) return undefined;
   const authorization = authorizationFrom(auth);
   if (!authorization) return undefined;
   const headers = { ...copyAllowedHeaders(auth.headers), Authorization: authorization, Accept: "application/json" };
@@ -313,21 +359,31 @@ function parseOpenRouter(payload: Record<string, unknown>): LiveUsageSnapshot {
 
 function parseCursor(payload: Record<string, unknown>): LiveUsageSnapshot {
   const root = asRecord(payload.currentPeriodUsage ?? payload.usage ?? payload.data ?? payload);
+  const planUsage = asRecord(root.planUsage);
   const windows: LiveUsageWindow[] = [];
   const metrics: Array<{ label: string; value: string }> = [];
 
-  const remaining = asNumber(root.remainingFastRequests ?? root.fastRequestsRemaining ?? root.remainingIncludedRequests);
-  const limit = asNumber(root.totalFastRequests ?? root.fastRequestsLimit ?? root.includedRequests);
-  const used = asNumber(root.usedFastRequests ?? root.fastRequestsUsed ?? root.usedIncludedRequests);
-  const resetsAt = asEpochMs(root.resetsAt ?? root.resetAt ?? root.currentPeriodEnd);
-  if (remaining !== undefined || limit !== undefined) {
-    windows.push({ key: "monthly", label: "Fast requests", remaining, limit, unit: "count", resetsAt });
-    if (used !== undefined) metrics.push({ label: "Used", value: String(used) });
+  const resetsAt = asEpochMs(root.billingCycleEnd ?? root.currentPeriodEnd ?? root.resetsAt ?? root.resetAt);
+  const totalPercent = asNumber(planUsage.totalPercentUsed ?? root.totalPercentUsed);
+  if (totalPercent !== undefined) {
+    windows.push({ key: "monthly", label: "Included usage", usedPercent: totalPercent, unit: "percent", resetsAt });
   }
 
-  const spendUsed = asNumber(root.spendUsed ?? root.usageSpend ?? root.totalSpend);
-  const spendLimit = asNumber(root.includedSpend ?? root.spendLimit);
-  if (spendUsed !== undefined || spendLimit !== undefined) {
+  const apiPercent = asNumber(planUsage.apiPercentUsed ?? root.apiPercentUsed);
+  if (apiPercent !== undefined) {
+    windows.push({ key: "api", label: "API usage", usedPercent: apiPercent, unit: "percent", resetsAt });
+  }
+
+  const autoPercent = asNumber(planUsage.autoPercentUsed ?? root.autoPercentUsed);
+  if (autoPercent !== undefined) {
+    windows.push({ key: "auto", label: "Auto usage", usedPercent: autoPercent, unit: "percent", resetsAt });
+  }
+
+  const spendUsedCents = asNumber(planUsage.totalSpend ?? root.totalSpend);
+  const spendLimitCents = asNumber(planUsage.includedSpend ?? planUsage.limit ?? root.includedSpend ?? root.spendLimit);
+  if (spendUsedCents !== undefined || spendLimitCents !== undefined) {
+    const spendUsed = spendUsedCents !== undefined ? spendUsedCents / 100 : undefined;
+    const spendLimit = spendLimitCents !== undefined ? spendLimitCents / 100 : undefined;
     windows.push({ key: "spend", label: "Spend", remaining: spendLimit !== undefined && spendUsed !== undefined ? Math.max(0, spendLimit - spendUsed) : undefined, limit: spendLimit, unit: "usd", resetsAt });
     if (spendUsed !== undefined) metrics.push({ label: "Spend used", value: `$${spendUsed.toFixed(2)}` });
   }
@@ -337,42 +393,45 @@ function parseCursor(payload: Record<string, unknown>): LiveUsageSnapshot {
 }
 
 function parseKilo(payload: Record<string, unknown>): LiveUsageSnapshot {
-  const root = asRecord(payload.data ?? payload.balance ?? payload);
+  const root = asRecord(payload.data ?? payload);
   const balance = asNumber(root.balance ?? root.remainingCredits ?? root.credits ?? root.available);
   const used = asNumber(root.used ?? root.spent ?? root.totalUsage);
   const total = asNumber(root.totalCredits ?? root.total);
-  if (balance === undefined && used === undefined && total === undefined) throw new Error("No Kilo balance data found");
+  const depleted = root.isDepleted === true;
+  if (balance === undefined && used === undefined && total === undefined && !depleted) throw new Error("No Kilo balance data found");
   return {
     providerId: "kilo",
     providerName: "Kilo",
     source: "Kilo profile balance API",
     fetchedAt: Date.now(),
     windows: [{ key: "credits", label: "Credits", remaining: balance, limit: total, unit: "usd" }],
-    metrics: used !== undefined ? [{ label: "Used", value: `$${used.toFixed(2)}` }] : [],
+    metrics: [
+      ...(used !== undefined ? [{ label: "Used", value: `$${used.toFixed(2)}` }] : []),
+      { label: "Depleted", value: depleted ? "Yes" : "No" },
+    ],
   };
 }
 
 function parseZai(payload: Record<string, unknown>): LiveUsageSnapshot {
   const root = asRecord(payload.data ?? payload.result ?? payload);
   const windows: LiveUsageWindow[] = [];
+  const metrics: Array<{ label: string; value: string }> = [];
 
-  const candidates = [
-    ["5h", asRecord(root.fiveHour ?? root.five_hour ?? root.window5h ?? root.rolling5h)],
-    ["7d", asRecord(root.sevenDay ?? root.seven_day ?? root.weekly ?? root.window7d)],
-  ] as const;
+  const items = Array.isArray(root.limits) ? root.limits : Array.isArray(root.windows) ? root.windows : [];
+  items.forEach((entry, index) => {
+    const item = asRecord(entry);
+    const type = asString(item.type) ?? `window-${index + 1}`;
+    const unit = asNumber(item.unit);
+    const number = asNumber(item.number);
+    const label = unit === 5 && number === 1 ? "1 day" : unit === 3 && number === 5 ? "5 hours" : type;
+    const usedPercent = asNumber(item.percentage ?? item.used_percent ?? item.usedPercent);
+    const remaining = asNumber(item.remaining);
+    const limit = asNumber(item.usage);
+    windows.push({ key: type.toLowerCase(), label, usedPercent, remaining, limit, unit: typeof remaining === "number" || typeof limit === "number" ? "count" : "percent", resetsAt: asEpochMs(item.nextResetTime ?? item.resetAt) });
+  });
 
-  for (const [label, source] of candidates) {
-    pushPercentWindow(windows, label, label, source);
-  }
-
-  if (windows.length === 0) {
-    const items = Array.isArray(root.limits) ? root.limits : Array.isArray(root.windows) ? root.windows : [];
-    items.forEach((entry, index) => {
-      const item = asRecord(entry);
-      const name = asString(item.label ?? item.name ?? item.type) ?? `window-${index + 1}`;
-      pushPercentWindow(windows, name, name, item);
-    });
-  }
+  const level = asString(root.level);
+  if (level) metrics.push({ label: "Level", value: level });
 
   if (windows.length === 0) throw new Error("No Z.ai quota windows found");
   return {
@@ -381,26 +440,23 @@ function parseZai(payload: Record<string, unknown>): LiveUsageSnapshot {
     source: "Z.ai quota API",
     fetchedAt: Date.now(),
     windows,
-    metrics: [],
+    metrics,
   };
 }
 
 function parseGoogleAntigravity(payload: Record<string, unknown>): LiveUsageSnapshot {
-  const root = asRecord(payload.data ?? payload.subscription ?? payload);
-  const windows: LiveUsageWindow[] = [];
-  const candidates = [
-    ["5h", asRecord(root.fiveHour ?? root.five_hour ?? root.shortWindow ?? root.primaryWindow)],
-    ["7d", asRecord(root.sevenDay ?? root.seven_day ?? root.weeklyWindow ?? root.secondaryWindow)],
-  ] as const;
-  for (const [label, source] of candidates) pushPercentWindow(windows, label, label, source);
-  if (windows.length === 0) throw new Error("No Google Antigravity quota windows found");
+  const root = asRecord(payload);
+  const currentTier = asRecord(root.currentTier);
+  const allowedTiers = Array.isArray(root.allowedTiers) ? root.allowedTiers : [];
+  const tier = Object.keys(currentTier).length > 0 ? currentTier : asRecord(allowedTiers[0]);
+  const tierName = asString(tier.name) ?? asString(tier.id) ?? "Unknown";
   return {
     providerId: "google-antigravity",
     providerName: "Google Antigravity",
-    source: "Google Antigravity subscription API",
+    source: "Google Antigravity loadCodeAssist API",
     fetchedAt: Date.now(),
-    windows,
-    metrics: [],
+    windows: [],
+    metrics: [{ label: "Tier", value: tierName }],
   };
 }
 
@@ -478,7 +534,9 @@ async function queryProvider(ctx: ExtensionContext, providerId: SupportedLivePro
       headers["x-request-id"] = headers["x-request-id"] || crypto.randomUUID();
     }
     if (providerId === "google-antigravity") {
-      headers["User-Agent"] = headers["User-Agent"] || "antigravity/1.104.0 darwin/arm64";
+      headers["User-Agent"] = headers["User-Agent"] || "google-api-nodejs-client/9.15.1";
+      headers["X-Goog-Api-Client"] = headers["X-Goog-Api-Client"] || "google-cloud-sdk vscode_cloudshelleditor/0.1";
+      headers["Client-Metadata"] = headers["Client-Metadata"] || JSON.stringify({ ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" });
     }
 
     const payload = await fetchJson(provider.endpoint, headers, DEFAULT_TIMEOUT_MS, provider.method ?? "GET", provider.body);

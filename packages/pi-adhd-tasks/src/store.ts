@@ -45,11 +45,15 @@ export function writeTaskFile(scope: TaskScope, content: string): void {
 }
 
 function parseStatus(marker: string): MarkdownTaskStatus {
-  return marker === "[*]" ? "done" : "pending";
+  if (marker === "[*]") return "done";
+  if (marker === "[~]") return "in_progress";
+  return "pending";
 }
 
 function markerForStatus(status: MarkdownTaskStatus): string {
-  return status === "done" ? "[*]" : "[ ]";
+  if (status === "done") return "[*]";
+  if (status === "in_progress") return "[~]";
+  return "[ ]";
 }
 
 function generateTaskId(scope: TaskScope): string {
@@ -57,7 +61,7 @@ function generateTaskId(scope: TaskScope): string {
 }
 
 function parseTaskLine(line: string, scope: TaskScope, fallbackIndex: number): MarkdownTask | undefined {
-  const match = line.match(/^\s*-\s*(\[ \]|\[\*\])\s+(.*?)(?:\s+<!--\s*pi-task:([^\s]+)\s*-->)?\s*$/);
+  const match = line.match(/^\s*-\s*(\[ \]|\[\*\]|\[~\])\s+(.*?)(?:\s+<!--\s*pi-task:([^\s]+)\s*-->)?\s*$/);
   if (!match) return undefined;
   const id = match[3] || `${scope}-${fallbackIndex}`;
   return {
@@ -114,10 +118,11 @@ export function parseTasks(scope: TaskScope): MarkdownTask[] {
 
 export function appendTask(scope: TaskScope, text: string): MarkdownTask {
   const content = readTaskFile(scope).replace(/\s*$/, "");
+  const existing = parseTasks(scope);
   const task: MarkdownTask = {
     id: generateTaskId(scope),
     text,
-    status: "pending",
+    status: scope === "session" && !existing.some((entry) => entry.status === "in_progress") ? "in_progress" : "pending",
     scope,
     line: 0,
   };
@@ -133,9 +138,23 @@ export function setTaskStatus(scope: TaskScope, id: string, status: MarkdownTask
   const tasks = parseTasks(scope);
   const task = tasks.find((entry) => entry.id === id);
   if (!task) return false;
+  if (scope === "session" && status === "in_progress") {
+    for (const other of tasks) {
+      if (other.id !== id && other.status === "in_progress") {
+        lines[other.line - 1] = formatTaskLine({ ...other, status: "pending" });
+      }
+    }
+  }
   const idx = task.line - 1;
   lines[idx] = formatTaskLine({ ...task, status });
   writeTaskFile(scope, `${lines.join("\n")}\n`);
+  if (scope === "session" && status === "done") {
+    const updated = parseTasks(scope);
+    if (!updated.some((entry) => entry.status === "in_progress")) {
+      const nextPending = updated.find((entry) => entry.status === "pending");
+      if (nextPending) setTaskStatus(scope, nextPending.id, "in_progress");
+    }
+  }
   return true;
 }
 
@@ -206,6 +225,19 @@ export function moveTaskUp(scope: TaskScope, id: string): boolean {
 
 export function moveTaskDown(scope: TaskScope, id: string): boolean {
   return reorderWithinScope(scope, id, (currentIndex, total) => Math.min(total - 1, currentIndex + 1));
+}
+
+export function getCurrentTask(scope: TaskScope): MarkdownTask | undefined {
+  const tasks = parseTasks(scope);
+  return tasks.find((task) => task.status === "in_progress") ?? tasks.find((task) => task.status === "pending");
+}
+
+export function getNextTask(scope: TaskScope): MarkdownTask | undefined {
+  const tasks = parseTasks(scope);
+  const current = tasks.find((task) => task.status === "in_progress");
+  if (!current) return tasks.find((task) => task.status === "pending");
+  const currentIndex = tasks.findIndex((task) => task.id === current.id);
+  return tasks.slice(currentIndex + 1).find((task) => task.status === "pending") ?? tasks.find((task) => task.status === "pending");
 }
 
 export function listAllTasks(): { session: MarkdownTask[]; project: MarkdownTask[] } {
