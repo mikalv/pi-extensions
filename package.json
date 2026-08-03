@@ -52,8 +52,11 @@
       "./packages/todos/index.ts",
       "./packages/token-rate/index.ts",
       "./packages/usage-extension/index.ts",
+      "./packages/pi-auth-extension/src/index.ts",
       "./packages/pi-atelier/extensions/index.ts",
-      "./packages/pi-backoffice-reporter/src/index.ts"
+      "./packages/pi-backoffice-reporter/src/index.ts",
+      "./packages/pi-copy-code/src/index.ts",
+      "./packages/pi-adhd-tasks/src/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
@@ -62,8 +65,7 @@
     "peerDependencies": {},
     "devDependencies": {},
     "themes": [
-      "./packages/dracula-themes/themes",
-      "./packages/nightfox-themes/themes"
+      "./themes"
     ]
   }
 }

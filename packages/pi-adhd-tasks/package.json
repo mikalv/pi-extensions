@@ -1,0 +1,15 @@
+{
+  "name": "pi-adhd-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Markdown-first shared task system for Pi with /todo and /task flows.",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
