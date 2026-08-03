@@ -28,6 +28,8 @@ export class Runtime {
 	consolidationPhase: ConsolidationPhase | undefined;
 	compactInFlight = false;
 	compactHookInFlight = false;
+	compactDeferredTimer: ReturnType<typeof setTimeout> | null = null;
+	compactDeferredNotified = false;
 	resolveFailureNotified = false;
 	lastObserverError: string | undefined;
 	lastReflectorError: string | undefined;

@@ -4,10 +4,15 @@ import {
   GOOGLE_ANTIGRAVITY_PROD_ENDPOINT,
   GOOGLE_ANTIGRAVITY_SANDBOX_ENDPOINT,
 } from "./protocol.ts";
+import {
+  ANTIGRAVITY_CLIENT_ID,
+  ANTIGRAVITY_CLIENT_SECRET,
+} from "./vendor/credentials.ts";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+const DEFAULT_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 
 export interface GoogleAntigravityOAuthConfig {
   callbackPort: number;
@@ -41,13 +46,21 @@ export interface CallbackServerInfo {
   waitForCode: () => Promise<CallbackWaitResult | null>;
 }
 
+export interface GoogleAntigravityLoginCallbacksLike {
+  onAuth: (info: { url: string; instructions?: string }) => void;
+  onProgress?: (message: string) => void;
+  onManualCodeInput?: () => Promise<string>;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 export const DEFAULT_GOOGLE_ANTIGRAVITY_OAUTH_CONFIG: GoogleAntigravityOAuthConfig = {
   callbackPort: 51121,
   callbackPath: "/oauth-callback",
   callbackOrigin: "http://localhost:51121",
   redirectUri: "http://localhost:51121/oauth-callback",
-  clientId: process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID || "",
-  clientSecret: process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET || "",
+  clientId: process.env.GOOGLE_ANTIGRAVITY_CLIENT_ID || ANTIGRAVITY_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_ANTIGRAVITY_CLIENT_SECRET || ANTIGRAVITY_CLIENT_SECRET,
   scopes: [
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -127,7 +140,17 @@ export async function startGoogleCallbackServer(
   });
 }
 
+export function validateGoogleAntigravityOAuthConfig(config: GoogleAntigravityOAuthConfig): void {
+  if (!config.clientId) {
+    throw new Error("Google Antigravity OAuth is missing clientId");
+  }
+  if (!config.clientSecret) {
+    throw new Error("Google Antigravity OAuth is missing clientSecret");
+  }
+}
+
 export function buildGoogleOAuthUrl(config: GoogleAntigravityOAuthConfig, verifier: string, challenge: string): string {
+  validateGoogleAntigravityOAuthConfig(config);
   const params = new URLSearchParams({
     client_id: config.clientId,
     response_type: "code",
@@ -161,6 +184,7 @@ export async function exchangeGoogleAuthorizationCode(
   code: string,
   verifier: string,
 ): Promise<GoogleAntigravityOAuthTokens> {
+  validateGoogleAntigravityOAuthConfig(config);
   const response = await fetch(GOOGLE_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -198,6 +222,7 @@ export async function refreshGoogleAntigravityAccessToken(
   refreshToken: string,
   projectId?: string,
 ): Promise<GoogleAntigravityOAuthTokens> {
+  validateGoogleAntigravityOAuthConfig(config);
   const response = await fetch(GOOGLE_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -240,6 +265,118 @@ export async function getGoogleUserEmail(accessToken: string): Promise<string | 
     return typeof data.email === "string" ? data.email : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function abortError(message: string): Error {
+  return new Error(message);
+}
+
+function waitForAbort(signal: AbortSignal | undefined, message = "Login cancelled"): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(message));
+      return;
+    }
+    signal?.addEventListener("abort", () => reject(abortError(message)), { once: true });
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function waitForGoogleAuthorization(
+  serverInfo: CallbackServerInfo,
+  verifier: string,
+  callbacks: GoogleAntigravityLoginCallbacksLike,
+): Promise<string> {
+  let manualInput: string | undefined;
+  let manualError: Error | undefined;
+  const manualPromise = callbacks.onManualCodeInput
+    ? callbacks.onManualCodeInput()
+        .then((value) => {
+          manualInput = value;
+          serverInfo.cancelWait();
+        })
+        .catch((error) => {
+          manualError = error instanceof Error ? error : new Error(String(error));
+          serverInfo.cancelWait();
+        })
+    : undefined;
+
+  const callbackPromise = serverInfo.waitForCode();
+  const raced = await withTimeout(
+    Promise.race([
+      callbackPromise,
+      ...(callbacks.signal ? [waitForAbort(callbacks.signal)] : []),
+    ]),
+    callbacks.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS,
+    "Google Antigravity login timed out",
+  );
+
+  if (raced !== null) {
+    if (raced.kind === "error") {
+      throw new Error(`Google authentication failed: ${raced.error}`);
+    }
+    if (raced.state !== verifier) {
+      throw new Error("OAuth state mismatch - possible CSRF attack");
+    }
+    return raced.code || "";
+  }
+
+  if (manualPromise) {
+    await manualPromise.catch(() => {});
+  }
+  if (manualError) throw manualError;
+  if (!manualInput) throw new Error("Google authentication cancelled");
+  const parsed = parseRedirectUrl(manualInput);
+  if (parsed.state && parsed.state !== verifier) {
+    throw new Error("OAuth state mismatch - possible CSRF attack");
+  }
+  if (!parsed.code) {
+    throw new Error("No authorization code received");
+  }
+  return parsed.code;
+}
+
+export async function loginGoogleAntigravity(
+  callbacks: GoogleAntigravityLoginCallbacksLike,
+  config: GoogleAntigravityOAuthConfig = DEFAULT_GOOGLE_ANTIGRAVITY_OAUTH_CONFIG,
+): Promise<GoogleAntigravityOAuthTokens> {
+  validateGoogleAntigravityOAuthConfig(config);
+  const { verifier, challenge } = generatePkcePair();
+  const serverInfo = await startGoogleCallbackServer(config.callbackPort, config.callbackPath, config.callbackOrigin);
+  try {
+    const url = buildGoogleOAuthUrl(config, verifier, challenge);
+    callbacks.onAuth({
+      url,
+      instructions: "Complete Google sign-in in your browser, or paste the redirect URL to finish manually.",
+    });
+    callbacks.onProgress?.("Waiting for Google authentication...");
+    const code = await waitForGoogleAuthorization(serverInfo, verifier, callbacks);
+    callbacks.onProgress?.("Exchanging Google authorization code...");
+    const tokens = await exchangeGoogleAuthorizationCode(config, code, verifier);
+    callbacks.onProgress?.("Fetching Google account email...");
+    tokens.email = await getGoogleUserEmail(tokens.accessToken);
+    callbacks.onProgress?.("Resolving Antigravity project...");
+    tokens.projectId = await discoverGoogleAntigravityProject(tokens.accessToken, callbacks.onProgress);
+    return tokens;
+  } finally {
+    serverInfo.cancelWait();
+    await new Promise((resolve) => serverInfo.server.close(() => resolve(undefined)));
   }
 }
 
