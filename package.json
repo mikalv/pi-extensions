@@ -61,7 +61,10 @@
       "./packages/pi-atelier/extensions/index.ts",
       "./packages/pi-backoffice-reporter/src/index.ts",
       "./packages/pi-copy-code/src/index.ts",
-      "./packages/pi-adhd-tasks/src/index.ts"
+      "./packages/pi-adhd-tasks/src/index.ts",
+      "./packages/pi-input-shortcuts/src/index.ts",
+      "./packages/pi-status-hub/src/index.ts",
+      "./packages/pi-plan-mode/src/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
