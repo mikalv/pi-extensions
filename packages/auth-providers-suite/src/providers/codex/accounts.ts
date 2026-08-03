@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { AccountRecord } from "../../types/account.ts";
 
 export interface CodexCredential {
   type: "oauth";
@@ -121,6 +122,47 @@ export function saveNamedCodexAccount(label: string, credential: CodexCredential
   };
   store.active = label;
   saveCodexAccountsStore(store);
+}
+
+export function saveCurrentActiveCodexAccount(label: string): CodexCredential | undefined {
+  const active = readActiveCodexCredential();
+  if (!active) return undefined;
+  saveNamedCodexAccount(label, active);
+  return active;
+}
+
+export function buildCodexAccountRecord(
+  label: string,
+  credential: CodexCredential,
+  status: AccountRecord["status"] = "ready",
+): AccountRecord {
+  return {
+    id: `codex:${label}`,
+    provider: "codex",
+    label,
+    authKind: "oauth",
+    enabled: true,
+    status,
+    lastValidatedAt: Date.now(),
+    metadata: {
+      source: "codex-cli",
+      accountId: credential.accountId,
+      accessToken: credential.access,
+      refreshToken: credential.refresh,
+      expiresAt: credential.expires,
+    },
+  };
+}
+
+export function importCodexCliIntoPiAuth(credential: CodexCredential): CodexCredential {
+  writeActiveCodexCredential(credential);
+  return readActiveCodexCredential() || credential;
+}
+
+export function importAndSaveNamedCodexAccount(label: string, credential: CodexCredential): AccountRecord {
+  const imported = importCodexCliIntoPiAuth(credential);
+  saveNamedCodexAccount(label, imported);
+  return buildCodexAccountRecord(label, imported, "ready");
 }
 
 export function switchNamedCodexAccount(label: string): CodexCredential | undefined {

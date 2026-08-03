@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   type CodexCredential,
+  importCodexCliIntoPiAuth,
   readActiveCodexCredential,
 } from "./accounts.ts";
 
@@ -118,6 +119,12 @@ async function waitForCodexCliCredential(
   throw new Error("Codex device login timed out");
 }
 
+export function getCodexCredentialSource(): "cli" | "pi" | "none" {
+  if (importCodexCliCredential()) return "cli";
+  if (readActiveCodexCredential()) return "pi";
+  return "none";
+}
+
 export async function loginCodex(callbacks: CodexLoginCallbacksLike): Promise<CodexOAuthCredentials> {
   const existing = importCodexCliCredential();
   const baselineRefresh = existing?.refresh;
@@ -165,11 +172,22 @@ export async function loginCodex(callbacks: CodexLoginCallbacksLike): Promise<Co
       waitForAbort(callbacks.signal),
     ]);
     validateCodexCredential(credential);
-    callbacks.onProgress?.("Codex login completed.");
-    return credential;
+    const imported = importCodexCliIntoPiAuth(credential);
+    callbacks.onProgress?.("Codex login completed and imported into Pi auth.");
+    return imported;
   } finally {
     killChild();
   }
+}
+
+export async function importCodexCredentialFromCliOrPi(): Promise<CodexOAuthCredentials> {
+  const imported = importCodexCliCredential();
+  if (imported) {
+    return importCodexCliIntoPiAuth(imported);
+  }
+  const active = readActiveCodexCredential();
+  validateCodexCredential(active);
+  return { ...active, type: "oauth" };
 }
 
 export async function refreshCodexCredential(

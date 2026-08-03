@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { AccountRecord } from "../../types/account.ts";
 import { readActiveCodexCredential, type CodexCredential } from "./accounts.ts";
 
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -59,6 +60,21 @@ function assertObject(value: unknown, description: string): Record<string, unkno
 function parseEpochMs(value: unknown): number | undefined {
   const n = asNumber(value);
   return n === undefined ? undefined : n * 1000;
+}
+
+export function codexAccountRecordToCredential(account: AccountRecord | undefined): CodexCredential | undefined {
+  if (!account || account.provider !== "codex") return undefined;
+  const metadata = account.metadata || {};
+  const access = typeof metadata.accessToken === "string" ? metadata.accessToken : undefined;
+  const refresh = typeof metadata.refreshToken === "string" ? metadata.refreshToken : undefined;
+  if (!access || !refresh) return undefined;
+  return {
+    type: "oauth",
+    access,
+    refresh,
+    expires: typeof metadata.expiresAt === "number" ? metadata.expiresAt : 0,
+    ...(typeof metadata.accountId === "string" ? { accountId: metadata.accountId } : {}),
+  };
 }
 
 export async function resolveCodexUsageAuth(): Promise<{ token?: string; accountId?: string }> {
@@ -203,4 +219,15 @@ export async function queryCodexUsage(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+export async function queryCodexUsageFromAccount(
+  account: AccountRecord | undefined,
+  timeoutMs = 15_000,
+): Promise<CodexUsageReport> {
+  const credential = codexAccountRecordToCredential(account);
+  if (!credential) {
+    throw new Error("Selected Codex account does not contain usable OAuth credentials");
+  }
+  return queryCodexUsage(credential, timeoutMs);
 }

@@ -5,9 +5,13 @@ export function resolveCodexAuth(account: AccountRecord | undefined): ResolvedAu
   if (!account) {
     return { kind: "oauth", diagnostic: "No Codex account selected" };
   }
+  const metadata = account.metadata || {};
   return {
     kind: account.authKind,
     headers: account.headers,
+    accessToken: typeof metadata.accessToken === "string" ? metadata.accessToken : undefined,
+    refreshToken: typeof metadata.refreshToken === "string" ? metadata.refreshToken : undefined,
+    expiresAt: typeof metadata.expiresAt === "number" ? metadata.expiresAt : undefined,
     diagnostic: account.status === "invalid" ? "Codex account is invalid" : undefined,
   };
 }
