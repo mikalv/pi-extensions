@@ -5,16 +5,16 @@
  * The answer is ephemeral: shown inline and NEVER added to history.
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { streamSimple } from "@mariozechner/pi-ai";
-import type { Message } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { Message } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
 	convertToLlm,
+	type ExtensionAPI,
 	type Theme,
-} from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { wrapTextWithAnsi, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { wrapTextWithAnsi, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const QQ_CUSTOM_TYPE = "qq";
 const QQ_SYSTEM_PROMPT_SUFFIX = `
@@ -31,12 +31,12 @@ const MAX_VIEWPORT_HEIGHT = 4;
  * Renders the Quick Question box with a right-rail scrollbar.
  */
 function renderQqBox(
-	width: number, 
-	theme: Theme, 
-	question: string, 
-	answer: string, 
+	width: number,
+	theme: Theme,
+	question: string,
+	answer: string,
 	isStreaming: boolean,
-	scrollOffset: number = 0
+	scrollOffset: number = 0,
 ) {
 	const borderStyle = (s: string) => theme.fg("border", s);
 	const accentStyle = (s: string) => theme.fg("accent", s);
@@ -48,11 +48,11 @@ function renderQqBox(
 	const leftPrefixWidth = 4; // "│   "
 	const rightSuffixWidth = 3; // "  │" or "  ┃"
 	const contentWidth = Math.max(1, width - leftPrefixWidth - rightSuffixWidth);
-	
+
 	const out: string[] = [];
 
 	// Widget mode: add breathing room above
-	out.push(""); 
+	out.push("");
 
 	// Header line (full width, no right border)
 	const headerText = `${borderStyle("╭─")} ${accentStyle("Quick Question:")} ${question}`;
@@ -62,7 +62,7 @@ function renderQqBox(
 	// Body text
 	const displayText = answer || (isStreaming ? dimStyle("Thinking...") : "");
 	const bodyLines = wrapTextWithAnsi(displayText.trim(), contentWidth);
-	
+
 	const totalLines = bodyLines.length;
 	const currentHeight = Math.min(totalLines, MAX_VIEWPORT_HEIGHT);
 	const viewStart = Math.max(0, Math.min(scrollOffset, totalLines - currentHeight));
@@ -82,7 +82,7 @@ function renderQqBox(
 	for (let i = 0; i < visibleLines.length; i++) {
 		const line = visibleLines[i];
 		const truncatedLine = truncateToWidth(line, contentWidth);
-		
+
 		// Right border is either track │ or thumb ┃
 		let rightBorder = borderStyle("│");
 		if (totalLines > MAX_VIEWPORT_HEIGHT && i >= thumbStart && i < thumbEnd) {
@@ -103,10 +103,10 @@ function renderQqBox(
 		scrollInfo = dimStyle(` [Line ${viewStart + 1}-${viewEnd} of ${totalLines}]`);
 	}
 
-	const hint = isStreaming 
-		? dimStyle("(Esc to cancel)") 
+	const hint = isStreaming
+		? dimStyle("(Esc to cancel)")
 		: dimStyle("(Space/Enter/Esc to dismiss)");
-	
+
 	const footerText = borderStyle("╰─") + scrollInfo + " " + hint;
 	out.push(truncateToWidth(footerText, width));
 
@@ -123,7 +123,7 @@ export default function qqExtension(pi: ExtensionAPI): void {
 		if (filtered.length !== event.messages.length) return { messages: filtered };
 	});
 
-	// Unified handler for /qq and /btw
+	// /qq only — /btw is owned by packages/mm-btw
 	const qqHandler = async (args: string, ctx: any) => {
 		const question = args.trim();
 		if (!question) {
@@ -142,16 +142,25 @@ export default function qqExtension(pi: ExtensionAPI): void {
 
 		const contextMessages: Message[] = [
 			...llmMessages,
-			{ role: "user" as const, content: [{ type: "text" as const, text: question }], timestamp: Date.now() },
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: question }],
+				timestamp: Date.now(),
+			},
 		];
 
 		let apiKey: string | undefined;
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-			if (!auth.ok) { ctx.ui.notify(`Could not retrieve API key: ${auth.error}`, "error"); return; }
+			if (!auth.ok) {
+				ctx.ui.notify(`Could not retrieve API key: ${auth.error}`, "error");
+				return;
+			}
 			apiKey = auth.apiKey;
+		} catch {
+			ctx.ui.notify("Could not retrieve API key for quick question", "error");
+			return;
 		}
-		catch { ctx.ui.notify("Could not retrieve API key for quick question", "error"); return; }
 
 		const thinkingLevel = pi.getThinkingLevel();
 		const abortController = new AbortController();
@@ -163,10 +172,15 @@ export default function qqExtension(pi: ExtensionAPI): void {
 
 		// Helper to update the inline widget
 		const updateWidget = () => {
-			ctx.ui.setWidget("qq", (_tui, theme) => ({
-				render: (w) => renderQqBox(w, theme, question, accumulated, !streamDone, scrollOffset),
-				invalidate: () => {},
-			}), { placement: "aboveEditor" });
+			ctx.ui.setWidget(
+				"qq",
+				(_tui, theme) => ({
+					render: (w) =>
+						renderQqBox(w, theme, question, accumulated, !streamDone, scrollOffset),
+					invalidate: () => {},
+				}),
+				{ placement: "aboveEditor" },
+			);
 		};
 
 		// Initial display
@@ -178,11 +192,11 @@ export default function qqExtension(pi: ExtensionAPI): void {
 				const eventStream = streamSimple(
 					ctx.model!,
 					{ systemPrompt, messages: contextMessages },
-					{ 
-						apiKey, 
-						signal: abortController.signal, 
+					{
+						apiKey,
+						signal: abortController.signal,
 						reasoning: thinkingLevel,
-						tools: []
+						tools: [],
 					},
 				);
 				for await (const event of eventStream) {
@@ -203,43 +217,46 @@ export default function qqExtension(pi: ExtensionAPI): void {
 
 		// Ghost interactive modal
 		const startTime = Date.now();
-		await ctx.ui.custom((tui, _theme, _kb, done) => ({
-			render: () => [], 
-			handleInput: (data) => {
-				// 1. Navigation Keys
-				if (matchesKey(data, Key.up)) {
-					scrollOffset = Math.max(0, scrollOffset - 1);
-					updateWidget();
-					tui.requestRender();
-					return;
-				}
-				if (matchesKey(data, Key.down)) {
-					scrollOffset++;
-					updateWidget();
-					tui.requestRender();
-					return;
-				}
-
-				// 2. Escape (Instant cancel)
-				if (data === "\x1b") {
-					abortController.abort();
-					done(null);
-					return;
-				}
-
-				// 3. Dismissal keys (with safety)
-				if (data === " " || data === "\r" || data === "\n") {
-					if (Date.now() - startTime >= 500) {
-						done(null);
+		await ctx.ui.custom(
+			(tui, _theme, _kb, done) => ({
+				render: () => [],
+				handleInput: (data) => {
+					// 1. Navigation Keys
+					if (matchesKey(data, Key.up)) {
+						scrollOffset = Math.max(0, scrollOffset - 1);
+						updateWidget();
+						tui.requestRender();
+						return;
 					}
-					return;
-				}
+					if (matchesKey(data, Key.down)) {
+						scrollOffset++;
+						updateWidget();
+						tui.requestRender();
+						return;
+					}
+
+					// 2. Escape (Instant cancel)
+					if (data === "\x1b") {
+						abortController.abort();
+						done(null);
+						return;
+					}
+
+					// 3. Dismissal keys (with safety)
+					if (data === " " || data === "\r" || data === "\n") {
+						if (Date.now() - startTime >= 500) {
+							done(null);
+						}
+						return;
+					}
+				},
+				invalidate: () => {},
+			}),
+			{
+				overlay: true,
+				overlayOptions: { anchor: "top-left", width: 0, height: 0 },
 			},
-			invalidate: () => {},
-		}), { 
-			overlay: true,
-			overlayOptions: { anchor: "top-left", width: 0, height: 0 }
-		});
+		);
 
 		ctx.ui.setWidget("qq", undefined);
 		await streamPromise;
@@ -247,10 +264,6 @@ export default function qqExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("qq", {
 		description: "Ask a quick question about your current work (ephemeral, no history)",
-		handler: qqHandler,
-	});
-	pi.registerCommand("btw", {
-		description: "Ask a quick side question (alias for /qq)",
 		handler: qqHandler,
 	});
 }

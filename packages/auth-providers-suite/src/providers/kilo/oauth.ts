@@ -183,7 +183,7 @@ export async function loginKilo(callbacks: KiloLoginCallbacksLike): Promise<OAut
   });
   const result = await waitForAuthorization(authData.code, authData.expiresIn, callbacks);
   if (!result.token) throw new Error("Authentication failed: missing token");
-  callbacks.onProgress?.(`Authenticated${result.userEmail ? ` as ${result.userEmail}` : ""}. Fetching profile...");
+  callbacks.onProgress?.(`Authenticated${result.userEmail ? ` as ${result.userEmail}` : ""}. Fetching profile...`);
   const profile = await fetchProfile(result.token);
   const accountId = await selectOrganization(profile.organizations, callbacks);
   return toOAuthCredentials({

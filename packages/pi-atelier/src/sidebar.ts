@@ -26,6 +26,7 @@ export interface SidebarSnapshotInput {
 	availableToolCount: number;
 	activeToolNames?: readonly string[];
 	extensionStatuses: readonly string[];
+	memoryStatuses?: readonly string[];
 	runActivity?: RunActivitySnapshot;
 	todos?: readonly NormalizedTodo[];
 }
@@ -42,6 +43,7 @@ export interface SidebarSnapshot extends AtelierState {
 	activeToolNames: readonly string[];
 	runActivity: RunActivitySnapshot;
 	todos: readonly NormalizedTodo[];
+	memoryStatuses: readonly string[];
 }
 
 function workspacePulseData(pulse: WorkspacePulseState): WorkspacePulseData | undefined {
@@ -65,6 +67,7 @@ export function buildSidebarSnapshot(input: SidebarSnapshotInput): SidebarSnapsh
 			a.localeCompare(b, "en"),
 		),
 		extensionStatuses: input.extensionStatuses,
+		memoryStatuses: input.memoryStatuses ?? [],
 		runActivity: input.runActivity ?? EMPTY_RUN_ACTIVITY,
 		todos: input.todos ?? [],
 	};
@@ -863,7 +866,7 @@ export function renderSidebarLines(
 			panel: "WORKSPACE",
 			panelRole: "accent",
 			rows: workspace.location,
-			required: false,
+			required: true,
 			dropRank: 5,
 		},
 		{
@@ -889,6 +892,14 @@ export function renderSidebarLines(
 			rows: workspace.session,
 			required: false,
 			dropRank: 4,
+		},
+		{
+			name: "memory",
+			panel: "MEMORY",
+			panelRole: "accent" as const,
+			rows: (snapshot.memoryStatuses ?? []).map(s => palette.paint("primary", s)),
+			required: false,
+			dropRank: 15,
 		},
 		{
 			name: "usage",

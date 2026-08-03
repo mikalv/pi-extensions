@@ -14,13 +14,13 @@ export type AgentLoopReflectionConfig = {
 };
 
 const DEFAULT_REMINDER_TEXT = [
-  "请先暂停继续推进，做一次 agent loop 反思：",
+  "Pause before continuing and do an agent-loop reflection:",
   "",
-  "1. 回到用户的原始目标：现在正在做的事是否仍然直接服务于这个目标？",
-  "2. 检查当前证据和方向：已经验证了什么，哪些只是猜测，下一步是否仍然是最小有效动作？",
-  "3. 判断是否卡住、不确定或可能跑偏：如果是，请先调用 `advisor` 获取建议，再继续。",
+  "1. Return to the user's original goal: does what you're doing still serve that goal directly?",
+  "2. Check current evidence and direction: what is verified, what is still a guess, and is the next step still the smallest useful action?",
+  "3. Decide whether you are stuck, uncertain, or possibly off track: if so, call `advisor` for guidance before continuing.",
   "",
-  "如果一切仍然清晰，请用一两句话说明判断依据，然后继续执行。",
+  "If everything is still clear, state your reasoning in one or two sentences, then continue.",
 ].join("\n");
 
 const DEFAULT_CONFIG: AgentLoopReflectionConfig = {

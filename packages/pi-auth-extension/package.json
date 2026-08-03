@@ -1,0 +1,18 @@
+{
+  "name": "@meeh/pi-auth-extension",
+  "version": "0.1.0",
+  "description": "Registers Cursor, Kilo, and Google Antigravity providers in Pi via auth-providers-suite OAuth flows.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Mikal Villa",
+  "keywords": ["pi-package", "pi-extension"],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": ["src/", "README.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

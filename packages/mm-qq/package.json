@@ -1,7 +1,7 @@
 {
   "name": "@meeh/mm-qq",
   "version": "1.0.1",
-  "description": "Quick questions with /qq or /btw — ask the LLM about the current session without affecting the main conversation",
+  "description": "Quick questions with /qq — ask the LLM about the current session without affecting the main conversation",
   "keywords": [
     "pi-package"
   ],
@@ -19,10 +19,9 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-ai-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*"
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }

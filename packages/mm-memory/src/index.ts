@@ -383,20 +383,42 @@ export default function mmMemory(pi: ExtensionAPI): void {
 
 	// Atelier sidebar status — show Prism connection state
 	const MEM_STATUS_KEY = "mm-memory";
+	let sessionRecalls = 0;
+	let sessionRemembers = 0;
+
+	const emitMemStatus = (ctx: { hasUI: boolean; ui: { setStatus: (k: string, v: string) => void } }) => {
+		const config = loadMemoryConfig();
+		const connected = Boolean(config.connection.baseUrl && config.connection.apiKey);
+		if (!connected) {
+			ctx.ui.setStatus(MEM_STATUS_KEY, "💾 ltm: —");
+			pi.events.emit("atelier:memory-status", { key: "mm-memory", line: "💾 ltm: —" });
+			return;
+		}
+		const parts = ["💾 ltm"];
+		if (sessionRecalls > 0) parts.push(`↓${sessionRecalls}`);
+		if (sessionRemembers > 0) parts.push(`↑${sessionRemembers}`);
+		if (config.ambientSync) parts.push("sync✓");
+		const status = parts.join(" · ");
+		ctx.ui.setStatus(MEM_STATUS_KEY, status);
+		pi.events.emit("atelier:memory-status", { key: "mm-memory", line: status });
+	};
 
 	pi.on("session_start", (_event, ctx) => {
-		if (!ctx.hasUI) return;
-		const config = loadMemoryConfig();
-		const connected = Boolean(config.connection.baseUrl && config.connection.apiKey);
-		ctx.ui.setStatus(MEM_STATUS_KEY, connected ? "💾 ltm: ready" : "💾 ltm: —");
+		sessionRecalls = 0;
+		sessionRemembers = 0;
+		emitMemStatus(ctx);
 	});
 
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("tool_execution_end", (event, ctx) => {
 		if (!ctx.hasUI) return;
-		const config = loadMemoryConfig();
-		const connected = Boolean(config.connection.baseUrl && config.connection.apiKey);
-		const sync = config.ambientSync ? " · sync✓" : "";
-		const inject = config.injectOnStart ? " · inject✓" : "";
-		ctx.ui.setStatus(MEM_STATUS_KEY, connected ? `💾 ltm: ready${sync}${inject}` : "💾 ltm: —");
+		const name = (event as { toolName?: string }).toolName ?? "";
+		if (name === "memory_recall" || name === "memory_sessions") sessionRecalls++;
+		if (name === "memory_remember") sessionRemembers++;
+		emitMemStatus(ctx);
+	});
+
+	pi.on("turn_end", (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		emitMemStatus(ctx);
 	});
 }

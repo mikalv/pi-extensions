@@ -120,8 +120,10 @@ async function waitForCodexCliCredential(
 }
 
 export function getCodexCredentialSource(): "cli" | "pi" | "none" {
-  if (importCodexCliCredential()) return "cli";
+  // In Pi, the canonical path should be Pi's own built-in openai-codex OAuth
+  // store when available. CLI import remains a bootstrap/recovery path.
   if (readActiveCodexCredential()) return "pi";
+  if (importCodexCliCredential()) return "cli";
   return "none";
 }
 
@@ -181,13 +183,16 @@ export async function loginCodex(callbacks: CodexLoginCallbacksLike): Promise<Co
 }
 
 export async function importCodexCredentialFromCliOrPi(): Promise<CodexOAuthCredentials> {
+  const active = readActiveCodexCredential();
+  if (active) {
+    validateCodexCredential(active);
+    return { ...active, type: "oauth" };
+  }
   const imported = importCodexCliCredential();
   if (imported) {
     return importCodexCliIntoPiAuth(imported);
   }
-  const active = readActiveCodexCredential();
-  validateCodexCredential(active);
-  return { ...active, type: "oauth" };
+  throw new Error("No Codex credential found in Pi auth or Codex CLI auth store");
 }
 
 export async function refreshCodexCredential(

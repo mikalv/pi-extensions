@@ -53,6 +53,24 @@ export default function atelierExtension(
 	let cachedTodos: NormalizedTodo[] = [];
 	let cachedTodosSessionManager: ExtensionContext["sessionManager"] | undefined;
 	let extensionStatuses: readonly string[] = [];
+	let memoryStatuses: readonly string[] = [];
+
+	// Listen for memory status updates from mm-memory and mm-observational-memory
+	const memoryStatusMap = new Map<string, string>();
+	pi.events.on("atelier:memory-status", (data) => {
+		if (typeof data !== "object" || data === null || !("key" in data) || !("line" in data)) return;
+		const key = (data as { key: unknown }).key;
+		const line = (data as { line: unknown }).line;
+		if (typeof key !== "string" || typeof line !== "string") return;
+		memoryStatusMap.set(key, line);
+		memoryStatuses = Array.from(memoryStatusMap.values());
+		requestAllRenders();
+	});
+
+	// Default placeholders so the MEMORY panel is visible from session start
+	memoryStatusMap.set("mm-om", "👁 om: —");
+	memoryStatusMap.set("mm-memory", "💾 ltm: —");
+	memoryStatuses = Array.from(memoryStatusMap.values());
 	let enabled = true;
 	let shortcutRegistered = false;
 	let resizeShortcutRegistered = false;
@@ -77,6 +95,7 @@ export default function atelierExtension(
 			return;
 		}
 		extensionStatuses = [...next];
+		requestRender();
 		sidebar?.requestRender();
 	}
 
@@ -160,6 +179,7 @@ export default function atelierExtension(
 			availableToolCount: pi.getAllTools().length,
 			activeToolNames: activeTools,
 			extensionStatuses,
+			memoryStatuses,
 			...(targetRunActivity ? { runActivity: targetRunActivity.getSnapshot() } : {}),
 			todos: cachedTodos,
 		});
@@ -324,14 +344,14 @@ export default function atelierExtension(
 		});
 	}
 
-	pi.registerCommand("atelier", {
+	pi.registerCommand("sidebar", {
 		description: "Open or control the Pi Atelier status menu",
 		handler: async (args, ctx) => {
 			const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 			const [action, sidebarAction, ...extra] = parts;
 			if (action === "display") {
 				if (sidebarAction !== undefined || extra.length > 0) {
-					ctx.ui.notify("Usage: /atelier display", "warning");
+					ctx.ui.notify("Usage: /sidebar display", "warning");
 					return;
 				}
 				await openDisplay(ctx);
@@ -352,7 +372,7 @@ export default function atelierExtension(
 						toolExtra.length > 0 ||
 						(toolAction !== undefined && toolAction !== "on" && toolAction !== "off")
 					) {
-						ctx.ui.notify("Usage: /atelier sidebar tools [on|off]", "warning");
+						ctx.ui.notify("Usage: /sidebar sidebar tools [on|off]", "warning");
 						return;
 					}
 					await setSidebarToolNames(ctx, toolAction === undefined ? undefined : toolAction === "on");
@@ -362,7 +382,7 @@ export default function atelierExtension(
 					extra.length > 0 ||
 					(sidebarAction !== undefined && sidebarAction !== "on" && sidebarAction !== "off")
 				) {
-					ctx.ui.notify("Usage: /atelier sidebar [on|off]", "warning");
+					ctx.ui.notify("Usage: /sidebar sidebar [on|off]", "warning");
 					return;
 				}
 				if (sidebarAction === "on") sidebar.show();
@@ -661,6 +681,7 @@ export default function atelierExtension(
 		if (!current?.runtime) return;
 		current.runtime.refreshUsage();
 		await current.runtime.refreshGitState();
+		requestAllRenders(); // pick up updated extension statuses
 	});
 	pi.on("model_select", (_event, ctx) => getCurrentContextState(ctx)?.runtime?.refreshUsage());
 	pi.on("thinking_level_select", (_event, ctx) => getCurrentContextState(ctx)?.runtime?.refreshUsage());
