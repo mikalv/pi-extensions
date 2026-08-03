@@ -1,15 +1,13 @@
 .DS_Store
 Thumbs.db
-node_modules
-dist
+node_modules/
+.env.*
 *.log
+dist
 
 # Local Pi agent state
 .pi/
 
 # Inspiration clones — keep local only; do not ship in the repo
-insp2/
 inspirations/
-
-# Nested clone, not part of this repo
-themes/pi-context/
+not_to_be_commited/
