@@ -152,6 +152,7 @@ function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: T
   pi.registerCommand(name, {
     description: scope === "session" ? "Manage session todos" : "Manage project tasks",
     handler: async (args, ctx) => {
+      const raw = (args || "").trim();
       const parts = parseCommandArgs(args);
       const [action, first, ...rest] = parts;
       const remainder = rest.join(" ");
@@ -171,7 +172,8 @@ function registerScopedCommand(pi: ExtensionAPI, name: "todo" | "task", scope: T
       if (action === "up") return handleReorder(scope, first || "", "up", ctx);
       if (action === "down") return handleReorder(scope, first || "", "down", ctx);
 
-      ctx.ui.notify(`Unknown /${name} action: ${action}`, "warning");
+      // Shorthand: `/todo some text here` or `/task some text here` means add.
+      return handleAdd(scope, raw, ctx);
     },
   });
 }
