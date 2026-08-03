@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-export type SupportedLiveProvider = "openai-codex" | "anthropic" | "github-copilot" | "openrouter";
+export type SupportedLiveProvider = "openai-codex" | "anthropic" | "github-copilot" | "openrouter" | "cursor" | "kilo" | "google-antigravity" | "zai";
 
 type PiModelLike = NonNullable<ExtensionContext["model"]> & { baseUrl?: string };
 
@@ -38,11 +38,15 @@ export interface LiveUsageState {
   message?: string;
 }
 
-const PROVIDERS: Array<{ id: SupportedLiveProvider; name: string; endpoint: string }> = [
+const PROVIDERS: Array<{ id: SupportedLiveProvider; name: string; endpoint: string; method?: "GET" | "POST"; body?: Record<string, unknown> }> = [
   { id: "openai-codex", name: "Codex", endpoint: "https://chatgpt.com/backend-api/wham/usage" },
   { id: "anthropic", name: "Claude", endpoint: "https://api.anthropic.com/api/oauth/usage" },
   { id: "github-copilot", name: "Copilot", endpoint: "https://api.github.com/copilot_internal/user" },
   { id: "openrouter", name: "OpenRouter", endpoint: "https://openrouter.ai/api/v1/key" },
+  { id: "cursor", name: "Cursor", endpoint: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage", method: "POST", body: {} },
+  { id: "kilo", name: "Kilo", endpoint: "https://api.kilo.ai/api/profile/balance" },
+  { id: "google-antigravity", name: "Google Antigravity", endpoint: "https://api.cloudcode-pa.googleapis.com/v1internal:describeSubscription" },
+  { id: "zai", name: "Z.ai", endpoint: "https://api.z.ai/api/monitor/usage/quota/limit" },
 ];
 
 const OFFICIAL_ORIGINS: Record<SupportedLiveProvider, string[]> = {
@@ -50,6 +54,10 @@ const OFFICIAL_ORIGINS: Record<SupportedLiveProvider, string[]> = {
   anthropic: ["https://api.anthropic.com"],
   "github-copilot": ["https://api.github.com", "https://copilot-proxy.githubusercontent.com"],
   openrouter: ["https://openrouter.ai"],
+  cursor: ["https://api2.cursor.sh", "https://cursor.com"],
+  kilo: ["https://api.kilo.ai"],
+  "google-antigravity": ["https://cloudcode-pa.googleapis.com", "https://api.cloudcode-pa.googleapis.com"],
+  zai: ["https://api.z.ai"],
 };
 
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -202,17 +210,29 @@ async function readBoundedResponse(response: Response, maxBytes: number): Promis
   return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
 }
 
-async function fetchJson(url: string, headers: Record<string, string>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Record<string, unknown>> {
+async function fetchJson(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  method: "GET" | "POST" = "GET",
+  requestBody?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     if (!hasHeader(headers, "User-Agent")) headers["User-Agent"] = "mm-usage-center";
-    const response = await fetch(url, { method: "GET", headers, signal: controller.signal });
-    const body = await readBoundedResponse(response, MAX_RESPONSE_BYTES);
+    if (method === "POST" && !hasHeader(headers, "Content-Type")) headers["Content-Type"] = "application/json";
+    const response = await fetch(url, {
+      method,
+      headers,
+      signal: controller.signal,
+      ...(method === "POST" ? { body: JSON.stringify(requestBody ?? {}) } : {}),
+    });
+    const responseBody = await readBoundedResponse(response, MAX_RESPONSE_BYTES);
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}${body ? `: ${body}` : ""}`);
+      throw new Error(`HTTP ${response.status} ${response.statusText}${responseBody ? `: ${responseBody}` : ""}`);
     }
-    const data = body ? (JSON.parse(body) as unknown) : {};
+    const data = responseBody ? (JSON.parse(responseBody) as unknown) : {};
     const parsed = asRecord(data);
     if (Object.keys(parsed).length === 0) {
       throw new Error("Empty or invalid JSON response");
@@ -291,6 +311,99 @@ function parseOpenRouter(payload: Record<string, unknown>): LiveUsageSnapshot {
   };
 }
 
+function parseCursor(payload: Record<string, unknown>): LiveUsageSnapshot {
+  const root = asRecord(payload.currentPeriodUsage ?? payload.usage ?? payload.data ?? payload);
+  const windows: LiveUsageWindow[] = [];
+  const metrics: Array<{ label: string; value: string }> = [];
+
+  const remaining = asNumber(root.remainingFastRequests ?? root.fastRequestsRemaining ?? root.remainingIncludedRequests);
+  const limit = asNumber(root.totalFastRequests ?? root.fastRequestsLimit ?? root.includedRequests);
+  const used = asNumber(root.usedFastRequests ?? root.fastRequestsUsed ?? root.usedIncludedRequests);
+  const resetsAt = asEpochMs(root.resetsAt ?? root.resetAt ?? root.currentPeriodEnd);
+  if (remaining !== undefined || limit !== undefined) {
+    windows.push({ key: "monthly", label: "Fast requests", remaining, limit, unit: "count", resetsAt });
+    if (used !== undefined) metrics.push({ label: "Used", value: String(used) });
+  }
+
+  const spendUsed = asNumber(root.spendUsed ?? root.usageSpend ?? root.totalSpend);
+  const spendLimit = asNumber(root.includedSpend ?? root.spendLimit);
+  if (spendUsed !== undefined || spendLimit !== undefined) {
+    windows.push({ key: "spend", label: "Spend", remaining: spendLimit !== undefined && spendUsed !== undefined ? Math.max(0, spendLimit - spendUsed) : undefined, limit: spendLimit, unit: "usd", resetsAt });
+    if (spendUsed !== undefined) metrics.push({ label: "Spend used", value: `$${spendUsed.toFixed(2)}` });
+  }
+
+  if (windows.length === 0 && metrics.length === 0) throw new Error("No Cursor usage data found");
+  return { providerId: "cursor", providerName: "Cursor", source: "Cursor dashboard usage API", fetchedAt: Date.now(), windows, metrics };
+}
+
+function parseKilo(payload: Record<string, unknown>): LiveUsageSnapshot {
+  const root = asRecord(payload.data ?? payload.balance ?? payload);
+  const balance = asNumber(root.balance ?? root.remainingCredits ?? root.credits ?? root.available);
+  const used = asNumber(root.used ?? root.spent ?? root.totalUsage);
+  const total = asNumber(root.totalCredits ?? root.total);
+  if (balance === undefined && used === undefined && total === undefined) throw new Error("No Kilo balance data found");
+  return {
+    providerId: "kilo",
+    providerName: "Kilo",
+    source: "Kilo profile balance API",
+    fetchedAt: Date.now(),
+    windows: [{ key: "credits", label: "Credits", remaining: balance, limit: total, unit: "usd" }],
+    metrics: used !== undefined ? [{ label: "Used", value: `$${used.toFixed(2)}` }] : [],
+  };
+}
+
+function parseZai(payload: Record<string, unknown>): LiveUsageSnapshot {
+  const root = asRecord(payload.data ?? payload.result ?? payload);
+  const windows: LiveUsageWindow[] = [];
+
+  const candidates = [
+    ["5h", asRecord(root.fiveHour ?? root.five_hour ?? root.window5h ?? root.rolling5h)],
+    ["7d", asRecord(root.sevenDay ?? root.seven_day ?? root.weekly ?? root.window7d)],
+  ] as const;
+
+  for (const [label, source] of candidates) {
+    pushPercentWindow(windows, label, label, source);
+  }
+
+  if (windows.length === 0) {
+    const items = Array.isArray(root.limits) ? root.limits : Array.isArray(root.windows) ? root.windows : [];
+    items.forEach((entry, index) => {
+      const item = asRecord(entry);
+      const name = asString(item.label ?? item.name ?? item.type) ?? `window-${index + 1}`;
+      pushPercentWindow(windows, name, name, item);
+    });
+  }
+
+  if (windows.length === 0) throw new Error("No Z.ai quota windows found");
+  return {
+    providerId: "zai",
+    providerName: "Z.ai",
+    source: "Z.ai quota API",
+    fetchedAt: Date.now(),
+    windows,
+    metrics: [],
+  };
+}
+
+function parseGoogleAntigravity(payload: Record<string, unknown>): LiveUsageSnapshot {
+  const root = asRecord(payload.data ?? payload.subscription ?? payload);
+  const windows: LiveUsageWindow[] = [];
+  const candidates = [
+    ["5h", asRecord(root.fiveHour ?? root.five_hour ?? root.shortWindow ?? root.primaryWindow)],
+    ["7d", asRecord(root.sevenDay ?? root.seven_day ?? root.weeklyWindow ?? root.secondaryWindow)],
+  ] as const;
+  for (const [label, source] of candidates) pushPercentWindow(windows, label, label, source);
+  if (windows.length === 0) throw new Error("No Google Antigravity quota windows found");
+  return {
+    providerId: "google-antigravity",
+    providerName: "Google Antigravity",
+    source: "Google Antigravity subscription API",
+    fetchedAt: Date.now(),
+    windows,
+    metrics: [],
+  };
+}
+
 function parseCopilot(payload: Record<string, unknown>): LiveUsageSnapshot {
   const snapshots = asRecord(payload.quota_snapshots);
   const premium = asRecord(snapshots.premium_interactions);
@@ -358,7 +471,17 @@ async function queryProvider(ctx: ExtensionContext, providerId: SupportedLivePro
       };
     }
 
-    const payload = await fetchJson(provider.endpoint, headers);
+    if (providerId === "cursor") {
+      headers["x-cursor-client-type"] = headers["x-cursor-client-type"] || "cli";
+      headers["x-cursor-client-version"] = headers["x-cursor-client-version"] || "cli-2026.01.17-d239e66";
+      headers["x-ghost-mode"] = headers["x-ghost-mode"] || "true";
+      headers["x-request-id"] = headers["x-request-id"] || crypto.randomUUID();
+    }
+    if (providerId === "google-antigravity") {
+      headers["User-Agent"] = headers["User-Agent"] || "antigravity/1.104.0 darwin/arm64";
+    }
+
+    const payload = await fetchJson(provider.endpoint, headers, DEFAULT_TIMEOUT_MS, provider.method ?? "GET", provider.body);
     const snapshot =
       providerId === "openai-codex"
         ? parseCodex(payload)
@@ -366,7 +489,15 @@ async function queryProvider(ctx: ExtensionContext, providerId: SupportedLivePro
           ? parseAnthropic(payload)
           : providerId === "github-copilot"
             ? parseCopilot(payload)
-            : parseOpenRouter(payload);
+            : providerId === "openrouter"
+              ? parseOpenRouter(payload)
+              : providerId === "cursor"
+                ? parseCursor(payload)
+                : providerId === "kilo"
+                  ? parseKilo(payload)
+                  : providerId === "zai"
+                    ? parseZai(payload)
+                    : parseGoogleAntigravity(payload);
 
     return { providerId, providerName: provider.name, status: "ready", snapshot };
   } catch (error) {
