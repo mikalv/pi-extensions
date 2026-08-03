@@ -1,6 +1,6 @@
 # Package selection decision
 
-## Activated now
+## Activated extensions
 - `packages/pi-plan-mode`
 - `packages/pi-input-shortcuts`
 - `packages/pi-status-hub`
@@ -8,30 +8,21 @@
 - `packages/pi-worktree`
 - `packages/pi-rtk`
 - `packages/pi-image-drop`
-
-## Left unregistered for now
+- `packages/pi-grill-me`
 - `packages/pi-chrome-devtools`
 - `packages/pi-github-pr`
+
+## Registered skills
+- `./skills` (code-review, grill, handoff, humanizer, python-script, scout, spec-dev, cherry-pr-review)
+
+## Moved out of repository
 - `packages/pi-obsidian`
 - `packages/pi-plan`
 - `packages/pi-goal`
 
-## Why these were activated
-- `pi-review`: useful focused review capability with good fit beside plan mode
-- `pi-worktree`: high-value workspace/session workflow support
-- `pi-rtk`: explicitly known and already installed by the user
-- `pi-image-drop`: convenient quality-of-life input/attachment workflow
-- `pi-input-shortcuts` and `pi-status-hub`: already selected as strong core UX/status additions
-- `pi-plan-mode`: selected as the active planning layer instead of `pi-plan`
-
-## Why others remain unregistered
-- `pi-chrome-devtools`: useful but specialized; not needed as a default extension yet
-- `pi-github-pr`: low-risk ambient status, but not essential yet
-- `pi-obsidian`: only useful when Obsidian-vault workflow is desired
-- `pi-plan`: overlaps with `pi-plan-mode` and broader workflow ownership
-- `pi-goal`: overlapping workflow scope and not ideal here right now
-
-## Future revisit candidates
-- `pi-chrome-devtools`
-- `pi-github-pr`
-- `pi-obsidian`
+## Rationale
+- `pi-chrome-devtools`: CDP browser inspection and screenshot capability for Pi agents.
+- `pi-github-pr`: ambient statusline PR review/checks summary.
+- `pi-grill-me`: deterministic design-interview extension for probing fuzzy plans.
+- `skills/`: top-level agent skills for code review, grilling, handoffs, humanizing prose, Python scripts, scouting, and spec development.
+- `pi-obsidian`, `pi-plan`, `pi-goal`: removed to prevent scope creep, chinois-only docs friction, or workflow collisions with `pi-plan-mode`.

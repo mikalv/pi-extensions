@@ -78,13 +78,16 @@
       "./packages/pi-worktree/src/index.ts",
       "./packages/pi-rtk/extensions/index.ts",
       "./packages/pi-image-drop/src/index.ts",
-      "./packages/pi-grill-me/src/index.ts"
+      "./packages/pi-grill-me/src/index.ts",
+      "./packages/pi-chrome-devtools/src/index.ts",
+      "./packages/pi-github-pr/src/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
       "./packages/mm-wiki/skills",
       "./packages/pi-adhd-tasks/skills",
-      "./packages/pi-grill-me/skills"
+      "./packages/pi-grill-me/skills",
+      "./skills"
     ],
     "peerDependencies": {},
     "devDependencies": {},
