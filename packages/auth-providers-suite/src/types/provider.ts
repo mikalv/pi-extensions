@@ -20,11 +20,14 @@ export type ProviderFamily =
   | "oauth"
   | "session";
 
+export type ProviderAuthPreference = "native-pi" | "custom-suite" | "bootstrap-import";
+
 export interface ProviderDescriptor {
   id: ProviderId;
   label: string;
   family: ProviderFamily;
   notes?: string;
+  authPreference?: ProviderAuthPreference;
   supportsMultiAccount?: boolean;
   supportsModelDiscovery?: boolean;
   supportsQuotaProbe?: boolean;
