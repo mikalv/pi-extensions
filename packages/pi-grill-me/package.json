@@ -1,0 +1,17 @@
+{
+  "name": "pi-grill-me",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic design interview workflow that records question-by-question decisions and saves Markdown results.",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-tui": ">=0.80.0",
+    "typebox": ">=1.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
