@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
     updateWidget(ctx);
   });
 
-  pi.on("context", (event: any) => {
+  pi.on("before_agent_start", (event: any) => {
     detectExternalTaskChange();
     turnsSinceTaskTouch += 1;
     const { session, project } = listAllTasks();
@@ -339,12 +339,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (!reminder) return;
-    const messages = Array.isArray(event?.messages) ? event.messages : [];
     return {
-      messages: [
-        ...messages,
-        { role: "system", content: reminder },
-      ],
+      systemPrompt: `${event.systemPrompt}\n\n# Active Task Reminders\n${reminder}`,
     };
   });
 }
