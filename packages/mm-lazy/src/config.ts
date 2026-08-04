@@ -35,14 +35,7 @@ export function defaultConfig(): LazyConfig {
 				priority: 10,
 				description: "Subagent orchestration",
 			},
-			{
-				name: "todo",
-				source: "npm:@juicesharp/rpiv-todo",
-				lazy: "after-start",
-				priority: 20,
-				cmd: ["todo"],
-				tools: ["todo"],
-			},
+
 			{
 				name: "ask-user",
 				source: "npm:@juicesharp/rpiv-ask-user-question",
@@ -66,15 +59,6 @@ export function defaultConfig(): LazyConfig {
 			},
 
 			// On-demand — heavy / situational
-			{
-				name: "web",
-				source: "npm:pi-web-access",
-				lazy: true,
-				cmd: ["web"],
-				tools: ["web_search", "fetch_content", "get_search_content"],
-				keywords: ["web search", "search the web", "fetch url", "youtube"],
-				description: "Web search / fetch / video",
-			},
 			{
 				name: "mcp",
 				source: "npm:pi-mcp-adapter",
