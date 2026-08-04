@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { Model, TextContent } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { completeSimple, getApiProvider } from "@earendil-works/pi-ai/compat";
 import {
   type ExtensionAPI,
   type ExtensionContext,
@@ -64,12 +64,19 @@ export type AutoNamingConfig = {
   model: string | null;
   /** 标题语言 */
   language: string;
+  /**
+   * Fallback-modell "provider/modelId" brukt når den aktive modellen har en
+   * custom API (f.eks. cursor-agent) som compat-laget ikke støtter direkte.
+   * null skrur av fallback (title-gen hoppes da over for slike modeller).
+   */
+  fallback_model: string | null;
 };
 
 const DEFAULT_CONFIG: AutoNamingConfig = {
   auto_refresh_turns: 10,
   model: null,
   language: "english",
+  fallback_model: null,
 };
 
 const CONFIG_PATH = join(getAgentDir(), "cnife-auto-naming-session.json");
@@ -146,6 +153,17 @@ function loadConfig(): AutoNamingConfig | null {
     return { ...DEFAULT_CONFIG };
   }
 
+  if (
+    obj.fallback_model !== undefined &&
+    obj.fallback_model !== null &&
+    typeof obj.fallback_model !== "string"
+  ) {
+    console.warn(
+      "[auto-naming-session] fallback_model must be a string or null, using default",
+    );
+    return { ...DEFAULT_CONFIG };
+  }
+
   if (obj.language !== undefined && typeof obj.language !== "string") {
     console.warn(
       "[auto-naming-session] language must be a string, using default",
@@ -166,6 +184,10 @@ function loadConfig(): AutoNamingConfig | null {
       obj.language !== undefined
         ? (obj.language as string)
         : DEFAULT_CONFIG.language,
+    fallback_model:
+      obj.fallback_model !== undefined
+        ? (obj.fallback_model as string | null)
+        : DEFAULT_CONFIG.fallback_model,
   };
 }
 
@@ -258,6 +280,46 @@ async function generateTitle(
   } else {
     model = ctx.model;
     if (!model) return null;
+  }
+
+  // Guard: completeSimple (compat layer) only handles builtin API providers.
+  // Extension providers with custom APIs (e.g. cursor-runtime's "cursor-agent")
+  // are dispatched via modelRuntime.streamSimple in the main agent loop, but
+  // completeSimple bypasses that and calls resolveApiProvider(model.api)
+  // directly — which throws "No API provider registered for api: cursor-agent"
+  // and, when raised from an async handler, crashes pi as an uncaughtException.
+  // If the resolved model has an unsupported custom API, try the configured
+  // fallback_model before giving up.
+  if (!getApiProvider((model as { api: string }).api)) {
+    if (config.fallback_model) {
+      const fallbackParsed = parseModelRef(config.fallback_model);
+      if (fallbackParsed) {
+        const fallback = ctx.modelRegistry.find(
+          fallbackParsed.provider,
+          fallbackParsed.id,
+        );
+        if (
+          fallback &&
+          getApiProvider((fallback as { api: string }).api)
+        ) {
+          model = fallback;
+        } else if (notifyErrors) {
+          ctx.ui.notify(
+            `Fallback model "${config.fallback_model}" unavailable or unsupported for title gen`,
+            "warning",
+          );
+        }
+      } else if (notifyErrors) {
+        ctx.ui.notify(
+          `Invalid fallback_model "${config.fallback_model}". Use "provider/modelId"`,
+          "warning",
+        );
+      }
+    }
+    // If we still have no usable model, bail out silently to avoid crashing pi.
+    if (!getApiProvider((model as { api: string }).api)) {
+      return null;
+    }
   }
 
   // 获取认证
