@@ -76,6 +76,13 @@ function formatReset(resetsAt: number | undefined): string {
   return ` · resets ${days}d`;
 }
 
+function renderProgressBar(percent: number, width: number): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  const empty = Math.max(0, width - filled);
+  return `[${"█".repeat(filled)}${"░".repeat(empty)}] ${clamped}%`;
+}
+
 function formatWindow(window: LiveUsageWindow): string {
   if (window.usedPercent !== undefined) {
     const remaining = Math.max(0, Math.round(100 - window.usedPercent));
@@ -90,13 +97,26 @@ function formatWindow(window: LiveUsageWindow): string {
   return window.label;
 }
 
-function renderLiveRows(rows: LiveUsageState[]): string[] {
+function formatWindowWithBar(window: LiveUsageWindow, width: number): string {
+  const base = formatWindow(window);
+  if (window.usedPercent !== undefined) {
+    const bar = renderProgressBar(window.usedPercent, Math.max(0, width - base.length - 2));
+    return `${base} ${bar}`;
+  }
+  return base;
+}
+
+function renderLiveRows(rows: LiveUsageState[], width?: number): string[] {
   if (rows.length === 0) return ["  - none"];
+  const barWidth = width ? Math.max(8, Math.min(20, Math.floor((width - 40) / 2))) : undefined;
   return rows.map((row) => {
     if (row.status === "ready" && row.snapshot) {
-      const summary = row.snapshot.windows.slice(0, 2).map(formatWindow).join(" · ");
+      const windows = row.snapshot.windows.slice(0, 2);
+      const formatted = barWidth !== undefined
+        ? windows.map((w) => formatWindowWithBar(w, barWidth)).join(" · ")
+        : windows.map(formatWindow).join(" · ");
       const metricSummary = row.snapshot.metrics.slice(0, 2).map((metric) => `${metric.label} ${metric.value}`).join(" · ");
-      return `  ${row.providerName}: ${summary || metricSummary || row.snapshot.source}`;
+      return `  ${row.providerName}: ${formatted || metricSummary || row.snapshot.source}`;
     }
     if (row.status === "unavailable") return `  ${row.providerName}: auth unavailable`;
     return `  ${row.providerName}: ${row.message || "error"}`;
@@ -171,7 +191,7 @@ function buildWidget(snapshot: DashboardSnapshot, data?: UsageData): string[] {
     renderPeriod("All", snapshot.offline.periods.allTime),
     "",
     "Live quotas",
-    ...renderLiveRows(liveReady.length > 0 ? liveReady : snapshot.live),
+    ...renderLiveRows(liveReady.length > 0 ? liveReady : snapshot.live, 80),
     "",
     "Top providers (30d)",
     ...renderProviderRows(snapshot.offline.topProviders),
@@ -192,7 +212,8 @@ function buildStatusFromLive(live: LiveUsageState | undefined, offline: OfflineS
     const first = live.snapshot.windows[0]!;
     if (first.usedPercent !== undefined) {
       const remaining = Math.max(0, Math.round(100 - first.usedPercent));
-      return `${live.providerName.toLowerCase()} ${remaining}% left`;
+      const bar = renderProgressBar(first.usedPercent, 12);
+      return `${live.providerName.toLowerCase()} ${remaining}% left ${bar}`;
     }
     if (first.remaining !== undefined || first.limit !== undefined) {
       const unit = first.unit === "usd" ? "$" : "";

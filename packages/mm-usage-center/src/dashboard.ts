@@ -83,6 +83,20 @@ function formatReset(resetsAt: number | undefined): string {
   return ` · resets ${days}d`;
 }
 
+function renderProgressBar(theme: Theme, percent: number, width: number): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clamped / 100) * width);
+  const empty = Math.max(0, width - filled);
+  const color = usageColor(percent);
+  return theme.fg(color, "█".repeat(filled)) + theme.fg("dim", "░".repeat(empty));
+}
+
+function usageColor(percent: number): "success" | "warning" | "error" {
+  if (percent >= 90) return "error";
+  if (percent >= 70) return "warning";
+  return "success";
+}
+
 function formatWindow(window: LiveUsageWindow): string {
   if (window.usedPercent !== undefined) {
     const remaining = Math.max(0, Math.round(100 - window.usedPercent));
@@ -309,11 +323,20 @@ class UsageDashboardComponent {
     }
     lines.push("");
     lines.push(this.theme.fg("accent", this.theme.bold("Live quotas")));
+    const barWidth = Math.max(6, Math.min(14, Math.floor((width - 30) / 2)));
     for (const row of this.snapshot.live) {
       if (row.status === "ready" && row.snapshot) {
-        const summary = row.snapshot.windows.slice(0, 2).map(formatWindow).join(" · ");
+        const windows = row.snapshot.windows.slice(0, 2);
+        const parts = windows.map((w) => {
+          const base = formatWindow(w);
+          if (w.usedPercent !== undefined) {
+            const bar = renderProgressBar(this.theme, w.usedPercent, barWidth);
+            return `${base} ${bar}`;
+          }
+          return base;
+        });
         const metricSummary = row.snapshot.metrics.slice(0, 2).map((metric) => `${metric.label} ${metric.value}`).join(" · ");
-        lines.push(`• ${row.providerName}: ${summary || metricSummary || row.snapshot.source}`);
+        lines.push(`• ${row.providerName}: ${parts.join(" · ") || metricSummary || row.snapshot.source}`);
       } else if (row.status === "unavailable") {
         lines.push(`• ${row.providerName}: auth unavailable`);
       } else {
@@ -323,7 +346,8 @@ class UsageDashboardComponent {
     lines.push("");
     lines.push(this.theme.fg("accent", this.theme.bold("Top providers")));
     for (const row of this.snapshot.offline.topProviders) {
-      lines.push(`• ${row.name} · ${formatCost(row.cost)} · ${formatTokens(totalTokens(row))} tok`);
+      const color = row.cost > 50 ? "error" : row.cost > 10 ? "warning" : "success";
+      lines.push(`• ${this.theme.fg(color, row.name)} · ${formatCost(row.cost)} · ${formatTokens(totalTokens(row))} tok`);
     }
     lines.push("");
     lines.push(this.theme.fg("accent", this.theme.bold("Top tools")));
@@ -341,10 +365,19 @@ class UsageDashboardComponent {
 
   private renderLive(width: number): string[] {
     const lines: string[] = [this.theme.fg("accent", this.theme.bold("Provider-native quota adapters")), ""];
+    const barWidth = Math.max(6, Math.min(16, Math.floor((width - 30) / 2)));
     for (const row of this.snapshot.live) {
       lines.push(this.theme.fg("accent", row.providerName));
       if (row.status === "ready" && row.snapshot) {
-        for (const window of row.snapshot.windows) lines.push(`  • ${formatWindow(window)}`);
+        for (const window of row.snapshot.windows) {
+          const base = formatWindow(window);
+          if (window.usedPercent !== undefined) {
+            const bar = renderProgressBar(this.theme, window.usedPercent, barWidth);
+            lines.push(`  • ${base} ${bar}`);
+          } else {
+            lines.push(`  • ${base}`);
+          }
+        }
         for (const metric of row.snapshot.metrics) lines.push(`  • ${metric.label}: ${metric.value}`);
         lines.push(`  • Source: ${row.snapshot.source}`);
       } else if (row.status === "unavailable") {
