@@ -35,6 +35,7 @@
       "./packages/auto-retry/src/index.ts",
       "./packages/claude-spinner/index.ts",
       "./packages/clipboard/index.ts",
+      "./packages/copymsgs.ts",
       "./packages/code-actions/index.ts",
       "./packages/context-control/extensions/index.ts",
       "./packages/execute-python/extensions",
