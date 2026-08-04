@@ -36,6 +36,7 @@
       "./packages/claude-spinner/index.ts",
       "./packages/clipboard/index.ts",
       "./packages/copymsgs.ts",
+      "./packages/shortcuts-help.ts",
       "./packages/code-actions/index.ts",
       "./packages/context-control/extensions/index.ts",
       "./packages/execute-python/extensions",
