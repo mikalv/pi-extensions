@@ -8,6 +8,9 @@ dist
 # Local Pi agent state
 .pi/
 
+# Bun (project uses npm package-lock.json; bun.lock is a local artifact)
+bun.lock
+
 # Inspiration clones — keep local only; do not ship in the repo
 inspirations/
 not_to_be_commited/
