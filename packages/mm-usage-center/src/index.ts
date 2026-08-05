@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import { collectTopTools, type ToolUsageSummary } from "./collector";
 import { openUsageDashboard, type DashboardSnapshot } from "./dashboard";
 import { buildGraphCsv, buildInsightsJson, buildTableCsv, exportFileName, parseExportDirSetting, resolveExportDir } from "./legacy/usage-export";
@@ -180,31 +182,64 @@ function buildGraphWidgetLines(data: UsageData, tab: TabName, metric: GraphMetri
   ];
 }
 
-function buildWidget(snapshot: DashboardSnapshot, data?: UsageData): string[] {
+// --- Widget box rendering (mirrors dashboard's panel helpers) ---------------------
+
+function widgetFill(theme: Theme, text: string, width: number): string {
+  return theme.bg("customMessageBg", truncateToWidth(text + " ".repeat(Math.max(0, width - visibleWidth(text))), width, ""));
+}
+
+function widgetBorder(theme: Theme, width: number, left: string, right: string): string {
+  return theme.fg("border", left) + theme.bg("customMessageBg", "─".repeat(Math.max(0, width))) + theme.fg("border", right);
+}
+
+function widgetRow(theme: Theme, text: string, width: number): string {
+  return theme.fg("border", "│") + widgetFill(theme, text, width) + theme.fg("border", "│");
+}
+
+function themeHeader(theme: Theme, text: string): string {
+  return theme.fg("accent", theme.bold(text));
+}
+
+function buildWidget(theme: Theme | undefined, snapshot: DashboardSnapshot, data?: UsageData): string[] {
   const liveReady = snapshot.live.filter((row) => row.status === "ready");
   const graphLines = data ? ["", ...buildGraphWidgetLines(data, "last30Days", "cost", "provider", true).slice(0, 15)] : [];
+  const t = (plain: string): string => (theme ? theme.fg("accent", theme.bold(plain)) : plain);
   return [
-    "Usage Center",
+    t("Usage Center"),
     renderPeriod("Today", snapshot.offline.periods.today),
     renderPeriod("Week", snapshot.offline.periods.thisWeek),
     renderPeriod("30d", snapshot.offline.periods.last30Days),
     renderPeriod("All", snapshot.offline.periods.allTime),
     "",
-    "Live quotas",
+    t("Live quotas"),
     ...renderLiveRows(liveReady.length > 0 ? liveReady : snapshot.live, 80),
     "",
-    "Top providers (30d)",
+    t("Top providers (30d)"),
     ...renderProviderRows(snapshot.offline.topProviders),
     "",
-    "Top tools",
+    t("Top tools"),
     ...renderToolRows(snapshot.tools),
     ...(snapshot.offline.insights.length > 0
-      ? ["", "Insights", ...snapshot.offline.insights.map((insight) => `  - ${insight.stat} ${insight.headline}`)]
+      ? ["", t("Insights"), ...snapshot.offline.insights.map((insight) => `  - ${insight.stat} ${insight.headline}`)]
       : []),
     ...graphLines,
     "",
     `Updated ${new Date(snapshot.generatedAt).toLocaleTimeString()}`,
   ];
+}
+
+// Wrap plain lines in a bordered, background-filled box matching the dashboard's style.
+// Returns a Component factory suitable for ctx.ui.setWidget(key, factory).
+function usageWidgetBox(lines: string[]): (tui: unknown, theme: Theme) => Component & { dispose?(): void } {
+  return (_tui, theme) => ({
+    render(width: number): string[] {
+      const inner = Math.max(20, width - 2);
+      const out = [widgetBorder(theme, inner, "╭", "╮")];
+      for (const line of lines) out.push(widgetRow(theme, line, inner));
+      out.push(widgetBorder(theme, inner, "╰", "╯"));
+      return out.map((l) => truncateToWidth(l, width, ""));
+    },
+  });
 }
 
 function buildStatusFromLive(live: LiveUsageState | undefined, offline: OfflineSnapshot): string {
@@ -364,7 +399,7 @@ export default function usageCenter(pi: ExtensionAPI): void {
         },
       });
     } else if (ctx.hasUI) {
-      ctx.ui.setWidget(WIDGET_KEY, buildWidget(snapshot, data));
+      ctx.ui.setWidget(WIDGET_KEY, usageWidgetBox(buildWidget(ctx.ui.theme, snapshot, data)));
     }
     ctx.ui.notify(ctx.mode === "tui" ? "Usage Center dashboard opened" : "Usage Center refreshed", "info");
   };
@@ -412,7 +447,7 @@ export default function usageCenter(pi: ExtensionAPI): void {
 
       if (action === "live") {
         const live = await getLive(ctx, true);
-        if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, ["Usage Center · Live quotas", ...renderLiveRows(live), "", `Updated ${new Date().toLocaleTimeString()}`]);
+        if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, usageWidgetBox([themeHeader(ctx.ui.theme, "Usage Center · Live quotas"), ...renderLiveRows(live), "", `Updated ${new Date().toLocaleTimeString()}`]));
         await refreshStatus(ctx, false);
         ctx.ui.notify("Usage Center live quotas refreshed", "info");
         return;
@@ -428,7 +463,7 @@ export default function usageCenter(pi: ExtensionAPI): void {
           ctx.ui.notify("No usage data available", "error");
           return;
         }
-        if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, buildGraphWidgetLines(data, tab, metric, groupBy, cumulative));
+        if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, usageWidgetBox(buildGraphWidgetLines(data, tab, metric, groupBy, cumulative).map((line, i) => i === 0 ? themeHeader(ctx.ui.theme, line) : line)));
         ctx.ui.notify(`Usage Center graph: ${tab} ${metric} ${groupBy}`, "info");
         return;
       }
