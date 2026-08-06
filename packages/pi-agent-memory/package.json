@@ -1,0 +1,20 @@
+{
+  "name": "@meeh/pi-agent-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Per-agent-type persistent file-based memory for pi subagents. Tools: read_agent_memory, save_agent_memory.",
+  "main": "index.ts",
+  "keywords": ["pi-package", "pi-extension", "memory", "subagent"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "license": "MIT"
+}
