@@ -14,3 +14,6 @@ bun.lock
 # Inspiration clones — keep local only; do not ship in the repo
 inspirations/
 not_to_be_commited/
+
+# pi-subagent-fleet runtime artifacts (worker transcripts, progress)
+.pi-subagents/
