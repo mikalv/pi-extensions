@@ -1,0 +1,20 @@
+{
+  "name": "@meeh/pi-task-notifications",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Structured <task-notification> protocol + JSONL audit log for subagent runs. Tools: inspect_run. Exports: formatTaskNotification, appendRunAudit, toRunRecord.",
+  "main": "index.ts",
+  "keywords": ["pi-package", "pi-extension", "subagent", "observability", "cluster"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "license": "MIT"
+}

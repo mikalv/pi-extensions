@@ -82,7 +82,10 @@
       "./packages/pi-image-drop/src/index.ts",
       "./packages/pi-grill-me/src/index.ts",
       "./packages/pi-chrome-devtools/src/index.ts",
-      "./packages/pi-github-pr/src/index.ts"
+      "./packages/pi-github-pr/src/index.ts",
+      "./packages/pi-agent-memory/index.ts",
+      "./packages/pi-task-notifications/index.ts",
+      "./packages/pi-subagent-fleet/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
