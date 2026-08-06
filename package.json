@@ -85,7 +85,8 @@
       "./packages/pi-github-pr/src/index.ts",
       "./packages/pi-agent-memory/index.ts",
       "./packages/pi-task-notifications/index.ts",
-      "./packages/pi-subagent-fleet/index.ts"
+      "./packages/pi-subagent-fleet/index.ts",
+      "./packages/pi-superagents/src/extension/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",
