@@ -11,6 +11,7 @@ import {
 	recall,
 	recallForInjection,
 	remember,
+	resolveCollection,
 } from "./memory.js";
 import {
 	assessTopic,
@@ -345,6 +346,48 @@ export default function mmMemory(pi: ExtensionAPI): void {
 	});
 
 	// Guidance always on; optional Prism hit inject when injectOnStart=true.
+	pi.registerTool({
+		name: "memory_forget",
+		label: "Forget (Prism LTM)",
+		description:
+			"Delete a memory from Prism LTM. Searches for the text first, then deletes the top hit. Use when a memory was stored in error or is no longer valid. Requires exact-ish text to identify the memory.",
+		parameters: Type.Object({
+			text: Type.String({ description: "Memory text to search for and delete" }),
+			scope: Type.Optional(StringEnum(["memories", "sessions"] as const)),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const config = loadMemoryConfig();
+			const collection = resolveCollection(config, params.scope ?? "memories");
+			const client = createClient(config);
+
+			const searchResult = await client.search(collection, {
+				query: params.text,
+				limit: 1,
+			});
+
+			const hits = normalizeRecallHits(searchResult, 1);
+			if (hits.length === 0) {
+				return {
+					content: [{ type: "text", text: `No memory found matching: "${params.text}"` }],
+					details: { success: false, error: "not_found" },
+			};
+			}
+
+			const hit = hits[0];
+			const deleted = await client.deleteDocument(collection, hit.id);
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Forgot: "${hit.text.slice(0, 120)}${hit.text.length > 120 ? "..." : ""}" (id: ${hit.id})`,
+					},
+			],
+				details: { success: true, id: hit.id, collection, deleted },
+			};
+		},
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		const parts = [event.systemPrompt, memoryStartupGuidance()];
 		try {

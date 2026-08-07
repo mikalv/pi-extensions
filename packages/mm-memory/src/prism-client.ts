@@ -40,6 +40,13 @@ export class PrismClient {
 		);
 	}
 
+	async deleteDocument(collection: string, id: string): Promise<unknown> {
+		return this.request(
+			"DELETE",
+			`/collections/${encodeURIComponent(collection)}/documents/${encodeURIComponent(id)}`,
+		);
+	}
+
 	private async request(method: string, path: string, body?: unknown): Promise<unknown> {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
