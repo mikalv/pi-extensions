@@ -46,8 +46,8 @@ export interface Config {
 }
 
 export const DEFAULTS: Config = {
-	observeAfterTokens: 10_000,
-	reflectAfterTokens: 20_000,
+	observeAfterTokens: 30_000,
+	reflectAfterTokens: 60_000,
 	reflectionContextMaxTokens: 10_000,
 	compactAfterTokens: 81_000,
 	compactAfterTokensMode: "calibrated",

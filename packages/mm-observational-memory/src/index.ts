@@ -49,6 +49,7 @@ export default function observationalMemory(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		runtime.reloadConfig(ctx.cwd);
 		ctx.ui.setStatus(OM_STATUS_KEY, "👁 om: —");
 	});
 }

@@ -42,6 +42,11 @@ export class Runtime {
 		this.configLoaded = true;
 	}
 
+	reloadConfig(cwd: string): void {
+		this.configLoaded = false;
+		this.ensureConfig(cwd);
+	}
+
 	async resolveModel(ctx: ResolveCtx): Promise<ResolveResult> {
 		let model = ctx.model;
 		if (this.config.model) {
