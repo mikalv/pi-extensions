@@ -46,6 +46,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				"recall ",
 				"remember ",
 				"sessions ",
+				"forget ",
 				"mine ",
 				"assess ",
 				"gap ",
@@ -81,7 +82,8 @@ export default function mmMemory(pi: ExtensionAPI): void {
 							"/memory inject on|off — session-start Prism inject (default off)",
 							"/memory checkpoint on|off — precompact LTM checkpoint (default on)",
 							"/memory sync on|off — ambient session sync to ltm-sessions (default on)",
-							"Tools: memory_remember, memory_recall, memory_sessions, memory_mine, memory_assess, memory_gap",
+							"/memory forget <text> — delete a memory by matching text",
+							"Tools: memory_remember, memory_recall, memory_sessions, memory_mine, memory_assess, memory_gap, memory_forget",
 						].join("\n"),
 						"info",
 					);
@@ -169,6 +171,30 @@ export default function mmMemory(pi: ExtensionAPI): void {
 					}
 					const path = recordKnowledgeGap(description);
 					ctx.ui.notify(`Knowledge gap recorded → ${path}`, "info");
+					return;
+				}
+
+				if (verb === "forget") {
+					const text = rest.join(" ").trim();
+					if (!text) {
+						ctx.ui.notify("Usage: /memory forget <text> — delete a memory by matching text", "error");
+						return;
+					}
+					const config = loadMemoryConfig();
+					const collection = resolveCollection(config, "memories");
+					const client = createClient(config);
+					const searchResult = await client.search(collection, { query: text, limit: 1 });
+					const hits = normalizeRecallHits(searchResult, 1);
+					if (hits.length === 0) {
+						ctx.ui.notify(`No memory found matching: "${text}"`, "warning");
+						return;
+					}
+					const hit = hits[0];
+					await client.deleteDocument(collection, hit.id);
+					ctx.ui.notify(
+						`Forgot: "${hit.text.slice(0, 120)}${hit.text.length > 120 ? "..." : ""}" (id: ${hit.id})`,
+						"info",
+					);
 					return;
 				}
 
