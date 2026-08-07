@@ -236,12 +236,12 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		name: "memory_recall",
 		label: "Recall (Prism LTM)",
 		description:
-			"Semantic recall from Prism LTM. Use scope=memories (default) for durable facts; scope=sessions for past conversation summaries (ambient sync + precompact checkpoints); scope=both when unsure. Optional filters: project (wing), kind (room), tags.",
+			"Semantic recall from Prism LTM. Searches across ALL projects by default; pass project only to narrow. Use scope=memories (default) for durable facts; scope=sessions for past conversation summaries (ambient sync + precompact checkpoints); scope=both when unsure. Optional filters: project (wing), kind (room), tags.",
 		parameters: Type.Object({
 			query: Type.String({ description: "Natural-language recall query" }),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 			scope: Type.Optional(StringEnum(["memories", "sessions", "both"] as const)),
-			project: Type.Optional(Type.String({ description: "Scope to project slug (wing)" })),
+			project: Type.Optional(Type.String({ description: "Optional: scope to project slug. Omit to search across all projects (recommended for infrastructure/cross-cutting topics)" })),
 			kind: Type.Optional(KIND_ENUM),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Require these tags" })),
 		}),
@@ -250,7 +250,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				cwd: ctx.cwd,
 				limit: params.limit,
 				scope: params.scope,
-				project: params.project ?? projectFromCwd(ctx.cwd),
+				project: params.project,
 				kind: params.kind,
 				tags: params.tags,
 			});
@@ -274,7 +274,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 				limit: params.limit ?? 10,
 				scope: "sessions",
 				kind: "session_summary",
-				project: params.project ?? projectFromCwd(ctx.cwd),
+				project: params.project,
 			});
 			return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
 		},
