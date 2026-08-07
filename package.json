@@ -48,6 +48,7 @@
       "./packages/mm-btw/src/index.ts",
       "./packages/mm-elixir/packages/extension/src/index.ts",
       "./packages/mm-lazy/dist/index.js",
+      "./packages/mm-sidebar-toggle/src/index.ts",
       "./packages/mm-memory/src/index.ts",
       "./packages/mm-observational-memory/src/index.ts",
       "./packages/mm-wiki/src/index.ts",

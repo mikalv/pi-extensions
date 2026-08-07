@@ -1,0 +1,9 @@
+{
+  "name": "mm-sidebar-toggle",
+  "version": "0.1.0",
+  "main": "./src/index.ts",
+  "pi": {
+    "name": "Sidebar Toggle",
+    "description": "Adds /sidebar on|off command and ctrl+\\ shortcut to toggle the session tree sidebar."
+  }
+}
