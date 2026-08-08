@@ -1,44 +1,174 @@
-# pi-adhd-tasks
+# /todo og /task — brukerveiledning
 
-**Title and purpose:** Markdown-first shared task system for Pi with `/todo` and `/task` flows. It manages session-scoped and project-scoped tasks, syncing them natively into Markdown files.
+> Formål: raskt fange opp, følge og ferdigstille arbeid i løpet av en
+> session eller i et prosjekt over tid.
 
-## Tools, Commands, and Hooks
+## Forskjellen
 
-- **Tools registered:**
-  - `adhd_tasks_list`: Lists all tasks for both `session` and `project` scopes.
-  - `adhd_tasks_add`: Appends a new task to a given scope.
-  - `adhd_tasks_update`: Updates an existing task (change status, edit text, move between scopes, reorder, or remove).
-- **Commands registered:**
-  - `/todo`: Manage session todos (supports `list`, `add`, `start`, `done`, `undo`, `edit`, `remove`, `move`, `top`, `up`, `down`).
-  - `/task`: Manage project tasks (supports identical subcommands to `/todo`).
-- **Event Hooks:**
-  - `session_start`: Initializes the session ID and resets task trackers.
-  - `user_message` / `assistant_message`: Detects external file modifications to the task lists and updates the TUI widget.
-  - `before_agent_start`: Injects an active task reminder into the agent's system prompt (e.g., current task and next steps) based on reminder intervals and recent file touches.
+| Kommando | Scope | Levde |
+|---|---|---|
+| `/todo` | **Session** — kun denne pi-sessionen | Når sessionen avsluttes |
+| `/task` | **Project** — delt i repoet | Persistert i repoet |
 
-## Key Files
+Bruk `/todo` umiddelbar work-in-progress, avbrutte grep, "kom tilbake til dette".
+Flytt til `/task` når arbeidet erverdighetsgrensen og andre også må se det.
 
-- `src/index.ts`: The main entry point. Registers tools, commands, UI widgets, event hooks, and manages the injection of task reminders into the system prompt.
-- `src/store.ts`: The data persistence layer. Reads and writes tasks to `.md` files, parses markdown checkboxes and `<!-- pi-task:id -->` markers, and handles operations like reordering, status updates, and moving tasks.
-- `src/types.ts`: Defines interfaces such as `MarkdownTask` and `TaskScope`.
+## Snarvei
 
-## How it works
+```
+/todo <tekst>
+/task <tekst>
+```
 
-The extension operates on a Markdown-first architecture where tasks are simply lines in a markdown file (e.g., `- [ ] My task <!-- pi-task:session-abc12345 -->`). It manages two distinct scopes: **session** (ephemeral tasks for the current work session) and **project** (long-term tasks for the whole repository).
+Bare skriv teksten uten subkommando → det blir automatisk en `add`.
 
-When interacting via slash commands or agent tools, it modifies the corresponding markdown files and re-syncs. It continuously monitors the files on disk, so if a user edits `.pi/tasks/project.md` manually, the extension detects the external change on the next message event and updates its internal snapshot.
+## Kommandoer
 
-A key feature is its cognitive scaffolding: during `before_agent_start`, it can prepend a `<system-reminder>` XML block to the agent's system prompt, reminding the LLM of its current active task or notifying it if the task list was just changed, reducing the chances of the agent wandering off track.
+### List
 
-## Configuration
+```
+/todo list
+/task list
+```
 
-The extension stores tasks in the `.pi/tasks/` directory inside the project root (`process.cwd()`):
-- Project tasks: `.pi/tasks/project.md`
-- Session tasks: `.pi/tasks/sessions/<sessionId>.md`
+Viser alle oppgaver med id, status, rekkefølge og tekst.
 
-It determines the session ID on `session_start` from the event payload, falling back to `process.env.PI_SESSION_ID` or `process.env.PI_SESSION`.
+### Add
 
-## Dependencies
+```
+/todo add Gjør X ferdig
+/task add Skriv test for Y
+```
 
-- **Peer Dependencies:** `@earendil-works/pi-coding-agent` (>= 0.80.0)
-- Relies on `@earendil-works/pi-ai` implicitly for type definitions (`Type.Object`, etc.).
+Eller med snarvei:
+
+```
+/todo Gjør X ferdig
+/task Skriv test for Y
+```
+
+### Done / Start / Undo
+
+```
+/todo done <id>
+/task done <id>
+/todo start <id>
+/task start <id>
+/todo undo <id>
+/task undo <id>
+```
+
+- `done` → ferdig
+- `start` → påbegynt (`in_progress`)
+- `undo` → tilbake til ventende (`pending`)
+
+### Edit
+
+```
+/todo edit <id> <ny tekst>
+/task edit <id> <ny tekst>
+```
+
+Eksempel:
+
+```
+/todo edit session-1 Oppdater dokumentasjon for /todo
+```
+
+### Remove
+
+```
+/todo remove <id>
+/task remove <id>
+```
+
+### Flytt mellom scope
+
+```
+/todo move <id> project
+/task move <id> session
+```
+
+Brukes når et session-todo blir viktig nok til å leve videre i prosjektet,
+eller når et prosjekt-task må gjøres umiddelbart i nåværende session.
+
+### Reorder
+
+```
+/todo top <id>
+/todo up <id>
+/todo down <id>
+/task top <id>
+/task up <id>
+/task down <id>
+```
+
+- `top` → flytt helt øverst
+- `up` / `down` → flytt en plass opp eller ned
+
+## ID-er
+
+Oppgaver får automatisk genererte ID-er:
+
+- Session: `session-1`, `session-2`, …
+- Project: `project-1`, `project-2`, …
+
+Du kan referere til en oppgave ved hjelp av disse ID-ene i alle kommandoer
+som tar `<id>`.
+
+## Filer på disk
+
+Oppgaver lagres som Markdown-filer, så du kan redigere dem direkte hvis du vil:
+
+- **Project:** `.pi/tasks/project.md`
+- **Session:** `.pi/tasks/sessions/<sessionId>.md`
+
+Format:
+
+```markdown
+- [ ] Oppgave tekst <!-- pi-task:session-1 -->
+- [x] Ferdig oppgave <!-- pi-task:project-2 -->
+```
+
+Extensionen overvåker filene og synkroniserer automatisk hvis du redigerer
+dem utenfor pi.
+
+## Påminnelser
+
+Extensionen injiserer automatisk en `<system-reminder>` i agentens system
+prompt når:
+
+- det finnes ventende session-todo
+- det finnes ventende prosjekt-tasks og ingen session-todo
+- todo-listen nettopp ble endret
+
+Påminnelsene opptrer jevnlig, ikke ved hver eneste melding.
+
+## Agent-verktøy
+
+Agenter har tilgang til disse verktøyene direkte:
+
+- `adhd_tasks_list` — hent nåværende todo-liste eller prosjekt-tasks
+- `adhd_tasks_add` — legg til oppgave
+- `adhd_tasks_update` — oppdater status, tekst, flytt, reorder eller fjern
+
+## Eksempel flyt
+
+```
+/todo Skriv brukerhistorie for innlogging
+/todo start session-1
+/todo add Lag tilbakemelding til reviewer
+/todo down session-2
+/todo done session-1
+/todo move session-3 project
+/task list
+```
+
+## Tips
+
+- Bruk `/todo` for alt du kan gjøre på under 5 minutter.
+- Bruk `/task` for arbeid som må leve videre etter denne sessionen.
+- Hvis du er i en session og ser `/todo`-listen er tom, men prosjektet har
+  tasks, så kan extensionen automatisk vise deg prosjekt-tasks på nytt.
+- Rediger filene i `.pi/tasks/` direkte hvis du vil strukturere med
+  overskrifter eller gruppering — extensionen synkroniserer likevel.
