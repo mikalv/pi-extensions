@@ -82,6 +82,7 @@ export const THINKING_LEVEL_VALUES: readonly ModelThinkingLevel[] = ["off", "min
 
 const SETTINGS_KEYS = ["mm-observational-memory", "observational-memory"] as const;
 const PASSIVE_ENV = "PI_OBSERVATIONAL_MEMORY_PASSIVE";
+const UTILITY_MODELS_PATH = join(getAgentDir(), "utility-models.json");
 
 function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return Number.isInteger(value) && typeof value === "number" && value > 0 ? value : undefined;
@@ -185,12 +186,14 @@ function readNamespacedConfig(path: string): Partial<Config> {
 export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): Config {
 	const globalPath = join(getAgentDir(), "settings.json");
 	const projectPath = join(cwd, ".pi", "settings.json");
+	const utilityModelsConfig = readNamespacedConfig(UTILITY_MODELS_PATH);
 	const globalConfig = readNamespacedConfig(globalPath);
 	const projectConfig = readNamespacedConfig(projectPath);
 	const envConfig = readEnvConfig(env);
 	const merged = {
 		...DEFAULTS,
 		observationsPoolTargetTokens: undefined,
+		...utilityModelsConfig,
 		...globalConfig,
 		...projectConfig,
 		...envConfig,
