@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { MarkdownTask, MarkdownTaskStatus, TaskScope } from "./types.ts";
 
-const TASKS_DIR = join(process.cwd(), ".pi", "tasks");
+export const TASKS_DIR = join(process.cwd(), ".pi", "tasks");
 const SESSIONS_DIR = join(TASKS_DIR, "sessions");
 const PROJECT_PATH = join(TASKS_DIR, "project.md");
 
