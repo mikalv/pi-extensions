@@ -86,6 +86,7 @@
       "./packages/pi-github-pr/src/index.ts",
       "./packages/pi-agent-memory/index.ts",
       "./packages/pi-task-notifications/index.ts",
+      "./packages/pi-model-restriction/src/index.ts",
       "./packages/pi-superagents/src/extension/index.ts"
     ],
     "skills": [
