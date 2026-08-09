@@ -115,4 +115,23 @@ export default function piModelRestriction(pi: ExtensionAPI) {
   pi.on("model_select", async (_event, ctx) => {
     await enforceRestriction(ctx, "model select");
   });
+
+  // HARD FIREWALL GATE: Intercept before request hits the wire
+  pi.on("before_provider_request", async (event: any, ctx: ExtensionContext) => {
+    const config = loadRestrictedConfig(ctx.cwd);
+    if (!config) return;
+
+    const requestModel = event.model ?? ctx.model;
+    if (!matchesModel(requestModel, config.allowedModels, config.allowedProviders)) {
+      const m = requestModel as { provider?: string; id?: string };
+      const modelName = `${m.provider ?? "unknown"}/${m.id ?? "unknown"}`;
+      const reason = config.reason ?? `Project restrictions enforced by ${CONFIG_FILENAME}`;
+      
+      if (ctx.hasUI && ctx.ui) {
+        ctx.ui.notify(`[Restricted FIREWALL] BLOCKED request to disallowed model "${modelName}". ${reason}`, "error");
+      }
+
+      throw new Error(`[Restricted FIREWALL] Request to model "${modelName}" blocked by .restricted.json policy. ${reason}`);
+    }
+  });
 }
