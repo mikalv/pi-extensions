@@ -61,12 +61,12 @@ function parseModelRef(ref: string): { provider: string; id: string } | null {
 }
 
 export default function piModelRestriction(pi: ExtensionAPI) {
-  async function enforceRestriction(ctx: ExtensionContext, source: string) {
+  async function enforceRestriction(ctx: ExtensionContext, source: string): Promise<boolean> {
     const config = loadRestrictedConfig(ctx.cwd);
-    if (!config) return;
+    if (!config) return true;
 
     if (matchesModel(ctx.model, config.allowedModels, config.allowedProviders)) {
-      return;
+      return true;
     }
 
     const reason = config.reason ?? `Project restrictions enforced by ${CONFIG_FILENAME}`;
@@ -91,7 +91,7 @@ export default function piModelRestriction(pi: ExtensionAPI) {
             if (ctx.hasUI && ctx.ui) {
               ctx.ui.notify(`[Restricted] Automatically switched session model to "${targetRef}"`, "info");
             }
-            return;
+            return true;
           } catch (err) {
             console.error("[pi-model-restriction] Failed to switch model:", err);
           }
@@ -102,22 +102,43 @@ export default function piModelRestriction(pi: ExtensionAPI) {
     if (ctx.hasUI && ctx.ui) {
       ctx.ui.notify(`[Restricted] Warning: Current model is disallowed, and no valid fallback model could be applied.`, "error");
     }
+
+    return false;
   }
 
   pi.on("session_start", async (_event, ctx) => {
     await enforceRestriction(ctx, "session start");
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
-    await enforceRestriction(ctx, "agent start");
-  });
-
   pi.on("model_select", async (_event, ctx) => {
     await enforceRestriction(ctx, "model select");
   });
 
-  // HARD FIREWALL GATE: Intercept before request hits the wire
-  pi.on("before_provider_request", async (event: any, ctx: ExtensionContext) => {
+  // Turn-level hard stop: Throws error BEFORE turn starts if model is disallowed
+  pi.on("before_agent_start", async (_event, ctx) => {
+    const ok = await enforceRestriction(ctx, "agent start");
+    if (!ok) {
+      const config = loadRestrictedConfig(ctx.cwd);
+      const reason = config?.reason ?? "Disallowed model policy.";
+      throw new Error(`[Restricted POLICY BLOCK] Agent run blocked. Model "${(ctx.model as any)?.provider}/${(ctx.model as any)?.id}" is not allowed in this repository. ${reason}`);
+    }
+  });
+
+  // Context hook: Prune/wipe messages if model is disallowed
+  pi.on("context", async (event, ctx) => {
+    const config = loadRestrictedConfig(ctx.cwd);
+    if (!config) return;
+
+    if (!matchesModel(ctx.model, config.allowedModels, config.allowedProviders)) {
+      if (ctx.hasUI && ctx.ui) {
+        ctx.ui.notify(`[Restricted FIREWALL] Wiping context payload to prevent disallowed API request.`, "error");
+      }
+      return { messages: [] };
+    }
+  });
+
+  // Payload neutralization hook: Completely strip/break outgoing payload as a fallback
+  pi.on("before_provider_request", (event: any, ctx: ExtensionContext) => {
     const config = loadRestrictedConfig(ctx.cwd);
     if (!config) return;
 
@@ -128,10 +149,15 @@ export default function piModelRestriction(pi: ExtensionAPI) {
       const reason = config.reason ?? `Project restrictions enforced by ${CONFIG_FILENAME}`;
       
       if (ctx.hasUI && ctx.ui) {
-        ctx.ui.notify(`[Restricted FIREWALL] BLOCKED request to disallowed model "${modelName}". ${reason}`, "error");
+        ctx.ui.notify(`[Restricted FIREWALL] Neutralizing outgoing payload to "${modelName}". ${reason}`, "error");
       }
 
-      throw new Error(`[Restricted FIREWALL] Request to model "${modelName}" blocked by .restricted.json policy. ${reason}`);
+      // Return a completely cleared/invalid payload so zero real prompt data leaves the machine
+      return {
+        messages: [{ role: "user", content: "BLOCKED_BY_RESTRICTED_MODEL_POLICY" }],
+        max_tokens: 1,
+        temperature: 0,
+      };
     }
   });
 }
