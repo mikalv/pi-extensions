@@ -79,7 +79,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 							"/memory mine [path] — ingest files into Prism (default: cwd)",
 							"/memory assess <topic> — coverage/confidence over wiki + Prism",
 							"/memory gap <description> — record a known knowledge gap",
-							"/memory inject on|off — session-start Prism inject (default off)",
+							"/memory inject on|off — session-start Prism inject (default on)",
 							"/memory checkpoint on|off — precompact LTM checkpoint (default on)",
 							"/memory sync on|off — ambient session sync to ltm-sessions (default on)",
 							"/memory forget <text> — delete a memory by matching text",

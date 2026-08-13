@@ -12,7 +12,7 @@ export interface MemoryConfig {
 	connection: PrismConnection;
 	memoriesCollection: string;
 	sessionsCollection: string;
-	/** When true, inject top-N Prism recall at session/agent start. Default false (OM cache-friendly). */
+	/** When true, inject top-N Prism recall at session/agent start. Default true (pre-flight memory recall). */
 	injectOnStart: boolean;
 	injectLimit: number;
 	injectCollection: "memories" | "sessions" | "both";
@@ -113,7 +113,7 @@ export function loadMemoryConfig(): MemoryConfig {
 	const connection = loadPrismConnection();
 	let memoriesCollection = LTM_MEMORIES_COLLECTION;
 	let sessionsCollection = LTM_SESSIONS_COLLECTION;
-	let injectOnStart = false;
+	let injectOnStart = true;
 	let injectLimit = 5;
 	let injectCollection: MemoryConfig["injectCollection"] = "memories";
 	let checkpointOnCompact = true;

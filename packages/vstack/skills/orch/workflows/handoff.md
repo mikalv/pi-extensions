@@ -9,13 +9,16 @@ Launch one or more independent work item sessions. This is launch-only.
 | `tracker` | `linear` or `github` |
 | `items` | Linear IDs or GitHub issue numbers |
 | `repo` | Required for GitHub if `gh repo view` cannot resolve |
-| `harness` | `claude`, `codex`, `codex-app`, `opencode`, or `pi`; optional when Codex app thread tools are exposed |
+| `harness` | `claude`, `codex`, `opencode`, or `pi`; `codex-app` is handled separately via `codex_app` thread tools |
+| `--lane` | Optional harness account selection (`auto`, `auto:<harness>`, or config dir) |
+| `--tmux` / `--ghostty` / `--cmd` | Terminal mode overrides (default: GUI terminal) |
 
 ## 0. Resolve Harness
 
 1. If the user explicitly selected a harness, use it.
 2. Else if multiple items were provided and `codex_app.create_thread` is exposed, set `harness=codex-app`.
 3. Else resolve the normal terminal harness for the current environment before launch.
+4. Resolve `--lane` (if provided) before creating worktrees to avoid partial fleet launches.
 
 ## 1. Confirm Launch
 
@@ -83,11 +86,13 @@ If the `codex_app` thread tools are not exposed, stop the `codex-app` handoff an
 
 ```bash
 # Linear
-.agents/skills/orch/scripts/open-terminal --tracker linear --harness [HARNESS] [ISSUE_IDS]
+.agents/skills/orch/scripts/open-terminal --tracker linear --harness [HARNESS] [ISSUE_IDS] [options]
 
 # GitHub
-.agents/skills/orch/scripts/open-terminal --tracker github --repo [OWNER/REPO] --harness [HARNESS] [NUMBERS]
+.agents/skills/orch/scripts/open-terminal --tracker github --repo [OWNER/REPO] --harness [HARNESS] [NUMBERS] [options]
 ```
+
+Options: `--lane <spec>` (harness account), `--lane-max-pct N` (threshold, default 90), `--tmux`, `--ghostty`, `--cmd "..."` (custom command template). Default terminal mode is GUI (Ghostty → `xdg-terminal-exec` → fallback).
 
 ## 3. Return
 
@@ -101,5 +106,6 @@ If the `codex_app` thread tools are not exposed, stop the `codex-app` handoff an
 | Mode | [codex-app|terminal|unavailable] |
 | Threads | [THREAD_IDS or none] |
 | Worktrees | [WORKTREE_PATHS or none] |
+| Lane | [LANE_ENV or none] |
 | Monitoring | none |
 </output_format>
