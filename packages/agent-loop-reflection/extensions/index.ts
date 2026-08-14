@@ -14,13 +14,13 @@ export type AgentLoopReflectionConfig = {
 };
 
 const DEFAULT_REMINDER_TEXT = [
-  "Pause before continuing and do an agent-loop reflection:",
+  "Pause and do a quick agent loop check-in:",
   "",
-  "1. Return to the user's original goal: does what you're doing still serve that goal directly?",
-  "2. Check current evidence and direction: what is verified, what is still a guess, and is the next step still the smallest useful action?",
-  "3. Decide whether you are stuck, uncertain, or possibly off track: if so, call `advisor` for guidance before continuing.",
+  "1. Go back to the user's original goal — is what you're doing right now still directly serving that goal?",
+  "2. Check your current evidence and direction — what has been verified, what is just a guess, and is the next step still the smallest effective action?",
+  "3. Judge whether you're stuck, uncertain, or possibly off track — if so, seek advice before continuing.",
   "",
-  "If everything is still clear, state your reasoning in one or two sentences, then continue.",
+  "CRITICAL FOR CONTINUITY: If everything is clear, state your assessment in 1-2 sentences AND IMMEDIATELY invoke your next planned tool call in the same turn so execution continues without interruption.",
 ].join("\n");
 
 const DEFAULT_CONFIG: AgentLoopReflectionConfig = {
