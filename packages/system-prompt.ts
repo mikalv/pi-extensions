@@ -45,10 +45,20 @@ export default function (pi: ExtensionAPI) {
       ];
 
       const mode = args?.trim().toLowerCase();
-      if (mode === "print" || mode === "dump" || mode === "raw") {
+      if (!mode || mode === "print" || mode === "dump" || mode === "raw") {
         console.log(allLines.join("\n"));
         if (ctx.hasUI) {
           ctx.ui.notify(`Printed system prompt (${lineCount} lines, ${charCount.toLocaleString()} chars) directly to terminal output.`, "info");
+        }
+        return;
+      }
+
+      if (mode === "copy" || mode === "clip") {
+        const fullText = allLines.join("\n");
+        const base64 = Buffer.from(fullText, "utf-8").toString("base64");
+        process.stdout.write(`\x1b]52;c;${base64}\x07`);
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Copied system prompt (${lineCount} lines) to clipboard via OSC 52.`, "info");
         }
         return;
       }
@@ -268,8 +278,20 @@ class SystemPromptView {
       this.copyToClipboard();
       return;
     }
-    if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+    if (
+      matchesKey(data, "escape") ||
+      matchesKey(data, "q") ||
+      matchesKey(data, "return") ||
+      matchesKey(data, "enter") ||
+      matchesKey(data, "ctrl+c") ||
+      data === "q" ||
+      data === "Q" ||
+      data === "\x1b" ||
+      data === "\r" ||
+      data === "\n"
+    ) {
       this.done();
+      return;
     }
   }
 
