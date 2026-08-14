@@ -13,8 +13,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("system-prompt", {
-    description: "Show the current system prompt and tool definitions",
-    handler: async (_args, ctx) => {
+    description: "Show the current system prompt and tool definitions (use /system-prompt print to dump directly to terminal)",
+    handler: async (args, ctx) => {
       await ctx.waitForIdle();
 
       let prompt = ctx.getSystemPrompt();
@@ -43,6 +43,15 @@ export default function (pi: ExtensionAPI) {
         "",
         ...toolLines,
       ];
+
+      const mode = args?.trim().toLowerCase();
+      if (mode === "print" || mode === "dump" || mode === "raw") {
+        console.log(allLines.join("\n"));
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Printed system prompt (${lineCount} lines, ${charCount.toLocaleString()} chars) directly to terminal output.`, "info");
+        }
+        return;
+      }
 
       const totalLineCount = allLines.length;
 
