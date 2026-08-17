@@ -19,7 +19,7 @@ import {
 	recordKnowledgeGap,
 } from "./metacognition.js";
 import { minePath } from "./mine.js";
-import { PrismApiError, PrismClient, truncateJson } from "./prism-client.js";
+import { escapePrismQuery, PrismApiError, PrismClient, truncateJson } from "./prism-client.js";
 
 function formatError(error: unknown): string {
 	if (error instanceof PrismApiError) return error.message;
@@ -183,7 +183,14 @@ export default function mmMemory(pi: ExtensionAPI): void {
 					const config = loadMemoryConfig();
 					const collection = resolveCollection(config, "memories");
 					const client = new PrismClient(config.connection);
-					const searchResult = await client.search(collection, { query: text, limit: 1 });
+					const escapedQuery = escapePrismQuery(text);
+					let searchResult: unknown;
+					try {
+						searchResult = await client.search(collection, { query: escapedQuery, limit: 1 });
+					} catch (searchError) {
+						ctx.ui.notify(`Search failed for "${text}": ${formatError(searchError)}`, "error");
+						return;
+					}
 					const hits = normalizeRecallHits(searchResult, 1);
 					if (hits.length === 0) {
 						ctx.ui.notify(`No memory found matching: "${text}"`, "warning");
@@ -385,32 +392,57 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			const config = loadMemoryConfig();
 			const collection = resolveCollection(config, params.scope ?? "memories");
 			const client = new PrismClient(config.connection);
+			const escapedQuery = escapePrismQuery(params.text);
 
-			const searchResult = await client.search(collection, {
-				query: params.text,
-				limit: 1,
-			});
+			let searchResult: unknown;
+			try {
+				searchResult = await client.search(collection, {
+					query: escapedQuery,
+					limit: 1,
+				});
+			} catch (searchError) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Search error while finding memory to delete: ${formatError(searchError)}`,
+						},
+					],
+					details: { success: false, error: formatError(searchError) },
+				};
+			}
 
 			const hits = normalizeRecallHits(searchResult, 1);
 			if (hits.length === 0) {
 				return {
 					content: [{ type: "text", text: `No memory found matching: "${params.text}"` }],
 					details: { success: false, error: "not_found" },
-			};
+				};
 			}
 
 			const hit = hits[0];
-			const deleted = await client.deleteDocument(collection, hit.id);
-
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Forgot: "${hit.text.slice(0, 120)}${hit.text.length > 120 ? "..." : ""}" (id: ${hit.id})`,
-					},
-			],
-				details: { success: true, id: hit.id, collection, deleted },
-			};
+			try {
+				const deleted = await client.deleteDocument(collection, hit.id);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Forgot: "${hit.text.slice(0, 120)}${hit.text.length > 120 ? "..." : ""}" (id: ${hit.id})`,
+						},
+					],
+					details: { success: true, id: hit.id, collection, deleted },
+				};
+			} catch (deleteError) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Failed to delete memory (id: ${hit.id}): ${formatError(deleteError)}`,
+						},
+					],
+					details: { success: false, error: formatError(deleteError), id: hit.id },
+				};
+			}
 		},
 	});
 

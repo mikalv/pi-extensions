@@ -18,6 +18,12 @@ export class PrismApiError extends Error {
 	}
 }
 
+export function escapePrismQuery(text: string): string {
+	// Tantivy / Lucene special query syntax characters
+	const special = /[+\-=&|><!(){}[\]^"~*?:\\\/]/g;
+	return text.replace(special, "\\$&");
+}
+
 export class PrismClient {
 	constructor(readonly config: PrismConnection) {}
 
