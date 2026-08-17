@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { installAmbientSync, memoryStartupGuidance } from "./ambient.js";
 import { checkpointBeforeCompact } from "./checkpoint.js";
 import { formatMemoryStatus, loadMemoryConfig, saveMemoryConfig } from "./config.js";
-import { projectFromCwd, type MemoryKind } from "./documents.js";
+import { projectFromCwd, normalizeRecallHits, type MemoryKind } from "./documents.js";
 import {
 	formatRecallResult,
 	formatRememberResult,
@@ -182,7 +182,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 					}
 					const config = loadMemoryConfig();
 					const collection = resolveCollection(config, "memories");
-					const client = createClient(config);
+					const client = new PrismClient(config.connection);
 					const searchResult = await client.search(collection, { query: text, limit: 1 });
 					const hits = normalizeRecallHits(searchResult, 1);
 					if (hits.length === 0) {
@@ -384,7 +384,7 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const config = loadMemoryConfig();
 			const collection = resolveCollection(config, params.scope ?? "memories");
-			const client = createClient(config);
+			const client = new PrismClient(config.connection);
 
 			const searchResult = await client.search(collection, {
 				query: params.text,
