@@ -1,0 +1,21 @@
+allowBuilds:
+  "@google/genai": false
+  koffi: false
+  protobufjs: false
+  # sharp ships native libvips binaries; allow its install script so the
+  # optional image optimizer can load at runtime.
+  sharp: true
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@latest
+  vitest: npm:@voidzero-dev/vite-plus-test@latest
+  vite-plus: latest
+overrides:
+  vite: "catalog:"
+  vitest: "catalog:"
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: "*"
+    vitest: "*"
