@@ -142,7 +142,7 @@ export async function handleSetupCommand(
     packageJsonPath: options?.packageJsonPath,
   });
   const allPaths = catalog.map((c) => c.path);
-  const currentSettings = await readProjectSettings(cwd);
+  const currentSettings = await readProjectSettings(cwd, allPaths);
 
   // 1. Help flag
   if (trimmed === "--help" || trimmed === "-h" || trimmed === "help") {

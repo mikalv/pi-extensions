@@ -92,9 +92,12 @@ export function resolvePiExtensionsRepo(options?: {
 /**
  * Read and parse .pi/settings.json from a project directory.
  * If the file is missing or corrupt, returns a clean default ProjectSettingsState.
+ * If no explicit `extensions: [...]` filter is defined on the repo package source,
+ * activeExtensions defaults to ALL available catalog extensions (or empty if none resolved yet).
  */
 export async function readProjectSettings(
   cwd: string = process.cwd(),
+  availableExtensionPaths?: string[],
 ): Promise<ProjectSettingsState> {
   const settingsPath = join(cwd, ".pi", "settings.json");
 
@@ -116,6 +119,7 @@ export async function readProjectSettings(
       ? rawSettings.packages
       : [];
 
+    let hasExplicitFilter = false;
     const activeExtensions: string[] = [];
 
     for (const pkg of packages) {
@@ -124,12 +128,19 @@ export async function readProjectSettings(
         typeof pkg === "object" &&
         Array.isArray((pkg as ProjectPackageConfig).extensions)
       ) {
+        hasExplicitFilter = true;
         for (const ext of (pkg as ProjectPackageConfig).extensions!) {
           if (typeof ext === "string" && !activeExtensions.includes(ext)) {
             activeExtensions.push(ext);
           }
         }
       }
+    }
+
+    // If no package source has an explicit extensions: [...] filter,
+    // all extensions are active by default (inherited unfiltered).
+    if (!hasExplicitFilter && availableExtensionPaths && availableExtensionPaths.length > 0) {
+      activeExtensions.push(...availableExtensionPaths);
     }
 
     const validated = validateProjectSettingsState({
@@ -152,7 +163,11 @@ export async function readProjectSettings(
       }
     );
   } catch {
-    return createDefaultProjectSettingsState(cwd);
+    const state = createDefaultProjectSettingsState(cwd);
+    if (availableExtensionPaths && availableExtensionPaths.length > 0) {
+      state.activeExtensions = [...availableExtensionPaths];
+    }
+    return state;
   }
 }
 
