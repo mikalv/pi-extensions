@@ -31,12 +31,15 @@ describe("pi-agent-core types & validation", () => {
       expect(DEFAULT_SUBAGENT_TIMEOUT_MS).toBe(300_000);
     });
 
-    it("supports all 4 runtime types", () => {
+    it("supports all supported runtime types", () => {
       expect(SUPPORTED_RUNTIMES).toEqual([
         "pi-inprocess",
         "pi-subprocess",
         "claude",
         "codex",
+        "gemini",
+        "copilot",
+        "custom",
       ]);
     });
 

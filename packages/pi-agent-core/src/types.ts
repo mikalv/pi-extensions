@@ -13,6 +13,9 @@ export const SUPPORTED_RUNTIMES = [
   "pi-subprocess",
   "claude",
   "codex",
+  "gemini",
+  "copilot",
+  "custom",
 ] as const;
 
 export type RuntimeType = (typeof SUPPORTED_RUNTIMES)[number];
