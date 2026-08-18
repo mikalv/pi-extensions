@@ -1,0 +1,27 @@
+{
+  "name": "@meeh/pi-project-setup",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Interactive TUI wizard (/setup-pi) for setting up and configuring project-local .pi/settings.json extension profiles, presets, and devtools.",
+  "main": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "setup",
+    "project-settings",
+    "extension-manager",
+    "tui"
+  ],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "license": "MIT"
+}
