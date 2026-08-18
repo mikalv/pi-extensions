@@ -216,8 +216,8 @@ describe("Extension Entrypoint, Commands & CLI Integration (`pi-project-setup`)"
         cwd: tempDir,
       });
 
-      expect(output).toContain("Applied \"Minimal / Core\"");
-      expect(notifications.some((n) => n.includes("Minimal / Core"))).toBe(true);
+      expect(output).toContain("Applied \"Ultra Minimal\"");
+      expect(notifications.some((n) => n.includes("Ultra Minimal"))).toBe(true);
 
       const state = await readProjectSettings(tempDir);
       expect(state.exists).toBe(true);

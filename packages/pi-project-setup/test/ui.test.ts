@@ -276,7 +276,7 @@ describe("Interactive TUI Multi-Select Component (`pi-project-setup/ui`)", () =>
     });
   });
 
-  describe("Preset Shortcuts (`1-5`)", () => {
+  describe("Preset Shortcuts (`1-6`)", () => {
     it("applies preset profiles via number keys", () => {
       const items = createSampleItems();
       const dialog = new SetupDialogComponent({
@@ -284,15 +284,22 @@ describe("Interactive TUI Multi-Select Component (`pi-project-setup/ui`)", () =>
         activeExtensions: [],
       });
 
-      // 1: Minimal preset
+      // 1: Baseline preset
       dialog.handleInput("1");
+      const selectedBaseline = dialog.getSelectedExtensions();
+      expect(selectedBaseline).toContain("./packages/mm-memory/src/index.ts");
+      expect(selectedBaseline).toContain("./packages/pi-agent-core/src/index.ts");
+      expect(dialog.getStatusMessage()).toContain("Baseline");
+
+      // 2: Minimal preset
+      dialog.handleInput("2");
       const selectedMinimal = dialog.getSelectedExtensions();
       expect(selectedMinimal).toContain("./packages/pi-agent-core/src/index.ts");
       expect(selectedMinimal).toContain("./packages/clipboard/index.ts");
       expect(dialog.getStatusMessage()).toContain("Minimal");
 
-      // 5: All extensions preset
-      dialog.handleInput("5");
+      // 6: All extensions preset
+      dialog.handleInput("6");
       expect(dialog.getSelectedExtensions().length).toBe(items.length);
       expect(dialog.getStatusMessage()).toContain("All");
     });

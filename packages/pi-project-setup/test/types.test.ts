@@ -43,6 +43,7 @@ describe("pi-project-setup types & validation", () => {
 
     it("exports built-in preset IDs", () => {
       expect(BUILTIN_PRESET_IDS).toEqual([
+        "baseline",
         "minimal",
         "web",
         "backend",
@@ -53,6 +54,7 @@ describe("pi-project-setup types & validation", () => {
 
     it("exports complete default presets with valid configurations", () => {
       expect(Object.keys(DEFAULT_PRESETS)).toEqual([
+        "baseline",
         "minimal",
         "web",
         "backend",

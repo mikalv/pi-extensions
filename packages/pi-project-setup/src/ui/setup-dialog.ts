@@ -357,9 +357,9 @@ export class SetupDialogComponent implements Component {
       return;
     }
 
-    // Preset shortcuts 1-5
-    if (data >= "1" && data <= "5") {
-      const presetIds = ["minimal", "web", "backend", "offline", "all"];
+    // Preset shortcuts 1-6
+    if (data >= "1" && data <= "6") {
+      const presetIds = ["baseline", "minimal", "web", "backend", "offline", "all"];
       const index = Number.parseInt(data, 10) - 1;
       if (presetIds[index]) {
         this.applyPreset(presetIds[index]);
@@ -603,8 +603,8 @@ export class SetupDialogComponent implements Component {
     // 7. Footer Shortcuts Help
     const footerText =
       targetWidth >= 90
-        ? " [Space] Toggle • [1-5] Preset • [a] All • [Tab] Tab • [/] Search • [Enter] Save • [Esc] Cancel"
-        : " [Space] Toggle • [1-5] Preset • [Enter] Save • [Esc] Cancel";
+        ? " [Space] Toggle • [1-6] Preset • [a] All • [Tab] Tab • [/] Search • [Enter] Save • [Esc] Cancel"
+        : " [Space] Toggle • [1-6] Preset • [Enter] Save • [Esc] Cancel";
 
     lines.push(this.style("dim", footerText));
 

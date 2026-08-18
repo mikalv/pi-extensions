@@ -79,6 +79,7 @@ export interface ExtensionItem {
  * Preset Profiles
  */
 export const BUILTIN_PRESET_IDS = [
+  "baseline",
   "minimal",
   "web",
   "backend",
@@ -97,10 +98,31 @@ export interface PresetProfile {
 }
 
 export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
+  baseline: {
+    id: "baseline",
+    name: "Core Baseline (Recommended)",
+    description: "Memory stack (Prism LTM + Wiki), agent control plane, paster, ADHD tasks, shortcuts",
+    icon: "💎",
+    extensions: [
+      "./packages/mm-memory/src/index.ts",
+      "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-context/src/index.ts",
+      "./packages/pi-agent-core/src/index.ts",
+      "./packages/pi-paster/src/index.ts",
+      "./packages/pi-adhd-tasks/src/index.ts",
+      "./packages/clipboard/index.ts",
+      "./packages/copymsgs.ts",
+      "./packages/pi-input-shortcuts/src/index.ts",
+      "./packages/pi-project-setup/src/index.ts",
+      "./packages/notify/extensions/index.ts",
+      "./packages/auto-retry/src/index.ts",
+      "./packages/system-prompt.ts",
+    ],
+  },
   minimal: {
     id: "minimal",
-    name: "Minimal / Core",
-    description: "Bare essentials: Unified subagents, clipboard, notify, and auto-retry",
+    name: "Ultra Minimal",
+    description: "Bare essentials: Agent control plane, clipboard, notify, auto-retry",
     icon: "⚡",
     extensions: [
       "./packages/pi-agent-core/src/index.ts",
@@ -113,34 +135,37 @@ export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
   web: {
     id: "web",
     name: "Full Stack / Web",
-    description: "Agent core, memory, UI widgets, image drop, and devtools",
+    description: "Core baseline + UI widgets, web tools, atelier sidebar, footer",
     icon: "🌐",
     extensions: [
-      "./packages/pi-agent-core/src/index.ts",
       "./packages/mm-memory/src/index.ts",
+      "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-agent-core/src/index.ts",
+      "./packages/pi-paster/src/index.ts",
       "./packages/clipboard/index.ts",
-      "./packages/notify/extensions/index.ts",
-      "./packages/auto-retry/src/index.ts",
       "./packages/files-widget/index.ts",
-      "./packages/pi-image-drop/src/index.ts",
       "./packages/pi-atelier/extensions/index.ts",
       "./packages/powerline-footer/index.ts",
+      "./packages/notify/extensions/index.ts",
+      "./packages/auto-retry/src/index.ts",
       "./packages/system-prompt.ts",
     ],
   },
   backend: {
     id: "backend",
     name: "Backend & Systems",
-    description: "Subagents, LTM, observational memory, Python/Elixir runners, scheduler, worktree",
+    description: "Core baseline + observational memory, Python runner, scheduler, worktrees, governance",
     icon: "⚙️",
     extensions: [
-      "./packages/pi-agent-core/src/index.ts",
       "./packages/mm-memory/src/index.ts",
+      "./packages/mm-wiki/src/index.ts",
       "./packages/mm-observational-memory/src/index.ts",
+      "./packages/pi-agent-core/src/index.ts",
       "./packages/execute-python/extensions",
       "./packages/scheduler/index.ts",
       "./packages/pi-worktree/src/index.ts",
       "./packages/pi-adhd-tasks/src/index.ts",
+      "./packages/pi-paster/src/index.ts",
       "./packages/clipboard/index.ts",
       "./packages/notify/extensions/index.ts",
       "./packages/pi-model-restriction/src/index.ts",
@@ -150,11 +175,12 @@ export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
   offline: {
     id: "offline",
     name: "Offline & Private",
-    description: "Strict local-only models, local Prism LTM, model restriction gate, zero network leakage",
+    description: "Strict local-only models, local Prism LTM, wiki, model restriction gate, zero network leakage",
     icon: "🔒",
     extensions: [
-      "./packages/pi-agent-core/src/index.ts",
       "./packages/mm-memory/src/index.ts",
+      "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-agent-core/src/index.ts",
       "./packages/pi-model-restriction/src/index.ts",
       "./packages/clipboard/index.ts",
       "./packages/pi-input-shortcuts/src/index.ts",

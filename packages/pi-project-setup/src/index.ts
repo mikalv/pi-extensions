@@ -50,7 +50,7 @@ ${presetList}
 
 Interactive TUI Shortcuts:
   [Space]     Toggle extension
-  [1-5]       Apply preset (1: Minimal, 2: Web, 3: Backend, 4: Offline, 5: All)
+  [1-6]       Apply preset (1: Baseline, 2: Minimal, 3: Web, 4: Backend, 5: Offline, 6: All)
   [a]         Select/Deselect all in current category
   [Tab]       Cycle category tabs
   [/]         Search / filter extensions
@@ -204,7 +204,7 @@ export async function handleSetupCommand(
   } else if (trimmed.startsWith("preset ")) {
     presetArg = trimmed.replace(/^preset\s+/, "").trim();
   } else if (
-    ["minimal", "web", "backend", "offline", "all", "full", "defaults", "empty"].includes(
+    ["baseline", "base", "core", "minimal", "web", "backend", "offline", "all", "full", "defaults", "empty"].includes(
       trimmed.toLowerCase(),
     )
   ) {
@@ -214,7 +214,7 @@ export async function handleSetupCommand(
   if (presetArg) {
     const preset = getPreset(presetArg);
     if (!preset) {
-      const err = `Unknown preset "${presetArg}". Available presets: minimal, web, backend, offline, all`;
+      const err = `Unknown preset "${presetArg}". Available presets: baseline, minimal, web, backend, offline, all`;
       if (ctx.hasUI && ctx.ui?.notify) {
         ctx.ui.notify(err, "error");
       }
@@ -370,6 +370,7 @@ export default function piProjectSetupExtension(
 
   const getCompletions = (query: string) => {
     const suggestions: string[] = [
+      "--preset baseline",
       "--preset minimal",
       "--preset web",
       "--preset backend",
