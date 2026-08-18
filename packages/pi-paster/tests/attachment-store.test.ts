@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vite-plus/test";
+import { describe, expect, test } from "bun:test";
 import { AttachmentStore } from "../src/index.ts";
 
 describe("AttachmentStore", () => {

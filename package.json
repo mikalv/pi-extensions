@@ -72,7 +72,7 @@
       "./packages/pi-review/extensions/index.ts",
       "./packages/pi-worktree/src/index.ts",
       "./packages/pi-rtk/extensions/index.ts",
-      "./packages/pi-image-drop/src/index.ts",
+      "./packages/pi-paster/src/index.ts",
       "./packages/pi-grill-me/src/index.ts",
       "./packages/pi-agent-memory/index.ts",
       "./packages/pi-task-notifications/index.ts",
