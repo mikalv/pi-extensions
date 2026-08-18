@@ -78,7 +78,8 @@
       "./packages/pi-task-notifications/index.ts",
       "./packages/pi-model-restriction/src/index.ts",
       "./packages/pi-agent-core/src/index.ts",
-      "./packages/pi-background-tasks/src/extension.ts"
+      "./packages/pi-background-tasks/src/extension.ts",
+      "./packages/pi-project-setup/src/index.ts"
     ],
     "skills": [
       "./packages/mm-elixir/packages/extension/skills",

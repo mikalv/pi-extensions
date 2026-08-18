@@ -399,9 +399,11 @@ export class SetupDialogComponent implements Component {
       matchesKey(data, "return")
     ) {
       if (this.onSave) {
-        this.onSave(Array.from(this.selectedExtensions), {
-          autoReload: this.autoReload,
-        });
+        void Promise.resolve(
+          this.onSave(Array.from(this.selectedExtensions), {
+            autoReload: this.autoReload,
+          }),
+        );
       }
       return;
     }
@@ -622,3 +624,53 @@ export class SetupDialogComponent implements Component {
     return text;
   }
 }
+
+/**
+ * Open the interactive project setup dialog via Pi's UI context.
+ */
+export async function openSetupDialog(
+  ctx: { hasUI?: boolean; ui?: any; cwd?: string },
+  options: SetupDialogOptions,
+): Promise<string[] | null> {
+  if (!ctx.hasUI || !ctx.ui?.custom) {
+    return null;
+  }
+
+  return await ctx.ui.custom<string[] | null>(
+    (
+      tui: any,
+      theme: any,
+      _keybindings: any,
+      done: (val: string[] | null) => void,
+    ) => {
+      return new SetupDialogComponent({
+        ...options,
+        theme,
+        cwd: options.cwd ?? ctx.cwd ?? process.cwd(),
+        onRenderRequest: () => tui?.requestRender?.(),
+        onSave: async (selected, saveOpts) => {
+          if (options.onSave) {
+            await options.onSave(selected, saveOpts);
+          }
+          done(selected);
+        },
+        onCancel: () => {
+          if (options.onCancel) {
+            options.onCancel();
+          }
+          done(null);
+        },
+      });
+    },
+    {
+      overlay: true,
+      overlayOptions: {
+        width: "95%",
+        height: "90%",
+        anchor: "center",
+        margin: 0,
+      },
+    },
+  );
+}
+
