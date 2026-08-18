@@ -176,6 +176,12 @@ export class ControlPlane extends EventEmitter {
       prompt: options.prompt,
       depth,
     });
+    this.emit("run:start", {
+      runId: initialRecord.id,
+      agent: validatedAgent.name,
+      prompt: options.prompt,
+      depth,
+    });
 
     const timeoutMs = options.timeout ?? this.defaultTimeoutMs;
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
@@ -195,6 +201,10 @@ export class ControlPlane extends EventEmitter {
 
         const handleProgressUpdate = (chunk: string) => {
           this.emit("run_update", {
+            runId: initialRecord.id,
+            chunk,
+          });
+          this.emit("run:update", {
             runId: initialRecord.id,
             chunk,
           });
@@ -246,6 +256,7 @@ export class ControlPlane extends EventEmitter {
         }
 
         this.emit("run_completed", lifecycle.record);
+        this.emit("run:complete", lifecycle.record);
         return lifecycle.record;
       } catch (err: unknown) {
         if (lifecycle.state !== "DONE") {
@@ -271,6 +282,7 @@ export class ControlPlane extends EventEmitter {
         this.steering.clear(initialRecord.id);
         this.allRuns.set(initialRecord.id, lifecycle.record);
         this.emit("run_finished", lifecycle.record);
+        this.emit("run:done", lifecycle.record);
       }
     }, abortController.signal);
   }
@@ -324,6 +336,13 @@ export class ControlPlane extends EventEmitter {
    */
   public listActiveRuns(): RunRecord[] {
     return Array.from(this.activeRuns.values()).map((e) => e.record);
+  }
+
+  /**
+   * Alias for listActiveRuns().
+   */
+  public getActiveRuns(): RunRecord[] {
+    return this.listActiveRuns();
   }
 
   /**
