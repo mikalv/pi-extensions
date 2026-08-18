@@ -23,6 +23,14 @@ export interface MemoryConfig {
 	 * (debounced) and hard-flush on compact/switch/shutdown. Pattern from nmem.
 	 */
 	ambientSync: boolean;
+	/**
+	 * Data Governance / Privacy isolation:
+	 * When set, only sessions running with these providers can read/write/inject from this config's collections.
+	 * If localOnly=true is set, defaults to ["vllm-local", "gemma4-local", "ollama", "local", "vllm", "llama.cpp", "lmstudio"].
+	 */
+	allowedProviders?: string[];
+	/** Shorthand for restricting to local-only providers */
+	localOnly?: boolean;
 }
 
 function agentDir(): string {
@@ -35,11 +43,23 @@ function agentDir(): string {
 	return join(homedir(), ".pi", "agent");
 }
 
-export function mmMemoryConfigPath(): string {
+export function mmMemoryConfigPath(cwd?: string): string {
+	if (cwd) {
+		const projectConfig = join(cwd, ".pi", "mm-memory.json");
+		if (existsSync(projectConfig)) return projectConfig;
+		const projectRootConfig = join(cwd, ".mm-memory.json");
+		if (existsSync(projectRootConfig)) return projectRootConfig;
+	}
 	return join(agentDir(), "mm-memory.json");
 }
 
-export function prismConfigPath(): string {
+export function prismConfigPath(cwd?: string): string {
+	if (cwd) {
+		const projectPrism = join(cwd, ".pi", "pi-prism.json");
+		if (existsSync(projectPrism)) return projectPrism;
+		const projectRootPrism = join(cwd, ".pi-prism.json");
+		if (existsSync(projectRootPrism)) return projectRootPrism;
+	}
 	return join(agentDir(), "pi-prism.json");
 }
 
@@ -60,7 +80,7 @@ function normalizeBaseUrl(url: string): string {
 	return url.replace(/\/+$/, "");
 }
 
-function loadPrismConnection(): PrismConnection {
+function loadPrismConnection(cwd?: string): PrismConnection {
 	const envBaseUrl =
 		asNonEmptyString(process.env.PRISM_URL) || asNonEmptyString(process.env.PRISM_BASE_URL);
 	const envApiKey = asNonEmptyString(process.env.PRISM_API_KEY);
@@ -72,7 +92,7 @@ function loadPrismConnection(): PrismConnection {
 	let fileApiKey: string | undefined;
 	let fileTimeout: number | undefined;
 
-	const path = prismConfigPath();
+	const path = prismConfigPath(cwd);
 	if (existsSync(path)) {
 		try {
 			const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
@@ -109,8 +129,52 @@ function loadPrismConnection(): PrismConnection {
 	};
 }
 
-export function loadMemoryConfig(): MemoryConfig {
-	const connection = loadPrismConnection();
+export const DEFAULT_LOCAL_PROVIDERS = [
+	"vllm-local",
+	"gemma4-local",
+	"ollama",
+	"local",
+	"vllm",
+	"llama.cpp",
+	"lmstudio",
+];
+
+export function isProviderAllowed(
+	currentProvider: string | undefined,
+	config: MemoryConfig,
+): { allowed: boolean; reason?: string } {
+	let effectiveAllowed = config.allowedProviders;
+	if (config.localOnly) {
+		effectiveAllowed = effectiveAllowed
+			? [...effectiveAllowed, ...DEFAULT_LOCAL_PROVIDERS]
+			: DEFAULT_LOCAL_PROVIDERS;
+	}
+
+	if (!effectiveAllowed || effectiveAllowed.length === 0) {
+		return { allowed: true };
+	}
+
+	const provider = (currentProvider ?? "").trim().toLowerCase();
+	if (!provider) {
+		return {
+			allowed: false,
+			reason: `Provider not identified. Allowed local providers: [${effectiveAllowed.join(", ")}]`,
+		};
+	}
+
+	const isMatch = effectiveAllowed.some((p) => p.trim().toLowerCase() === provider);
+	if (!isMatch) {
+		return {
+			allowed: false,
+			reason: `Provider '${provider}' is NOT permitted to access collection '${config.memoriesCollection}'. Allowed providers: [${effectiveAllowed.join(", ")}]`,
+		};
+	}
+
+	return { allowed: true };
+}
+
+export function loadMemoryConfig(cwd?: string): MemoryConfig {
+	const connection = loadPrismConnection(cwd);
 	let memoriesCollection = LTM_MEMORIES_COLLECTION;
 	let sessionsCollection = LTM_SESSIONS_COLLECTION;
 	let injectOnStart = true;
@@ -118,25 +182,52 @@ export function loadMemoryConfig(): MemoryConfig {
 	let injectCollection: MemoryConfig["injectCollection"] = "memories";
 	let checkpointOnCompact = true;
 	let ambientSync = true;
+	let allowedProviders: string[] | undefined;
+	let localOnly: boolean | undefined;
 
-	const path = mmMemoryConfigPath();
-	if (existsSync(path)) {
+	// 1. Global config (~/.pi/agent/mm-memory.json)
+	const globalPath = join(agentDir(), "mm-memory.json");
+	if (existsSync(globalPath)) {
 		try {
-			const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-			memoriesCollection =
-				asNonEmptyString(parsed.memoriesCollection) || memoriesCollection;
-			sessionsCollection =
-				asNonEmptyString(parsed.sessionsCollection) || sessionsCollection;
+			const parsed = JSON.parse(readFileSync(globalPath, "utf8")) as Record<string, unknown>;
+			memoriesCollection = asNonEmptyString(parsed.memoriesCollection) || memoriesCollection;
+			sessionsCollection = asNonEmptyString(parsed.sessionsCollection) || sessionsCollection;
 			if (typeof parsed.injectOnStart === "boolean") injectOnStart = parsed.injectOnStart;
 			injectLimit = asPositiveInt(parsed.injectLimit, injectLimit);
 			const ic = asNonEmptyString(parsed.injectCollection);
 			if (ic === "memories" || ic === "sessions" || ic === "both") injectCollection = ic;
-			if (typeof parsed.checkpointOnCompact === "boolean") {
-				checkpointOnCompact = parsed.checkpointOnCompact;
-			}
+			if (typeof parsed.checkpointOnCompact === "boolean") checkpointOnCompact = parsed.checkpointOnCompact;
 			if (typeof parsed.ambientSync === "boolean") ambientSync = parsed.ambientSync;
+			if (Array.isArray(parsed.allowedProviders)) {
+				allowedProviders = parsed.allowedProviders.filter((p): p is string => typeof p === "string");
+			}
+			if (typeof parsed.localOnly === "boolean") localOnly = parsed.localOnly;
 		} catch {
 			// ignore
+		}
+	}
+
+	// 2. Project config override (.pi/mm-memory.json or .mm-memory.json)
+	if (cwd) {
+		const projectConfigPath = mmMemoryConfigPath(cwd);
+		if (projectConfigPath !== globalPath && existsSync(projectConfigPath)) {
+			try {
+				const parsed = JSON.parse(readFileSync(projectConfigPath, "utf8")) as Record<string, unknown>;
+				memoriesCollection = asNonEmptyString(parsed.memoriesCollection) || memoriesCollection;
+				sessionsCollection = asNonEmptyString(parsed.sessionsCollection) || sessionsCollection;
+				if (typeof parsed.injectOnStart === "boolean") injectOnStart = parsed.injectOnStart;
+				injectLimit = asPositiveInt(parsed.injectLimit, injectLimit);
+				const ic = asNonEmptyString(parsed.injectCollection);
+				if (ic === "memories" || ic === "sessions" || ic === "both") injectCollection = ic;
+				if (typeof parsed.checkpointOnCompact === "boolean") checkpointOnCompact = parsed.checkpointOnCompact;
+				if (typeof parsed.ambientSync === "boolean") ambientSync = parsed.ambientSync;
+				if (Array.isArray(parsed.allowedProviders)) {
+					allowedProviders = parsed.allowedProviders.filter((p): p is string => typeof p === "string");
+				}
+				if (typeof parsed.localOnly === "boolean") localOnly = parsed.localOnly;
+			} catch {
+				// ignore
+			}
 		}
 	}
 
@@ -149,12 +240,14 @@ export function loadMemoryConfig(): MemoryConfig {
 		injectCollection,
 		checkpointOnCompact,
 		ambientSync,
+		allowedProviders,
+		localOnly,
 	};
 }
 
-export function saveMemoryConfig(patch: Partial<Omit<MemoryConfig, "connection">>): void {
-	const current = loadMemoryConfig();
-	const next = {
+export function saveMemoryConfig(patch: Partial<Omit<MemoryConfig, "connection">>, cwd?: string): void {
+	const current = loadMemoryConfig(cwd);
+	const next: Record<string, unknown> = {
 		memoriesCollection: patch.memoriesCollection ?? current.memoriesCollection,
 		sessionsCollection: patch.sessionsCollection ?? current.sessionsCollection,
 		injectOnStart: patch.injectOnStart ?? current.injectOnStart,
@@ -163,12 +256,21 @@ export function saveMemoryConfig(patch: Partial<Omit<MemoryConfig, "connection">
 		checkpointOnCompact: patch.checkpointOnCompact ?? current.checkpointOnCompact,
 		ambientSync: patch.ambientSync ?? current.ambientSync,
 	};
-	const path = mmMemoryConfigPath();
+	if (patch.allowedProviders !== undefined) next.allowedProviders = patch.allowedProviders;
+	if (patch.localOnly !== undefined) next.localOnly = patch.localOnly;
+
+	const path = mmMemoryConfigPath(cwd);
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
 }
 
-export function formatMemoryStatus(config: MemoryConfig): string {
+export function formatMemoryStatus(config: MemoryConfig, cwd?: string): string {
+	const restriction = config.localOnly
+		? "localOnly: true (only local providers allowed)"
+		: config.allowedProviders && config.allowedProviders.length > 0
+			? `allowedProviders: [${config.allowedProviders.join(", ")}]`
+			: "allowedProviders: (all / unrestricted)";
+
 	return [
 		`prism: ${config.connection.baseUrl}`,
 		`apiKey: ${config.connection.apiKey ? "(set)" : "(none)"}`,
@@ -177,8 +279,9 @@ export function formatMemoryStatus(config: MemoryConfig): string {
 		`injectOnStart: ${config.injectOnStart} (limit=${config.injectLimit}, collection=${config.injectCollection})`,
 		`checkpointOnCompact: ${config.checkpointOnCompact}`,
 		`ambientSync: ${config.ambientSync}`,
-		`configFile: ${mmMemoryConfigPath()}`,
-		`prismConfig: ${prismConfigPath()}`,
+		`securityPolicy: ${restriction}`,
+		`configFile: ${mmMemoryConfigPath(cwd)}`,
+		`prismConfig: ${prismConfigPath(cwd)}`,
 		"",
 		"Layer model: STM (observational) → wiki (mm-wiki) → Prism LTM (this package).",
 		"Patterns: mine, scoped recall, precompact checkpoint, ambient session sync (from nmem).",

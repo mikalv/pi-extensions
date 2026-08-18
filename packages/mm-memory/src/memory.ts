@@ -3,6 +3,7 @@ import {
 	LTM_MEMORIES_COLLECTION,
 	LTM_SESSIONS_COLLECTION,
 	loadMemoryConfig,
+	isProviderAllowed,
 } from "./config.js";
 import {
 	buildRememberDocument,
@@ -25,9 +26,16 @@ export function resolveCollection(
 
 export async function remember(
 	input: RememberInput,
-	opts: { cwd?: string; config?: MemoryConfig } = {},
+	opts: { cwd?: string; config?: MemoryConfig; currentProvider?: string } = {},
 ): Promise<{ collection: string; document: ReturnType<typeof buildRememberDocument>; result: unknown }> {
-	const config = opts.config ?? loadMemoryConfig();
+	const config = opts.config ?? loadMemoryConfig(opts.cwd);
+	
+	// Data governance check
+	const access = isProviderAllowed(opts.currentProvider, config);
+	if (!access.allowed) {
+		throw new Error(`[LTM Data Governance] ${access.reason}`);
+	}
+
 	const document = buildRememberDocument(input, opts.cwd);
 	const scope =
 		input.scope ??
@@ -60,6 +68,8 @@ export interface RecallScope {
 	kind?: string;
 	/** Extra tag filters (all must match when present on a hit) */
 	tags?: string[];
+	/** Active provider for data governance checks */
+	currentProvider?: string;
 }
 
 function buildScopedQuery(query: string, opts: RecallScope): string {
@@ -109,7 +119,14 @@ export async function recall(
 }> {
 	const q = query.trim();
 	if (!q) throw new Error("query is required");
-	const config = opts.config ?? loadMemoryConfig();
+	const config = opts.config ?? loadMemoryConfig(opts.cwd);
+
+	// Data governance check
+	const access = isProviderAllowed(opts.currentProvider, config);
+	if (!access.allowed) {
+		throw new Error(`[LTM Data Governance] ${access.reason}`);
+	}
+
 	const limit = opts.limit ?? 8;
 	const scope = opts.scope ?? "memories";
 	const collections =
@@ -156,10 +173,18 @@ export async function recall(
 
 export async function recallForInjection(
 	prompt: string,
-	opts: { cwd?: string; config?: MemoryConfig } = {},
+	opts: { cwd?: string; config?: MemoryConfig; currentProvider?: string } = {},
 ): Promise<string | undefined> {
-	const config = opts.config ?? loadMemoryConfig();
+	const config = opts.config ?? loadMemoryConfig(opts.cwd);
 	if (!config.injectOnStart) return undefined;
+
+	// Check provider permission for injection
+	const access = isProviderAllowed(opts.currentProvider, config);
+	if (!access.allowed) {
+		// Silently suppress injection to prevent leaking sensitive LTM context to external models
+		return undefined;
+	}
+
 	const project = opts.cwd ? opts.cwd.split(/[/\\]/).filter(Boolean).at(-1) : undefined;
 	const query = prompt.trim().slice(0, 400) || project || "recent preferences decisions";
 	const { hits } = await recall(query, {
@@ -168,6 +193,7 @@ export async function recallForInjection(
 		limit: config.injectLimit,
 		scope: config.injectCollection,
 		project,
+		currentProvider: opts.currentProvider,
 	});
 	const block = formatRecallForPrompt(hits);
 	return block || undefined;

@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { installAmbientSync, memoryStartupGuidance } from "./ambient.js";
 import { checkpointBeforeCompact } from "./checkpoint.js";
-import { formatMemoryStatus, loadMemoryConfig, saveMemoryConfig } from "./config.js";
+import { formatMemoryStatus, isProviderAllowed, loadMemoryConfig, saveMemoryConfig } from "./config.js";
 import { projectFromCwd, normalizeRecallHits, type MemoryKind } from "./documents.js";
 import {
 	formatRecallResult,
@@ -42,79 +42,40 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		description: "Prism LTM status, remember, recall, and mine",
 		getArgumentCompletions: async (prefix) => {
 			const options = [
-				"status",
-				"recall ",
-				"remember ",
-				"sessions ",
-				"forget ",
-				"mine ",
-				"assess ",
-				"gap ",
-				"inject on",
-				"inject off",
-				"checkpoint on",
-				"checkpoint off",
-				"sync on",
-				"sync off",
-				"help",
+				{ value: "status", description: "Show Prism connection and collections" },
+				{ value: "remember ", description: "Store a durable fact/decision/insight" },
+				{ value: "recall ", description: "Semantic recall across LTM collections" },
+				{ value: "sessions ", description: "Search past session summaries" },
+				{ value: "mine ", description: "Mine docs/decisions from path into LTM" },
+				{ value: "assess ", description: "Estimate knowledge coverage for topic" },
+				{ value: "gap ", description: "Record a known missing fact or question" },
+				{ value: "forget ", description: "Delete a memory by matching text" },
+				{ value: "checkpoint", description: "Force a session summary checkpoint now" },
+				{ value: "inject", description: "Preview the auto-injected recall block" },
+				{ value: "sync", description: "Toggle ambient session sync (now: on)" },
 			];
-			const needle = prefix.trim().toLowerCase();
-			return options
-				.filter((option) => option.startsWith(needle) || option.includes(needle))
-				.map((value) => ({ value, label: value }));
+			return options.filter((opt) => opt.value.startsWith(prefix));
 		},
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
-			const [action, ...rest] = trimmed.split(/\s+/);
-			const verb = (action || "status").toLowerCase();
+			const [verb = "status", ...rest] = trimmed ? trimmed.split(/\s+/) : [];
 
 			try {
-				if (verb === "help") {
-					ctx.ui.notify(
-						[
-							"/memory status — Prism LTM config + health",
-							"/memory recall <query> — scoped semantic search",
-							"/memory sessions <query> — search past session summaries (ltm-sessions)",
-							"/memory remember <text> — index a durable memory",
-							"/memory mine [path] — ingest files into Prism (default: cwd)",
-							"/memory assess <topic> — coverage/confidence over wiki + Prism",
-							"/memory gap <description> — record a known knowledge gap",
-							"/memory inject on|off — session-start Prism inject (default on)",
-							"/memory checkpoint on|off — precompact LTM checkpoint (default on)",
-							"/memory sync on|off — ambient session sync to ltm-sessions (default on)",
-							"/memory forget <text> — delete a memory by matching text",
-							"Tools: memory_remember, memory_recall, memory_sessions, memory_mine, memory_assess, memory_gap, memory_forget",
-						].join("\n"),
-						"info",
-					);
-					return;
-				}
-
-				if (verb === "inject" || verb === "checkpoint" || verb === "sync") {
-					const mode = rest[0]?.toLowerCase();
-					if (mode !== "on" && mode !== "off") {
-						ctx.ui.notify(`Usage: /memory ${verb} on|off`, "error");
-						return;
-					}
-					if (verb === "inject") saveMemoryConfig({ injectOnStart: mode === "on" });
-					else if (verb === "checkpoint")
-						saveMemoryConfig({ checkpointOnCompact: mode === "on" });
-					else saveMemoryConfig({ ambientSync: mode === "on" });
-					ctx.ui.notify(formatMemoryStatus(loadMemoryConfig()), "info");
-					return;
-				}
-
 				if (verb === "remember") {
 					const text = rest.join(" ").trim();
 					if (!text) {
 						ctx.ui.notify("Usage: /memory remember <text>", "error");
 						return;
 					}
+					const currentProvider = ctx.model?.provider;
 					const result = await remember(
-						{ text, kind: "note", source: "memory_command" },
-						{ cwd: ctx.cwd },
+						{ text, kind: "note" },
+						{ cwd: ctx.cwd, currentProvider },
 					);
-					ctx.ui.notify(formatRememberResult(result), "info");
+					ctx.ui.notify(
+						`Remembered (${result.collection}: ${result.document.id})`,
+						"info",
+					);
 					return;
 				}
 
@@ -124,31 +85,80 @@ export default function mmMemory(pi: ExtensionAPI): void {
 						ctx.ui.notify("Usage: /memory recall <query>", "error");
 						return;
 					}
-					const result = await recall(query, {
-						cwd: ctx.cwd,
-						project: projectFromCwd(ctx.cwd),
-					});
-					ctx.ui.notify(formatRecallResult(result), "info");
+					const currentProvider = ctx.model?.provider;
+					const result = await recall(query, { cwd: ctx.cwd, limit: 5, currentProvider });
+					const lines = [
+						`Prism recall: "${query}" (${result.hits.length} hits)`,
+						...result.hits.map((h, i) => `${i + 1}. [${h.kind ?? "fact"}] ${h.text}`),
+					];
+					ctx.ui.notify(lines.join("\n"), "info");
 					return;
 				}
 
 				if (verb === "sessions") {
-					const query = rest.join(" ").trim() || projectFromCwd(ctx.cwd);
+					const query = rest.join(" ").trim();
+					if (!query) {
+						ctx.ui.notify("Usage: /memory sessions <query>", "error");
+						return;
+					}
+					const currentProvider = ctx.model?.provider;
 					const result = await recall(query, {
 						cwd: ctx.cwd,
-						project: projectFromCwd(ctx.cwd),
+						limit: 5,
 						scope: "sessions",
 						kind: "session_summary",
-						limit: 10,
+						currentProvider,
 					});
-					ctx.ui.notify(formatRecallResult(result), "info");
+					const lines = [
+						`Prism session search: "${query}" (${result.hits.length} hits)`,
+						...result.hits.map((h, i) => `${i + 1}. ${h.text}`),
+					];
+					ctx.ui.notify(lines.join("\n"), "info");
 					return;
 				}
 
 				if (verb === "mine") {
 					const target = rest.join(" ").trim() || ctx.cwd;
-					const result = await minePath({ path: target, cwd: ctx.cwd });
-					ctx.ui.notify(truncateJson(result, 8_000), "info");
+					ctx.ui.notify(`Mining ${target} into Prism LTM...`, "info");
+					const report = await minePath({ path: target, cwd: ctx.cwd });
+					ctx.ui.notify(
+						`Mined ${report.indexed} chunks across ${report.filesScanned} files into ${report.collection}`,
+						"info",
+					);
+					return;
+				}
+
+				if (verb === "checkpoint") {
+					const result = await checkpointBeforeCompact({
+						messages: [],
+						cwd: ctx.cwd,
+						reason: "manual",
+					});
+					ctx.ui.notify(
+						result.ok
+							? `Checkpoint saved (${result.collection}: ${result.id})`
+							: "Checkpoint had no content to save",
+						result.ok ? "info" : "warning",
+					);
+					return;
+				}
+
+				if (verb === "inject") {
+					const currentProvider = ctx.model?.provider;
+					const block = await recallForInjection("", { cwd: ctx.cwd, currentProvider });
+					if (!block) {
+						ctx.ui.notify("No memories would be auto-injected right now.", "info");
+						return;
+					}
+					ctx.ui.notify(block, "info");
+					return;
+				}
+
+				if (verb === "sync") {
+					const config = loadMemoryConfig(ctx.cwd);
+					const next = !config.ambientSync;
+					saveMemoryConfig({ ambientSync: next }, ctx.cwd);
+					ctx.ui.notify(`Ambient LTM sync is now ${next ? "ENABLED" : "DISABLED"}`, "info");
 					return;
 				}
 
@@ -158,15 +168,22 @@ export default function mmMemory(pi: ExtensionAPI): void {
 						ctx.ui.notify("Usage: /memory assess <topic>", "error");
 						return;
 					}
-					const result = await assessTopic(topic, { cwd: ctx.cwd });
-					ctx.ui.notify(formatAssessResult(result), "info");
+					const assessment = await assessTopic(topic, { cwd: ctx.cwd });
+					ctx.ui.notify(
+						[
+							`Coverage for "${topic}": ${assessment.confidence} confidence (${assessment.confidenceScore}/100)`,
+							assessment.recommendation,
+							`Wiki hits: ${assessment.sources.wikiHits.length} · Prism hits: ${assessment.sources.prismHits.length} · Gaps: ${assessment.sources.gaps.length}`,
+						].join("\n"),
+						"info",
+					);
 					return;
 				}
 
 				if (verb === "gap") {
 					const description = rest.join(" ").trim();
 					if (!description) {
-						ctx.ui.notify("Usage: /memory gap <description>", "error");
+						ctx.ui.notify("Usage: /memory gap <missing fact or question>", "error");
 						return;
 					}
 					const path = recordKnowledgeGap(description);
@@ -180,7 +197,14 @@ export default function mmMemory(pi: ExtensionAPI): void {
 						ctx.ui.notify("Usage: /memory forget <text> — delete a memory by matching text", "error");
 						return;
 					}
-					const config = loadMemoryConfig();
+					const config = loadMemoryConfig(ctx.cwd);
+					const currentProvider = ctx.model?.provider;
+					const access = isProviderAllowed(currentProvider, config);
+					if (!access.allowed) {
+						ctx.ui.notify(`[LTM Governance] ${access.reason}`, "error");
+						return;
+					}
+
 					const collection = resolveCollection(config, "memories");
 					const client = new PrismClient(config.connection);
 					const escapedQuery = escapePrismQuery(text);
@@ -213,19 +237,19 @@ export default function mmMemory(pi: ExtensionAPI): void {
 					return;
 				}
 
-				const config = loadMemoryConfig();
+				const config = loadMemoryConfig(ctx.cwd);
 				const client = new PrismClient(config.connection);
 				try {
 					const health = await client.health();
 					ctx.ui.notify(
-						[formatMemoryStatus(config), "", `health: ok`, JSON.stringify(health)].join(
+						[formatMemoryStatus(config, ctx.cwd), "", `health: ok`, JSON.stringify(health)].join(
 							"\n",
 						),
 						"info",
 					);
 				} catch (error) {
 					ctx.ui.notify(
-						[formatMemoryStatus(config), "", `health: FAILED — ${formatError(error)}`].join(
+						[formatMemoryStatus(config, ctx.cwd), "", `health: FAILED — ${formatError(error)}`].join(
 							"\n",
 						),
 						"error",
@@ -251,18 +275,26 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			source: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = await remember(
-				{
-					text: params.text,
-					kind: params.kind as MemoryKind | undefined,
-					project: params.project,
-					tags: params.tags,
-					scope: params.scope,
-					source: params.source ?? "memory_remember",
-				},
-				{ cwd: ctx.cwd },
-			);
-			return { content: [{ type: "text", text: formatRememberResult(result) }], details: {} };
+			const currentProvider = ctx.model?.provider;
+			try {
+				const result = await remember(
+					{
+						text: params.text,
+						kind: params.kind as MemoryKind | undefined,
+						project: params.project,
+						tags: params.tags,
+						scope: params.scope,
+						source: params.source ?? "memory_remember",
+					},
+					{ cwd: ctx.cwd, currentProvider },
+				);
+				return { content: [{ type: "text", text: formatRememberResult(result) }], details: {} };
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `Remember failed: ${formatError(err)}` }],
+					details: { success: false, error: formatError(err) },
+				};
+			}
 		},
 	});
 
@@ -280,15 +312,24 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Require these tags" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = await recall(params.query, {
-				cwd: ctx.cwd,
-				limit: params.limit,
-				scope: params.scope,
-				project: params.project,
-				kind: params.kind,
-				tags: params.tags,
-			});
-			return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
+			const currentProvider = ctx.model?.provider;
+			try {
+				const result = await recall(params.query, {
+					cwd: ctx.cwd,
+					limit: params.limit,
+					scope: params.scope,
+					project: params.project,
+					kind: params.kind,
+					tags: params.tags,
+					currentProvider,
+				});
+				return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `Recall failed: ${formatError(err)}` }],
+					details: { success: false, error: formatError(err) },
+				};
+			}
 		},
 	});
 
@@ -303,14 +344,23 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			project: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = await recall(params.query, {
-				cwd: ctx.cwd,
-				limit: params.limit ?? 10,
-				scope: "sessions",
-				kind: "session_summary",
-				project: params.project,
-			});
-			return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
+			const currentProvider = ctx.model?.provider;
+			try {
+				const result = await recall(params.query, {
+					cwd: ctx.cwd,
+					limit: params.limit ?? 10,
+					scope: "sessions",
+					kind: "session_summary",
+					project: params.project,
+					currentProvider,
+				});
+				return { content: [{ type: "text", text: formatRecallResult(result) }], details: {} };
+			} catch (err) {
+				return {
+					content: [{ type: "text", text: `Session search failed: ${formatError(err)}` }],
+					details: { success: false, error: formatError(err) },
+				};
+			}
 		},
 	});
 
@@ -330,6 +380,16 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			scope: Type.Optional(StringEnum(["memories", "sessions"] as const)),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const config = loadMemoryConfig(ctx.cwd);
+			const currentProvider = ctx.model?.provider;
+			const access = isProviderAllowed(currentProvider, config);
+			if (!access.allowed) {
+				return {
+					content: [{ type: "text", text: `[LTM Data Governance] ${access.reason}` }],
+					details: { success: false, error: access.reason },
+				};
+			}
+
 			const result = await minePath({
 				path: params.path?.trim() || ctx.cwd,
 				cwd: ctx.cwd,
@@ -369,11 +429,11 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			description: Type.String({ description: "What is missing or uncertain" }),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const path = recordKnowledgeGap(params.description);
 			return {
-				content: [{ type: "text", text: `Knowledge gap recorded → ${path}` }],
-				details: {},
+				content: [{ type: "text", text: `Recorded knowledge gap in ${path}` }],
+				details: { path },
 			};
 		},
 	});
@@ -388,8 +448,17 @@ export default function mmMemory(pi: ExtensionAPI): void {
 			text: Type.String({ description: "Memory text to search for and delete" }),
 			scope: Type.Optional(StringEnum(["memories", "sessions"] as const)),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const config = loadMemoryConfig();
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const config = loadMemoryConfig(ctx.cwd);
+			const currentProvider = ctx.model?.provider;
+			const access = isProviderAllowed(currentProvider, config);
+			if (!access.allowed) {
+				return {
+					content: [{ type: "text", text: `[LTM Data Governance] ${access.reason}` }],
+					details: { success: false, error: access.reason },
+				};
+			}
+
 			const collection = resolveCollection(config, params.scope ?? "memories");
 			const client = new PrismClient(config.connection);
 			const escapedQuery = escapePrismQuery(params.text);
@@ -449,7 +518,8 @@ export default function mmMemory(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		const parts = [event.systemPrompt, memoryStartupGuidance()];
 		try {
-			const block = await recallForInjection(event.prompt ?? "", { cwd: ctx.cwd });
+			const currentProvider = ctx.model?.provider;
+			const block = await recallForInjection(event.prompt ?? "", { cwd: ctx.cwd, currentProvider });
 			if (block) parts.push(block);
 		} catch {
 			// inject is best-effort
@@ -498,28 +568,24 @@ export default function mmMemory(pi: ExtensionAPI): void {
 		const parts = ["💾 ltm"];
 		if (sessionRecalls > 0) parts.push(`↓${sessionRecalls}`);
 		if (sessionRemembers > 0) parts.push(`↑${sessionRemembers}`);
-		if (config.ambientSync) parts.push("sync✓");
-		const status = parts.join(" · ");
-		ctx.ui.setStatus(MEM_STATUS_KEY, status);
-		pi.events.emit("atelier:memory-status", { key: "mm-memory", line: status });
+		const text = parts.join(" ");
+		ctx.ui.setStatus(MEM_STATUS_KEY, text);
+		pi.events.emit("atelier:memory-status", { key: "mm-memory", line: text });
 	};
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		sessionRecalls = 0;
 		sessionRemembers = 0;
-		emitMemStatus(ctx);
+		if (ctx.hasUI) emitMemStatus(ctx);
 	});
 
-	pi.on("tool_execution_end", (event, ctx) => {
-		if (!ctx.hasUI) return;
-		const name = (event as { toolName?: string }).toolName ?? "";
-		if (name === "memory_recall" || name === "memory_sessions") sessionRecalls++;
-		if (name === "memory_remember") sessionRemembers++;
-		emitMemStatus(ctx);
-	});
-
-	pi.on("turn_end", (_event, ctx) => {
-		if (!ctx.hasUI) return;
-		emitMemStatus(ctx);
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === "memory_recall" || event.toolName === "memory_sessions") {
+			sessionRecalls++;
+			if (ctx.hasUI) emitMemStatus(ctx);
+		} else if (event.toolName === "memory_remember" || event.toolName === "memory_mine") {
+			sessionRemembers++;
+			if (ctx.hasUI) emitMemStatus(ctx);
+		}
 	});
 }
