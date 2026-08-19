@@ -62,7 +62,7 @@ function formatDuration(ms: number): string {
 
 function appendAdded(base: string, addedPackages: string[]): string {
   if (addedPackages.length === 0) return base;
-  return `${base} 新增依赖：${addedPackages.join(", ")}。`;
+  return `${base} Added dependencies: ${addedPackages.join(", ")}.`;
 }
 
 function buildRestartNotice(
@@ -73,24 +73,24 @@ function buildRestartNotice(
     case "packages": {
       const added = addedPackages.length > 0 ? addedPackages.join(", ") : "";
       return added
-        ? `内核已重启：新增依赖 ${added}，内存状态已重置。`
-        : "内核已重启：依赖变更，内存状态已重置。";
+        ? `Kernel restarted: added dependencies ${added}, memory state reset.`
+        : "Kernel restarted: dependencies changed, memory state reset.";
     }
     case "pythonVersion":
       return appendAdded(
-        "内核已重启：Python 版本切换，内存状态已重置。",
+        "Kernel restarted: Python version switched, memory state reset.",
         addedPackages,
       );
     case "pythonExecutable":
       return appendAdded(
-        "内核已重启：Python 解释器切换，内存状态已重置。",
+        "Kernel restarted: Python interpreter switched, memory state reset.",
         addedPackages,
       );
     case "reset":
-      return "内核已重置：所有状态和累加依赖已清空。";
+      return "Kernel reset: all state and accumulated dependencies cleared.";
     case "crash":
       return appendAdded(
-        "内核已崩溃后重启：之前的内存状态已丢失。",
+        "Kernel crashed and restarted: previous memory state lost.",
         addedPackages,
       );
     default:
@@ -318,7 +318,7 @@ const executePythonTool = defineTool({
 
       if (result.error?.name === "StartupError") {
         contentParts.push(
-          "[内核启动失败：之前的内存状态已丢失，修正依赖后可重试]",
+          "[Kernel startup failed: previous memory state lost, retry after fixing dependencies]",
         );
       }
 
