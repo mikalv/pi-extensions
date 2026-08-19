@@ -101,11 +101,12 @@ export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
   baseline: {
     id: "baseline",
     name: "Core Baseline (Recommended)",
-    description: "Memory stack (Prism LTM + Wiki), agent control plane, paster, ADHD tasks, shortcuts",
+    description: "Memory stack (Prism LTM + Wiki), MCP adapter, agent control plane, paster, ADHD tasks, shortcuts",
     icon: "💎",
     extensions: [
       "./packages/mm-memory/src/index.ts",
       "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-mcp-adapter/index.ts",
       "./packages/pi-context/src/index.ts",
       "./packages/pi-agent-core/src/index.ts",
       "./packages/pi-paster/src/index.ts",
@@ -140,6 +141,7 @@ export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
     extensions: [
       "./packages/mm-memory/src/index.ts",
       "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-mcp-adapter/index.ts",
       "./packages/pi-agent-core/src/index.ts",
       "./packages/pi-paster/src/index.ts",
       "./packages/clipboard/index.ts",
@@ -159,6 +161,7 @@ export const DEFAULT_PRESETS: Record<BuiltinPresetId, PresetProfile> = {
     extensions: [
       "./packages/mm-memory/src/index.ts",
       "./packages/mm-wiki/src/index.ts",
+      "./packages/pi-mcp-adapter/index.ts",
       "./packages/mm-observational-memory/src/index.ts",
       "./packages/pi-agent-core/src/index.ts",
       "./packages/execute-python/extensions",
