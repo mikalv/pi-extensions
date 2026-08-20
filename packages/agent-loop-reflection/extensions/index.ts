@@ -11,6 +11,9 @@ import {
 export type AgentLoopReflectionConfig = {
   reminderTurnsInterval: number;
   reminderText: string;
+  autoContinueEnabled: boolean;
+  maxConsecutiveAutoContinues: number;
+  autoContinuePrompt: string;
 };
 
 const DEFAULT_REMINDER_TEXT = [
@@ -23,9 +26,15 @@ const DEFAULT_REMINDER_TEXT = [
   "CRITICAL FOR CONTINUITY: If everything is clear, state your assessment in 1-2 sentences AND IMMEDIATELY invoke your next planned tool call in the same turn so execution continues without interruption.",
 ].join("\n");
 
+const DEFAULT_AUTO_CONTINUE_PROMPT =
+  "Continue with your planned action and invoke the next tool call.";
+
 const DEFAULT_CONFIG: AgentLoopReflectionConfig = {
   reminderTurnsInterval: 10,
   reminderText: DEFAULT_REMINDER_TEXT,
+  autoContinueEnabled: true,
+  maxConsecutiveAutoContinues: 2,
+  autoContinuePrompt: DEFAULT_AUTO_CONTINUE_PROMPT,
 };
 
 const CONFIG_PATH = join(getAgentDir(), "cnife-agent-loop-reflection.json");
@@ -104,20 +113,93 @@ function loadConfig(): AgentLoopReflectionConfig | null {
 
   return {
     reminderTurnsInterval:
-      parsed.reminderTurnsInterval !== undefined
-        ? (parsed.reminderTurnsInterval as number)
+      typeof parsed.reminderTurnsInterval === "number" &&
+      parsed.reminderTurnsInterval > 0
+        ? parsed.reminderTurnsInterval
         : DEFAULT_CONFIG.reminderTurnsInterval,
     reminderText:
-      parsed.reminderText !== undefined
-        ? (parsed.reminderText as string)
+      typeof parsed.reminderText === "string" &&
+      parsed.reminderText.trim().length > 0
+        ? parsed.reminderText
         : DEFAULT_CONFIG.reminderText,
+    autoContinueEnabled:
+      typeof parsed.autoContinueEnabled === "boolean"
+        ? parsed.autoContinueEnabled
+        : DEFAULT_CONFIG.autoContinueEnabled,
+    maxConsecutiveAutoContinues:
+      typeof parsed.maxConsecutiveAutoContinues === "number" &&
+      parsed.maxConsecutiveAutoContinues > 0
+        ? parsed.maxConsecutiveAutoContinues
+        : DEFAULT_CONFIG.maxConsecutiveAutoContinues,
+    autoContinuePrompt:
+      typeof parsed.autoContinuePrompt === "string" &&
+      parsed.autoContinuePrompt.trim().length > 0
+        ? parsed.autoContinuePrompt
+        : DEFAULT_CONFIG.autoContinuePrompt,
   };
+}
+
+// ──── Continuation Heuristics ───────────────────────────────────
+
+/**
+ * Common patterns indicating the model planned to continue or stated an assessment,
+ * rather than asking the user a direct question or ending the whole task.
+ */
+const CONTINUATION_PATTERNS = [
+  /\bassessment\b/i,
+  /\bvurdering\b/i,
+  /\bnext step\b/i,
+  /\bneste steg\b/i,
+  /\bproceeding\b/i,
+  /\bcontinuing\b/i,
+  /\bfortsetter\b/i,
+  /\bnå skal jeg\b/i,
+  /\bjeg skal nå\b/i,
+  /\bwill now\b/i,
+  /\blet me\b/i,
+  /\bplan\b/i,
+];
+
+/**
+ * Checks if the text looks like an incomplete stopping point that intended to continue.
+ */
+function shouldAutoContinue(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  // If text ends with a direct question or asks the user, do not auto-continue
+  if (
+    trimmed.endsWith("?") ||
+    /\b(hva tenker du|hva ønsker du|vil du at|skal vi|do you want|should I|please confirm|what do you think)\b/i.test(
+      trimmed,
+    )
+  ) {
+    return false;
+  }
+
+  // Check if any continuation keyword matches
+  return CONTINUATION_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+function extractTextFromMessage(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const msg = message as Record<string, unknown>;
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .filter((p: unknown) => typeof p === "object" && p !== null && (p as any).type === "text")
+      .map((p: any) => p.text || "")
+      .join("\n");
+  }
+  return "";
 }
 
 // ──── State ────────────────────────────────────────────────────
 
 // Single countdown: how many more assistant turns before the next reminder.
 let turnsUntilNextReminder = 0;
+let consecutiveAutoContinues = 0;
+let reminderPendingFollowup = false;
 
 function setConfigErrorStatus(ctx: ExtensionContext): void {
   ctx.ui.setStatus(
@@ -137,27 +219,25 @@ export default function (pi: ExtensionAPI) {
     return;
   }
 
-  turnsUntilNextReminder = config.reminderTurnsInterval;
+  const resetState = () => {
+    turnsUntilNextReminder = config.reminderTurnsInterval;
+    consecutiveAutoContinues = 0;
+    reminderPendingFollowup = false;
+  };
 
-  pi.on("session_start", () => {
-    turnsUntilNextReminder = config.reminderTurnsInterval;
-  });
-  pi.on("session_tree", () => {
-    turnsUntilNextReminder = config.reminderTurnsInterval;
-  });
-  pi.on("session_compact", () => {
-    turnsUntilNextReminder = config.reminderTurnsInterval;
-  });
+  resetState();
+
+  pi.on("session_start", resetState);
+  pi.on("session_tree", resetState);
+  pi.on("session_compact", resetState);
   pi.on("agent_start", () => {
-    turnsUntilNextReminder = config.reminderTurnsInterval;
-  });
-  pi.on("agent_end", () => {
-    turnsUntilNextReminder = config.reminderTurnsInterval;
+    // Keep countdown on agent_start unless fresh user input
   });
 
   pi.on("input", (event) => {
     if (event.source === "extension") return;
-    turnsUntilNextReminder = config.reminderTurnsInterval;
+    // Human user typed a message, reset loop counters
+    resetState();
   });
 
   pi.on("turn_end", (event) => {
@@ -165,10 +245,59 @@ export default function (pi: ExtensionAPI) {
 
     turnsUntilNextReminder--;
 
-    if (event.message.stopReason !== "toolUse") return;
-    if (turnsUntilNextReminder > 0) return;
+    // If turn ended with toolUse, agent is naturally continuing
+    if (event.message.stopReason === "toolUse") {
+      consecutiveAutoContinues = 0;
+      reminderPendingFollowup = false;
+      if (turnsUntilNextReminder <= 0) {
+        pi.sendUserMessage(config.reminderText, { deliverAs: "steer" });
+        turnsUntilNextReminder = config.reminderTurnsInterval + 1;
+        reminderPendingFollowup = true;
+      }
+      return;
+    }
 
-    pi.sendUserMessage(config.reminderText, { deliverAs: "steer" });
-    turnsUntilNextReminder = config.reminderTurnsInterval + 1;
+    // Model ended turn with normal stop / no toolUse.
+    // Check if it stopped right after receiving a reminder or stated continuation intent
+    if (config.autoContinueEnabled && (reminderPendingFollowup || turnsUntilNextReminder <= 0)) {
+      const text = extractTextFromMessage(event.message);
+
+      if (
+        consecutiveAutoContinues < config.maxConsecutiveAutoContinues &&
+        (reminderPendingFollowup || shouldAutoContinue(text))
+      ) {
+        consecutiveAutoContinues++;
+        reminderPendingFollowup = false;
+        turnsUntilNextReminder = config.reminderTurnsInterval;
+
+        // Auto-continue the loop without human intervention
+        void pi.sendUserMessage(config.autoContinuePrompt, {
+          deliverAs: "followUp",
+        });
+      }
+    }
+  });
+
+  pi.on("agent_end", (event: any) => {
+    if (!config.autoContinueEnabled) return;
+    if (consecutiveAutoContinues >= config.maxConsecutiveAutoContinues) return;
+
+    // If agent ended immediately after a reminder without tool use
+    if (reminderPendingFollowup) {
+      const lastMsg = Array.isArray(event.messages)
+        ? event.messages[event.messages.length - 1]
+        : null;
+      const text = extractTextFromMessage(lastMsg);
+
+      if (shouldAutoContinue(text)) {
+        consecutiveAutoContinues++;
+        reminderPendingFollowup = false;
+        turnsUntilNextReminder = config.reminderTurnsInterval;
+
+        void pi.sendUserMessage(config.autoContinuePrompt, {
+          deliverAs: "followUp",
+        });
+      }
+    }
   });
 }
