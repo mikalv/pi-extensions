@@ -92,71 +92,13 @@ export default function piAgentCoreExtension(
   workflowRunner.on("workflow:error", () => updateWidget());
 
   // Hook session_start
-  let unsubTerminalInput: (() => void) | null = null;
-
-  async function getRunsForSelection(ctx: any): Promise<RunRecord[]> {
-    const memoryRuns = controlPlane.getAllRuns();
-    if (memoryRuns.length > 0) return memoryRuns;
-
-    try {
-      const records = await auditLogger.query({ limit: 30 });
-      return records.map((r) => ({
-        id: r.runId,
-        agent: r.agent,
-        prompt: r.prompt,
-        runtime: (r.runtime as any) || "pi-inprocess",
-        depth: r.depth,
-        turnBudget: 20,
-        status: r.status as any,
-        state: "DONE",
-        startedAt: r.startedAt || 0,
-        completedAt: r.completedAt,
-        durationMs: r.durationMs,
-        turns: r.turns,
-        tokens: r.tokens,
-        output: r.output || "",
-        error: r.error,
-      }));
-    } catch {
-      return [];
-    }
-  }
-
-  function setupTerminalInputListener(ctx: any) {
-    unsubTerminalInput?.();
-    unsubTerminalInput = null;
-
-    if (!ctx?.hasUI || !ctx?.ui?.onTerminalInput) return;
-
-    unsubTerminalInput = ctx.ui.onTerminalInput((data: string) => {
-      // Trigger interactive subagent history overlay on Arrow Left or Arrow Down in empty editor prompt
-      const isArrowDown = matchesKey(data, Key.down) || data === "\x1b[B" || data === "\x1bOB" || data === "\x1b[b";
-      const isArrowLeft = matchesKey(data, Key.left) || data === "\x1b[D" || data === "\x1bOD" || data === "\x1b[d";
-
-      if (isArrowDown || isArrowLeft) {
-        const editorText = (ctx.ui.getEditorText?.() ?? "").trim();
-        if (editorText.length === 0) {
-          getRunsForSelection(ctx).then((runs) => {
-            if (runs.length > 0) {
-              openHistoryModal(runs, ctx);
-            }
-          });
-          return true; // Consume key
-        }
-      }
-      return undefined;
-    });
-  }
-
   pi.on("session_start", (_event: any, ctx: any) => {
     currentSessionContext = ctx;
-    setupTerminalInputListener(ctx);
     updateWidget();
   });
 
   pi.on("session_tree", (_event: any, ctx: any) => {
     currentSessionContext = ctx;
-    setupTerminalInputListener(ctx);
     updateWidget();
   });
 
