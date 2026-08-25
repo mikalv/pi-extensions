@@ -186,7 +186,15 @@ export default function piAgentCoreExtension(
         cwd: ctx?.cwd,
         signal,
         onUpdate: (u) => {
-          onUpdate?.(u);
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: typeof u === "string" ? u : (u?.lastMessage || `[subagent: ${params.agent} running...]`),
+              },
+            ],
+            details: u,
+          });
           updateWidget();
         },
       };
