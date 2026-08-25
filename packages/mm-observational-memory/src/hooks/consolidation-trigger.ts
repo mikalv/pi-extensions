@@ -9,6 +9,7 @@ import { promoteEnabledFromEnv, promoteReflections } from "../promote.js";
 import { digestFitsBudget, digestTokenCount, reflectionContextBudget, selectRecentReflections } from "../reflection-context.js";
 import { type ResolveResult, type Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
+import { estimateEntryTokens } from "../tokens.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
@@ -193,6 +194,21 @@ export async function runConsolidationPipeline(
 	}
 }
 
+function sliceEntriesByTokenBudget(entries: Entry[], maxTokens: number): Entry[] {
+	const selected: Entry[] = [];
+	let accumulated = 0;
+	for (const entry of entries) {
+		const entryTokens = estimateEntryTokens(entry);
+		// Always include at least one entry even if it exceeds maxTokens alone
+		if (selected.length > 0 && accumulated + entryTokens > maxTokens) {
+			break;
+		}
+		selected.push(entry);
+		accumulated += entryTokens;
+	}
+	return selected;
+}
+
 async function runObserverStage(
 	pi: ExtensionAPI,
 	runtime: Runtime,
@@ -204,7 +220,12 @@ async function runObserverStage(
 	if (tokens < runtime.config.observeAfterTokens) return "continue";
 
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
-	const chunkEntries = sourceEntriesAfter(entries, lastCoverageIdx);
+	const allPendingEntries = sourceEntriesAfter(entries, lastCoverageIdx);
+	if (allPendingEntries.length === 0) return "continue";
+
+	// Cap chunk size so observer models do not time out or overflow on massive historical sessions.
+	const maxChunkTokens = Math.max(runtime.config.observeAfterTokens * 2, 40_000);
+	const chunkEntries = sliceEntriesByTokenBudget(allPendingEntries, maxChunkTokens);
 	const coversUpToId = chunkEntries.at(-1)?.id;
 	if (!coversUpToId) return "continue";
 
