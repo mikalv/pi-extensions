@@ -4,6 +4,17 @@
   "type": "module",
   "description": "Unified subagent and workflow control plane for pi. Merges in-process, subprocess, Claude, and Codex runtimes with universal discovery, JS worker workflows, and high-speed observability.",
   "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./control": "./src/control/index.ts",
+    "./discovery": "./src/discovery/index.ts",
+    "./runtimes": "./src/runtimes/index.ts",
+    "./workflow": "./src/workflow/index.ts",
+    "./observability": "./src/observability/index.ts",
+    "./ui": "./src/ui/index.ts",
+    "./superpowers-bridge": "./src/superpowers-bridge.ts"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

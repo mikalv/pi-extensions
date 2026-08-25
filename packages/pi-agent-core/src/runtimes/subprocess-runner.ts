@@ -56,7 +56,7 @@ export class SubprocessRunner implements AgentRunner {
 
     const model = options.model ?? agent.model;
     if (model) {
-      args.push("--model", model);
+      args.push("--models", model);
     }
 
     const thinking = options.thinking ?? agent.thinking;
@@ -71,11 +71,6 @@ export class SubprocessRunner implements AgentRunner {
 
     if (agent.systemPrompt) {
       args.push("--append-system-prompt", agent.systemPrompt);
-    }
-
-    const turnBudget = options.turnBudget ?? agent.turnBudget;
-    if (turnBudget) {
-      args.push("--max-turns", String(turnBudget));
     }
 
     args.push("-p", options.prompt);

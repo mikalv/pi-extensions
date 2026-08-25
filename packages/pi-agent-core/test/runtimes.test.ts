@@ -212,7 +212,7 @@ describe("Pluggable Runtime Adapters", () => {
       expect(args).toContain("--mode");
       expect(args).toContain("json");
       expect(args).toContain("-p");
-      expect(args).toContain("--model");
+      expect(args).toContain("--models");
       expect(args).toContain("zai/glm-5.2");
       expect(args).toContain("--thinking");
       expect(args).toContain("high");

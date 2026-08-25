@@ -108,6 +108,7 @@ export interface ExecutionOptions {
   timeout?: number;
   parentRunId?: string;
   depth?: number;
+  ctx?: any;
   env?: Record<string, string>;
   onUpdate?: (update: RunUpdate) => void;
   signal?: AbortSignal;
@@ -336,6 +337,7 @@ export function validateExecutionOptions(
     timeout: typeof obj.timeout === "number" ? obj.timeout : DEFAULT_SUBAGENT_TIMEOUT_MS,
     parentRunId: typeof obj.parentRunId === "string" ? obj.parentRunId : undefined,
     depth,
+    ctx: obj.ctx,
     env: obj.env && typeof obj.env === "object" ? (obj.env as Record<string, string>) : undefined,
     onUpdate: typeof obj.onUpdate === "function" ? (obj.onUpdate as (update: RunUpdate) => void) : undefined,
     signal: obj.signal instanceof AbortSignal ? obj.signal : undefined,

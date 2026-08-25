@@ -37,7 +37,10 @@ export function getRuntimeRunner(runtime: RuntimeType): AgentRunner {
   return runner;
 }
 
-export function createRuntimeRunner(agent: AgentDefinition): AgentRunner {
-  const runtime = agent.runtime ?? "pi-inprocess";
+export function createRuntimeRunner(
+  agent: AgentDefinition,
+  options?: ExecutionOptions
+): AgentRunner {
+  const runtime = options?.runtime ?? agent.runtime ?? "pi-inprocess";
   return getRuntimeRunner(runtime);
 }

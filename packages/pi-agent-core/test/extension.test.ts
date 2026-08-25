@@ -62,6 +62,7 @@ function createMockPi() {
 function createMockContext() {
   const widgetCalls: Array<{ key: string; value: any; options?: any }> = [];
   const notifications: Array<{ message: string; level?: string }> = [];
+  const customOverlays: any[] = [];
   let editorOpened: { title: string; content: string } | null = null;
 
   const ctx = {
@@ -82,6 +83,10 @@ function createMockContext() {
       notify(message: string, level?: string) {
         notifications.push({ message, level });
       },
+      async custom(factory: any, options?: any) {
+        customOverlays.push({ factory, options });
+        return;
+      },
       async editor(title: string, content: string) {
         editorOpened = { title, content };
         return content;
@@ -95,6 +100,7 @@ function createMockContext() {
     },
     widgetCalls,
     notifications,
+    customOverlays,
     getEditorOpened() {
       return editorOpened;
     },
@@ -421,9 +427,8 @@ describe("Interactive TUI Overlays, Extension Entrypoint & Superpowers Bridge", 
       const historyCmd = pi.commands.get("sub:history")!;
       await historyCmd.options.handler("", ctx);
 
-      expect(ctx.getEditorOpened()).toBeDefined();
-      expect(ctx.getEditorOpened()!.content).toContain("Subagent Execution History");
-      expect(ctx.getEditorOpened()!.content).toContain("verifier");
+      // In mock context with custom support, custom overlay is created
+      expect(ctx.customOverlays.length).toBeGreaterThan(0);
     });
   });
 });

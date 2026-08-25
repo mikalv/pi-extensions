@@ -16,10 +16,14 @@ import {
   type RunRecord,
   type WorkflowResult,
 } from "./types.js";
+import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
   ActiveWidgetController,
+  openHistoryModal,
   openPeekModal,
   openWorkflowsView,
+  renderSubagentToolCall,
+  renderSubagentToolResult,
   type ActiveWidgetOptions,
 } from "./ui/index.js";
 import { WorkflowRunner } from "./workflow/index.js";
@@ -88,8 +92,71 @@ export default function piAgentCoreExtension(
   workflowRunner.on("workflow:error", () => updateWidget());
 
   // Hook session_start
+  let unsubTerminalInput: (() => void) | null = null;
+
+  async function getRunsForSelection(ctx: any): Promise<RunRecord[]> {
+    const memoryRuns = controlPlane.getAllRuns();
+    if (memoryRuns.length > 0) return memoryRuns;
+
+    try {
+      const records = await auditLogger.query({ limit: 30 });
+      return records.map((r) => ({
+        id: r.runId,
+        agent: r.agent,
+        prompt: r.prompt,
+        runtime: (r.runtime as any) || "pi-inprocess",
+        depth: r.depth,
+        turnBudget: 20,
+        status: r.status as any,
+        state: "DONE",
+        startedAt: r.startedAt || 0,
+        completedAt: r.completedAt,
+        durationMs: r.durationMs,
+        turns: r.turns,
+        tokens: r.tokens,
+        output: r.output || "",
+        error: r.error,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  function setupTerminalInputListener(ctx: any) {
+    unsubTerminalInput?.();
+    unsubTerminalInput = null;
+
+    if (!ctx?.hasUI || !ctx?.ui?.onTerminalInput) return;
+
+    unsubTerminalInput = ctx.ui.onTerminalInput((data: string) => {
+      // Trigger interactive subagent history overlay on Arrow Left or Arrow Down in empty editor prompt
+      const isArrowDown = matchesKey(data, Key.down) || data === "\x1b[B" || data === "\x1bOB" || data === "\x1b[b";
+      const isArrowLeft = matchesKey(data, Key.left) || data === "\x1b[D" || data === "\x1bOD" || data === "\x1b[d";
+
+      if (isArrowDown || isArrowLeft) {
+        const editorText = (ctx.ui.getEditorText?.() ?? "").trim();
+        if (editorText.length === 0) {
+          getRunsForSelection(ctx).then((runs) => {
+            if (runs.length > 0) {
+              openHistoryModal(runs, ctx);
+            }
+          });
+          return true; // Consume key
+        }
+      }
+      return undefined;
+    });
+  }
+
   pi.on("session_start", (_event: any, ctx: any) => {
     currentSessionContext = ctx;
+    setupTerminalInputListener(ctx);
+    updateWidget();
+  });
+
+  pi.on("session_tree", (_event: any, ctx: any) => {
+    currentSessionContext = ctx;
+    setupTerminalInputListener(ctx);
     updateWidget();
   });
 
@@ -184,6 +251,7 @@ export default function piAgentCoreExtension(
         worktree: params.worktree,
         depth: requestedDepth,
         cwd: ctx?.cwd,
+        ctx,
         signal,
         onUpdate: (u) => {
           onUpdate?.({
@@ -257,6 +325,12 @@ export default function piAgentCoreExtension(
         updateWidget();
       }
     },
+    renderCall(args: any, theme: any, context?: any) {
+      return renderSubagentToolCall(args, theme, context);
+    },
+    renderResult(result: any, options: any, theme: any) {
+      return renderSubagentToolResult(result, options, theme);
+    },
   });
 
   // ---------------------------------------------------------------------------
@@ -300,10 +374,10 @@ export default function piAgentCoreExtension(
 
   // /sub:peek <id>
   pi.registerCommand("sub:peek", {
-    description: "Peek at a live running or completed subagent transcript",
+    description: "Peek at a live running or completed subagent transcript (interactive overlay)",
     getArgumentCompletions: async () => {
-      const active = controlPlane.getActiveRuns();
-      return active.map((r) => ({ value: r.id, label: `${r.agent} [${r.id}] (${r.status})` }));
+      const all = controlPlane.getAllRuns();
+      return all.map((r) => ({ value: r.id, label: `${r.agent} [${r.id}] (${r.status})` }));
     },
     handler: async (args: string, ctx: any) => {
       currentSessionContext = ctx;
@@ -313,20 +387,17 @@ export default function piAgentCoreExtension(
       if (trimmed) {
         run = controlPlane.getRun(trimmed);
       } else {
-        const active = controlPlane.getActiveRuns();
-        if (active.length === 1) {
-          run = active[0];
-        } else if (active.length > 1 && ctx.ui?.select) {
-          const chosen = await ctx.ui.select(
-            "Select subagent run to peek:",
-            active.map((r) => ({ label: `${r.agent} (${r.id})`, value: r.id }))
-          );
-          if (chosen) run = controlPlane.getRun(chosen);
+        const all = controlPlane.getAllRuns();
+        if (all.length === 1) {
+          run = all[0];
+        } else if (all.length > 1) {
+          await openHistoryModal(all, ctx);
+          return;
         }
       }
 
       if (!run) {
-        ctx.ui?.notify?.("No active run found to peek. Provide run ID: /sub:peek <runId>", "warning");
+        ctx.ui?.notify?.("No subagent run found. Use /sub:peek or /sub:history to browse.", "warning");
         return;
       }
 
@@ -387,41 +458,37 @@ export default function piAgentCoreExtension(
 
   // /sub:history
   pi.registerCommand("sub:history", {
-    description: "Show subagent audit execution history and summaries",
+    description: "Show interactive subagent history overlay modal",
     handler: async (_args: string, ctx: any) => {
       currentSessionContext = ctx;
       try {
-        const summary = await auditLogger.getSummary();
-        const records = await auditLogger.query({ limit: 20 });
-
-        const lines: string[] = [
-          "================================================================================",
-          " Subagent Execution History & Summary",
-          "================================================================================",
-          `Total Runs:     ${summary.totalRuns}`,
-          `Success Rate:   ${(summary.successRate * 100).toFixed(1)}%`,
-          `Total Tokens:   ${summary.totalTokens.total} total`,
-          `Total Duration: ${(summary.totalDurationMs / 1000).toFixed(1)}s`,
-          "--------------------------------------------------------------------------------",
-          " Recent Executions (last 20):",
-          "--------------------------------------------------------------------------------",
-        ];
-
-        for (const r of records) {
-          const timeStr = r.startedAt ? new Date(r.startedAt).toLocaleTimeString() : "";
-          const durStr = r.durationMs ? `${(r.durationMs / 1000).toFixed(1)}s` : "";
-          lines.push(`• [${r.status.toUpperCase()}] ${r.agent} (${r.runId}) · ${durStr} · ${timeStr}`);
-          lines.push(`  Prompt: ${r.prompt.slice(0, 70)}...`);
-        }
-        lines.push("================================================================================");
-
-        const text = lines.join("\n");
-        if (ctx.hasUI && ctx.ui?.editor) {
-          await ctx.ui.editor("Subagent Execution History", text);
-        } else if (ctx.hasUI && ctx.ui?.notify) {
-          ctx.ui.notify(`History: ${summary.totalRuns} total runs`, "info");
+        const runs = controlPlane.getAllRuns();
+        if (runs.length > 0) {
+          await openHistoryModal(runs, ctx);
         } else {
-          process.stdout.write(`\n${text}\n`);
+          const records = await auditLogger.query({ limit: 30 });
+          if (records.length === 0) {
+            ctx.ui?.notify?.("No subagent runs recorded yet.", "info");
+            return;
+          }
+          const synthRuns: RunRecord[] = records.map((r) => ({
+            id: r.runId,
+            agent: r.agent,
+            prompt: r.prompt,
+            runtime: (r.runtime as any) || "pi-inprocess",
+            depth: r.depth,
+            turnBudget: 20,
+            status: r.status as any,
+            state: "DONE",
+            startedAt: r.startedAt || 0,
+            completedAt: r.completedAt,
+            durationMs: r.durationMs,
+            turns: r.turns,
+            tokens: r.tokens,
+            output: r.output || "",
+            error: r.error,
+          }));
+          await openHistoryModal(synthRuns, ctx);
         }
       } catch (err: any) {
         ctx.ui?.notify?.(`Failed to load history: ${err.message}`, "error");

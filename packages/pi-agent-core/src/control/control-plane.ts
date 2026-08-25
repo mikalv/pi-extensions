@@ -22,7 +22,7 @@ export interface ControlPlaneOptions {
   steeringManager?: SteeringManager;
   replayCache?: ReplayCache | ReplayCacheOptions;
   enableReplayCache?: boolean;
-  runnerResolver?: (agent: AgentDefinition) => AgentRunner;
+  runnerResolver?: (agent: AgentDefinition, options?: ExecutionOptions) => AgentRunner;
   defaultTimeoutMs?: number;
 }
 
@@ -41,7 +41,10 @@ export class ControlPlane extends EventEmitter {
   public readonly steering: SteeringManager;
   public readonly replayCache: ReplayCache;
   public readonly enableReplayCache: boolean;
-  private readonly runnerResolver: (agent: AgentDefinition) => AgentRunner;
+  private readonly runnerResolver: (
+    agent: AgentDefinition,
+    options?: ExecutionOptions
+  ) => AgentRunner;
   private readonly defaultTimeoutMs: number;
 
   private activeRuns = new Map<string, ActiveRunEntry>();
@@ -148,7 +151,7 @@ export class ControlPlane extends EventEmitter {
     });
 
     const lifecycle = new RunLifecycle(initialRecord);
-    const runner = this.runnerResolver(validatedAgent);
+    const runner = this.runnerResolver(validatedAgent, options);
 
     const abortController = new AbortController();
     if (options.signal) {
@@ -199,14 +202,30 @@ export class ControlPlane extends EventEmitter {
           }, timeoutMs);
         }
 
-        const handleProgressUpdate = (chunk: string) => {
+        const handleProgressUpdate = (chunk: string | any) => {
+          let lastMessage = typeof chunk === "string" ? chunk : chunk?.lastMessage;
+          if (typeof chunk === "object" && chunk !== null) {
+            if (typeof chunk.turns === "number") {
+              lifecycle.record.turns = chunk.turns;
+            }
+            if (chunk.tokens) {
+              lifecycle.record.tokens = {
+                input: chunk.tokens.input ?? lifecycle.record.tokens.input,
+                output: chunk.tokens.output ?? lifecycle.record.tokens.output,
+                total: chunk.tokens.total ?? lifecycle.record.tokens.total,
+                cacheRead: lifecycle.record.tokens.cacheRead,
+                cacheWrite: lifecycle.record.tokens.cacheWrite,
+              };
+            }
+          }
+
           this.emit("run_update", {
             runId: initialRecord.id,
-            chunk,
+            chunk: lastMessage || "",
           });
           this.emit("run:update", {
             runId: initialRecord.id,
-            chunk,
+            chunk: lastMessage || "",
           });
 
           if (options.onUpdate) {
@@ -214,7 +233,7 @@ export class ControlPlane extends EventEmitter {
               runId: initialRecord.id,
               status: lifecycle.status,
               turns: lifecycle.record.turns,
-              lastMessage: chunk,
+              lastMessage: lastMessage || "",
               tokens: lifecycle.record.tokens,
             };
             options.onUpdate(update);
@@ -350,6 +369,13 @@ export class ControlPlane extends EventEmitter {
    */
   public listAllRuns(): RunRecord[] {
     return Array.from(this.allRuns.values());
+  }
+
+  /**
+   * Alias for listAllRuns().
+   */
+  public getAllRuns(): RunRecord[] {
+    return this.listAllRuns();
   }
 
   /**
