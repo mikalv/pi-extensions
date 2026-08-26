@@ -94,6 +94,16 @@ describe("runs.json", () => {
 		expect(rows.some((r) => r.runId === `r${RUNS_PER_JOB + 9}`)).toBe(true);
 	});
 
+	it("keeps every row when parallel runs save at the same time", async () => {
+		await Promise.all([
+			saveRun(dir, row({ runId: "p1", jobId: "a", startedAt: "2026-08-26T00:01:00.000Z" })),
+			saveRun(dir, row({ runId: "p2", jobId: "a", startedAt: "2026-08-26T00:01:01.000Z" })),
+			saveRun(dir, row({ runId: "p3", jobId: "a", startedAt: "2026-08-26T00:01:02.000Z" })),
+		]);
+
+		expect((await loadRuns(dir)).map((r) => r.runId).sort()).toEqual(["p1", "p2", "p3"]);
+	});
+
 	it("reports the last run and the median duration per job", async () => {
 		await saveRun(dir, row({ runId: "r1", jobId: "a", startedAt: "2026-08-26T00:01:00.000Z", durationMs: 100 }));
 		await saveRun(dir, row({ runId: "r2", jobId: "a", startedAt: "2026-08-26T00:02:00.000Z", durationMs: 300 }));

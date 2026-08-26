@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -35,7 +36,8 @@ export function enabledKey(workspace: string, id: string): string {
 
 export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
-	const tmp = `${path}.${process.pid}.tmp`;
+	// Unique per write: two parallel runs in one process would otherwise race for the same temp file.
+	const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 	await rename(tmp, path);
 }
@@ -78,7 +80,20 @@ export async function loadRuns(stateDir: string): Promise<RunRow[]> {
 	return file.runs ?? [];
 }
 
-export async function saveRun(stateDir: string, run: RunRow): Promise<void> {
+// runs.json is read-modify-written, so concurrent callers in one process must take turns or
+// lose rows. Only the leader process writes it, so an in-process chain is enough.
+let runWrites: Promise<unknown> = Promise.resolve();
+
+export function saveRun(stateDir: string, run: RunRow): Promise<void> {
+	const next = runWrites.then(
+		() => saveRunNow(stateDir, run),
+		() => saveRunNow(stateDir, run),
+	);
+	runWrites = next;
+	return next;
+}
+
+async function saveRunNow(stateDir: string, run: RunRow): Promise<void> {
 	const rows = (await loadRuns(stateDir)).filter((existing) => existing.runId !== run.runId);
 	rows.push(run);
 
