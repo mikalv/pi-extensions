@@ -9,6 +9,7 @@ import {
   validateExecutionOptions,
   type AgentDefinition,
   type ExecutionOptions,
+  type ProgressPayload,
   type RunRecord,
   type RunUpdate,
 } from "../types.js";
@@ -24,6 +25,28 @@ export interface ControlPlaneOptions {
   enableReplayCache?: boolean;
   runnerResolver?: (agent: AgentDefinition, options?: ExecutionOptions) => AgentRunner;
   defaultTimeoutMs?: number;
+}
+
+const ANSI_PATTERN =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape sequences use control characters by definition.
+  /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[\u0000-\u0008\u000b-\u001f\u007f]/g;
+
+const ACTIVITY_LINE_MAX_CHARS = 200;
+
+/** Strip ANSI, collapse to the last non-empty line, and cap length. */
+function normalizeActivityLine(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const line = text
+    .replace(/\r\n?/g, "\n")
+    .replace(ANSI_PATTERN, "")
+    .split("\n")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .pop();
+  if (!line) return undefined;
+  return line.length > ACTIVITY_LINE_MAX_CHARS
+    ? line.slice(0, ACTIVITY_LINE_MAX_CHARS)
+    : line;
 }
 
 interface ActiveRunEntry {
@@ -202,22 +225,39 @@ export class ControlPlane extends EventEmitter {
           }, timeoutMs);
         }
 
-        const handleProgressUpdate = (chunk: string | any) => {
-          let lastMessage = typeof chunk === "string" ? chunk : chunk?.lastMessage;
-          if (typeof chunk === "object" && chunk !== null) {
-            if (typeof chunk.turns === "number") {
-              lifecycle.record.turns = chunk.turns;
-            }
-            if (chunk.tokens) {
-              lifecycle.record.tokens = {
-                input: chunk.tokens.input ?? lifecycle.record.tokens.input,
-                output: chunk.tokens.output ?? lifecycle.record.tokens.output,
-                total: chunk.tokens.total ?? lifecycle.record.tokens.total,
-                cacheRead: lifecycle.record.tokens.cacheRead,
-                cacheWrite: lifecycle.record.tokens.cacheWrite,
-              };
-            }
-          }
+        const handleProgressUpdate = (chunk: string | ProgressPayload) => {
+          const payload: ProgressPayload =
+            typeof chunk === "string" ? { lastMessage: chunk } : (chunk ?? {});
+          const lastMessage = payload.lastMessage;
+
+          const tokens = payload.tokens
+            ? {
+                input: payload.tokens.input ?? lifecycle.record.tokens.input,
+                output: payload.tokens.output ?? lifecycle.record.tokens.output,
+                total: payload.tokens.total ?? lifecycle.record.tokens.total,
+                cacheRead:
+                  payload.tokens.cacheRead ?? lifecycle.record.tokens.cacheRead,
+                cacheWrite:
+                  payload.tokens.cacheWrite ??
+                  lifecycle.record.tokens.cacheWrite,
+              }
+            : undefined;
+
+          lifecycle.updateProgress({
+            turns: typeof payload.turns === "number" ? payload.turns : undefined,
+            tokens,
+            toolCall: payload.toolCall
+              ? {
+                  tool: payload.toolCall.tool,
+                  args: payload.toolCall.args,
+                  result: payload.toolCall.result,
+                  timestamp: Date.now(),
+                }
+              : undefined,
+            thought: payload.thought,
+            output: payload.output,
+            lastLine: normalizeActivityLine(lastMessage),
+          });
 
           this.emit("run_update", {
             runId: initialRecord.id,
@@ -234,6 +274,14 @@ export class ControlPlane extends EventEmitter {
               status: lifecycle.status,
               turns: lifecycle.record.turns,
               lastMessage: lastMessage || "",
+              thought: payload.thought,
+              toolCall: payload.toolCall
+                ? {
+                    tool: payload.toolCall.tool,
+                    args: payload.toolCall.args,
+                    result: payload.toolCall.result,
+                  }
+                : undefined,
               tokens: lifecycle.record.tokens,
             };
             options.onUpdate(update);
@@ -247,12 +295,28 @@ export class ControlPlane extends EventEmitter {
           handleProgressUpdate
         );
 
+        // Runners execute against their own RunRecord instance. Adopt the
+        // transcript details that cannot arrive through progress updates, so
+        // inspectors see them regardless of final status.
+        lifecycle.mergeToolCalls(resultRecord.toolCalls);
+        if (resultRecord.output && !lifecycle.record.output) {
+          lifecycle.record.output = resultRecord.output;
+        }
+
+        // A runner that streamed progress but reports empty counters in its
+        // final record must not reset what inspectors already showed.
+        const finalTurns = resultRecord.turns || lifecycle.record.turns;
+        const finalTokens =
+          (resultRecord.tokens?.total ?? 0) > 0
+            ? resultRecord.tokens
+            : lifecycle.record.tokens;
+
         if (lifecycle.state !== "DONE") {
           if (resultRecord.status === "completed") {
             lifecycle.complete({
               output: resultRecord.output,
-              turns: resultRecord.turns,
-              tokens: resultRecord.tokens,
+              turns: finalTurns,
+              tokens: finalTokens,
               verdict: resultRecord.verdict,
               diff: resultRecord.diff,
               artifacts: resultRecord.artifacts,

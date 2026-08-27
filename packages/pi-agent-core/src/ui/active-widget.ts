@@ -2,6 +2,24 @@ import type { RunRecord, WorkflowResult } from "../types.js";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+const ACTIVITY_LABEL_MAX_CHARS = 96;
+const IDLE_WARNING_MS = 60_000;
+
+/**
+ * Collapse a runner activity line to a single readable label.
+ */
+function activityLabel(run: RunRecord): string | undefined {
+  const line = run.lastLine
+    ?.replace(/\s*\n+\s*/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const text = line || (run.lastToolName ? `tool: ${run.lastToolName}` : undefined);
+  if (!text) return undefined;
+  return text.length > ACTIVITY_LABEL_MAX_CHARS
+    ? `${text.slice(0, ACTIVITY_LABEL_MAX_CHARS - 1)}…`
+    : text;
+}
+
 export interface ActiveWidgetOptions {
   widgetKey?: string;
   updateIntervalMs?: number;
@@ -77,13 +95,25 @@ export class ActiveWidgetController {
       const tokenStr = this.formatTokens(run.tokens?.total ?? 0);
       const turnsStr = `${run.turns}/${run.turnBudget} turns`;
       const depthStr = `Depth: ${run.depth}/10`;
+      const toolStr = run.toolCalls?.length
+        ? ` · ${run.toolCalls.length} tools`
+        : "";
 
       const agentName = theme?.accent ? theme.accent(run.agent) : run.agent;
-      const meta = theme?.dim
-        ? theme.dim(`(${depthStr} · ${turnsStr} · ${tokenStr} · ${elapsed})`)
-        : `(${depthStr} · ${turnsStr} · ${tokenStr} · ${elapsed})`;
+      const head = `${spinner} [subagent] ${agentName} · ${depthStr} · ${turnsStr} · ${tokenStr}${toolStr} · ${elapsed}`;
 
-      lines.push(`${spinner} [subagent] ${agentName} · ${depthStr} · ${turnsStr} · ${tokenStr} · ${elapsed}`);
+      const idleMs = run.lastActivityAt ? now - run.lastActivityAt : 0;
+      const idleStr =
+        idleMs >= IDLE_WARNING_MS
+          ? ` · idle ${this.formatDuration(idleMs)}`
+          : "";
+      lines.push(`${head}${idleStr}`);
+
+      const activity = activityLabel(run);
+      if (activity) {
+        const rendered = theme?.dim ? theme.dim(activity) : activity;
+        lines.push(`   ↳ ${rendered}`);
+      }
     }
 
     return lines;

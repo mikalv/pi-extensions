@@ -14,6 +14,7 @@ import {
   type AgentDefinition,
   type ExecutionOptions,
   type RunRecord,
+  type RunUpdate,
   type WorkflowResult,
 } from "./types.js";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
@@ -36,6 +37,32 @@ export * from "./workflow/index.js";
 export * from "./observability/index.js";
 export * from "./ui/index.js";
 export * from "./superpowers-bridge.js";
+
+/**
+ * Single-line progress text shown in the parent transcript while a subagent runs.
+ */
+function formatSubagentProgressText(
+  agent: string,
+  update: string | RunUpdate | undefined
+): string {
+  if (typeof update === "string") return update;
+  if (!update) return `[subagent: ${agent} running...]`;
+
+  const parts: string[] = [];
+  if (update.toolCall) {
+    parts.push(
+      update.toolCall.result !== undefined
+        ? `✓ ${update.toolCall.tool}`
+        : `→ ${update.toolCall.tool}`
+    );
+  }
+  if (update.turns) parts.push(`turn ${update.turns}`);
+  if (update.lastMessage) parts.push(update.lastMessage);
+
+  return parts.length > 0
+    ? `[${agent}] ${parts.join(" · ")}`
+    : `[subagent: ${agent} running...]`;
+}
 
 export interface PiAgentCoreExtensionOptions {
   controlPlane?: ControlPlane;
@@ -71,6 +98,9 @@ export default function piAgentCoreExtension(
 
   const recordedWorkflows: WorkflowResult[] = [];
   let currentSessionContext: any = null;
+
+  /** Resolves the tracked record so open inspectors follow a run as it advances. */
+  const getLiveRun = (id: string) => controlPlane.getRun(id);
 
   function updateWidget() {
     if (currentSessionContext) {
@@ -200,7 +230,7 @@ export default function piAgentCoreExtension(
             content: [
               {
                 type: "text",
-                text: typeof u === "string" ? u : (u?.lastMessage || `[subagent: ${params.agent} running...]`),
+                text: formatSubagentProgressText(params.agent, u),
               },
             ],
             details: u,
@@ -333,7 +363,7 @@ export default function piAgentCoreExtension(
         if (all.length === 1) {
           run = all[0];
         } else if (all.length > 1) {
-          await openHistoryModal(all, ctx);
+          await openHistoryModal(all, ctx, getLiveRun);
           return;
         }
       }
@@ -343,7 +373,7 @@ export default function piAgentCoreExtension(
         return;
       }
 
-      await openPeekModal(run, ctx);
+      await openPeekModal(run, ctx, getLiveRun);
     },
   });
 
@@ -406,7 +436,7 @@ export default function piAgentCoreExtension(
       try {
         const runs = controlPlane.getAllRuns();
         if (runs.length > 0) {
-          await openHistoryModal(runs, ctx);
+          await openHistoryModal(runs, ctx, getLiveRun);
         } else {
           const records = await auditLogger.query({ limit: 30 });
           if (records.length === 0) {
@@ -430,7 +460,7 @@ export default function piAgentCoreExtension(
             output: r.output || "",
             error: r.error,
           }));
-          await openHistoryModal(synthRuns, ctx);
+          await openHistoryModal(synthRuns, ctx, getLiveRun);
         }
       } catch (err: any) {
         ctx.ui?.notify?.(`Failed to load history: ${err.message}`, "error");
@@ -476,5 +506,71 @@ export default function piAgentCoreExtension(
       ctx.ui?.notify?.(`Executing Superpowers implementation for: ${task}`, "info");
       await superpowers.dispatchImplement(task, { cwd: ctx?.cwd });
     },
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3. Arrow-key & Shortcut Navigation for Subagent Inspection
+  // ---------------------------------------------------------------------------
+  // Register explicit shortcut as primary binding
+  if (typeof (pi as any).registerShortcut === "function") {
+    (pi as any).registerShortcut("ctrl+alt+s", {
+      description: "Open subagents inspector overlay",
+      handler: async (ctx: any) => {
+        currentSessionContext = ctx;
+        const runs = controlPlane.getAllRuns();
+        if (runs.length > 0) {
+          await openHistoryModal(runs, ctx, getLiveRun);
+        } else {
+          ctx.ui?.notify?.("No subagent runs recorded yet.", "info");
+        }
+      },
+    });
+  }
+
+  // Raw terminal input listener: Left Arrow opens subagent peek/history
+  // when editor is empty or when not in an interactive selection dialog
+  let isOverlayActive = false;
+
+  pi.on("session_start", (_event: any, ctx: any) => {
+    if (!ctx.hasUI || !ctx.ui?.onTerminalInput) return;
+
+    ctx.ui.onTerminalInput((data: string) => {
+      // If modal already open or no runs exist, pass through
+      if (isOverlayActive) return;
+
+      // Check for Left Arrow key sequence (or Ctrl+Left / Alt+Left)
+      const isLeft =
+        matchesKey(data, "left") ||
+        matchesKey(data, "alt+left") ||
+        matchesKey(data, "ctrl+left") ||
+        data === "\x1b[D" ||
+        data === "\x1b[1;5D" ||
+        data === "\x1b[1;3D";
+
+      if (!isLeft) return;
+
+      const runs = controlPlane.getAllRuns();
+      if (runs.length === 0) return;
+
+      // Only trigger if editor input is empty so normal cursor movement in text isn't hijacked
+      const editorText = ctx.ui.getEditorText ? ctx.ui.getEditorText() : "";
+      if (editorText && editorText.trim().length > 0) {
+        return;
+      }
+
+      isOverlayActive = true;
+      (async () => {
+        try {
+          const active = controlPlane.getActiveRuns();
+          if (active.length === 1) {
+            await openPeekModal(active[0], ctx, getLiveRun);
+          } else {
+            await openHistoryModal(runs, ctx, getLiveRun);
+          }
+        } finally {
+          isOverlayActive = false;
+        }
+      })();
+    });
   });
 }

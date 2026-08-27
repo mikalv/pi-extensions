@@ -1,6 +1,7 @@
 import type {
   AgentDefinition,
   ExecutionOptions,
+  ProgressPayload,
   RunRecord,
   RuntimeType,
 } from "../types.js";
@@ -28,6 +29,6 @@ export interface AgentRunner {
     agent: AgentDefinition,
     options: ExecutionOptions,
     signal?: AbortSignal,
-    onUpdate?: (chunk: string) => void
+    onUpdate?: (chunk: string | ProgressPayload) => void
   ): Promise<RunRecord>;
 }

@@ -14,6 +14,7 @@ import type { Message, TextContent } from "@earendil-works/pi-ai";
 import {
   type AgentDefinition,
   type ExecutionOptions,
+  type ProgressPayload,
   type RunRecord,
   type TokenUsage,
   type ToolCallRecord,
@@ -31,15 +32,10 @@ export interface InProcessExecutionResult {
   toolCalls?: ToolCallRecord[];
 }
 
-export interface ProgressPayload {
-  lastMessage?: string;
-  turns?: number;
-  tokens?: {
-    input?: number;
-    output?: number;
-    total?: number;
-  };
-}
+export type { ProgressPayload };
+
+/** Assistant text arrives per token; progress is emitted at most this often. */
+const DELTA_EMIT_INTERVAL_MS = 150;
 
 export type InProcessExecutor = (
   agent: AgentDefinition,
@@ -203,6 +199,8 @@ export class InProcessRunner implements AgentRunner {
 
             if (activeTools.length > 0 && typeof agentLoop === "function") {
               // Run full multi-turn agentLoop with tools
+              let currentLlmText = "";
+              let lastDeltaEmitAt = 0;
               const prompts: Message[] = [
                 {
                   role: "user",
@@ -277,6 +275,7 @@ export class InProcessRunner implements AgentRunner {
                     args: ev.args,
                     timestamp: Date.now(),
                   });
+                  record.toolCalls = toolCalls;
                   onUpdate?.({
                     turns,
                     tokens: {
@@ -284,12 +283,44 @@ export class InProcessRunner implements AgentRunner {
                       output: outputTokens,
                       total: inputTokens + outputTokens,
                     },
+                    toolCall: { tool: toolName, args: ev.args },
                     lastMessage: `[tool: ${toolName}]`,
                   });
+                } else if (event.type === "tool_execution_end" || (event as any).type === "tool_end") {
+                  const ev = event as any;
+                  const toolResult = ev.result ?? ev.output;
+                  let completedTool: string | undefined;
+                  if (toolCalls.length > 0) {
+                    const lastTc = toolCalls[toolCalls.length - 1];
+                    if (lastTc && lastTc.result === undefined) {
+                      lastTc.result = toolResult;
+                      completedTool = lastTc.tool;
+                    }
+                  }
+                  record.toolCalls = toolCalls;
+                  if (completedTool) {
+                    onUpdate?.({
+                      turns,
+                      toolCall: { tool: completedTool, result: toolResult },
+                      lastMessage: `[tool: ${completedTool} done]`,
+                    });
+                  }
                 } else if (event.type === "message_update" || (event as any).type === "text_delta") {
                   const ev = event as any;
                   if (ev.delta) {
-                    onUpdate?.(ev.delta);
+                    currentLlmText += ev.delta;
+                    record.output = currentLlmText;
+                    // Deltas arrive per token; forwarding each one would rerender
+                    // the widget and inspector faster than anyone can read.
+                    const now = Date.now();
+                    if (now - lastDeltaEmitAt >= DELTA_EMIT_INTERVAL_MS) {
+                      lastDeltaEmitAt = now;
+                      onUpdate?.({
+                        turns,
+                        output: currentLlmText,
+                        lastMessage: currentLlmText,
+                      });
+                    }
                   }
                 }
               }
@@ -313,6 +344,11 @@ export class InProcessRunner implements AgentRunner {
                       .trim();
                   }
                 }
+              }
+
+              // Fallback if message content was streamed but not captured in finalMessages
+              if (!llmOutput && currentLlmText.trim()) {
+                llmOutput = currentLlmText.trim();
               }
             } else {
               // Standard completeSimple completion

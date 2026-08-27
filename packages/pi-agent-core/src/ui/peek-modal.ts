@@ -2,6 +2,34 @@ import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-a
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { RunRecord } from "../types.js";
 
+const RESULT_PREVIEW_MAX_CHARS = 2000;
+const RESULT_PREVIEW_MAX_LINES = 40;
+
+/**
+ * Render a tool argument or result for inspection, capped so a single large
+ * file read cannot bury the rest of the transcript.
+ */
+function previewValue(value: unknown): string[] {
+  const text =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2) ?? "";
+  const clipped =
+    text.length > RESULT_PREVIEW_MAX_CHARS
+      ? text.slice(0, RESULT_PREVIEW_MAX_CHARS)
+      : text;
+  const lines = clipped.split("\n");
+  const truncatedLines = lines.length > RESULT_PREVIEW_MAX_LINES;
+  const visible = truncatedLines
+    ? lines.slice(0, RESULT_PREVIEW_MAX_LINES)
+    : lines;
+  if (truncatedLines || clipped.length < text.length) {
+    const omitted = text.length - clipped.length;
+    visible.push(
+      `… truncated (${lines.length - visible.length} more lines, ${omitted} more chars)`
+    );
+  }
+  return visible;
+}
+
 /**
  * Format a complete inspectable transcript for a subagent run.
  */
@@ -17,6 +45,22 @@ export function formatPeekContent(run: RunRecord): string {
   lines.push(`Depth:      ${run.depth}/10`);
   lines.push(`Turns:      ${run.turns} / ${run.turnBudget}`);
   lines.push(`Tokens:     ${run.tokens?.total ?? 0} total (in: ${run.tokens?.input ?? 0}, out: ${run.tokens?.output ?? 0})`);
+  if (run.toolCalls && run.toolCalls.length > 0) {
+    lines.push(`Tool calls: ${run.toolCalls.length}`);
+  }
+  if (run.lastToolName) {
+    lines.push(`Last tool:  ${run.lastToolName}`);
+  }
+  if (run.lastLine) {
+    lines.push(`Activity:   ${run.lastLine}`);
+  }
+  if (run.thought) {
+    lines.push(`Thinking:   ${run.thought}`);
+  }
+  if (run.status === "running" && run.lastActivityAt) {
+    const idleMs = Date.now() - run.lastActivityAt;
+    lines.push(`Idle for:   ${(idleMs / 1000).toFixed(1)}s`);
+  }
   if (run.startedAt) {
     const started = new Date(run.startedAt).toISOString();
     const duration = run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : "running";
@@ -44,13 +88,15 @@ export function formatPeekContent(run: RunRecord): string {
       const tc = run.toolCalls[i];
       const timeStr = tc.timestamp ? new Date(tc.timestamp).toLocaleTimeString() : "";
       lines.push(`[${i + 1}] [Tool Call: ${tc.tool}] ${timeStr}`);
-      lines.push(`Args: ${JSON.stringify(tc.args, null, 2)}`);
+      if (tc.args !== undefined) {
+        lines.push("Args:");
+        lines.push(...previewValue(tc.args));
+      }
       if (tc.result !== undefined) {
-        const resStr =
-          typeof tc.result === "string"
-            ? tc.result
-            : JSON.stringify(tc.result, null, 2);
-        lines.push(`Result: ${resStr}`);
+        lines.push("Result:");
+        lines.push(...previewValue(tc.result));
+      } else if (run.status === "running") {
+        lines.push("Result: (running…)");
       }
       lines.push("");
     }
@@ -65,7 +111,7 @@ export function formatPeekContent(run: RunRecord): string {
   }
 
   lines.push("--------------------------------------------------------------------------------");
-  lines.push(" FINAL OUTPUT");
+  lines.push(run.status === "running" ? " OUTPUT (streaming…)" : " FINAL OUTPUT");
   lines.push("--------------------------------------------------------------------------------");
   lines.push(run.output || "(no output returned)");
   lines.push("================================================================================");
@@ -103,13 +149,29 @@ export class SubagentHistoryComponent {
   private cachedWidth?: number;
   private cachedLines?: string[];
 
+  private readonly timer?: NodeJS.Timeout;
+
   constructor(
     private readonly theme: any,
     private readonly done: () => void,
     private readonly requestRender: () => void,
     private readonly runs: RunRecord[],
     private readonly onSelect: (run: RunRecord) => void
-  ) {}
+  ) {
+    // Status, turn counts and activity lines keep changing while the list is
+    // open, so a still-running list must not render a frozen snapshot.
+    this.timer = setInterval(() => {
+      if (!this.runs.some((r) => r.status === "running")) return;
+      this.cachedWidth = undefined;
+      this.cachedLines = undefined;
+      this.requestRender();
+    }, 500);
+    this.timer.unref?.();
+  }
+
+  dispose(): void {
+    if (this.timer) clearInterval(this.timer);
+  }
 
   private getViewport(): number {
     const rows = Math.max(10, (process.stdout as any).rows || 24);
@@ -126,29 +188,39 @@ export class SubagentHistoryComponent {
   }
 
   handleInput(data: string): void {
-    if (matchesKey(data, Key.up) || data === "k") {
+    if (
+      matchesKey(data, "escape") ||
+      matchesKey(data, Key.escape) ||
+      matchesKey(data, "ctrl+c") ||
+      data === "q" ||
+      data === "Q" ||
+      data === "\x1b" ||
+      data === "\x03"
+    ) {
+      this.dispose();
+      if (typeof this.done === "function") this.done();
+      return;
+    }
+    if (matchesKey(data, "up") || matchesKey(data, Key.up) || data === "k" || data === "\x1b[A") {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
       this.ensureVisible();
       this.cachedWidth = undefined;
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.down) || data === "j") {
+    if (matchesKey(data, "down") || matchesKey(data, Key.down) || data === "j" || data === "\x1b[B") {
       this.selectedIndex = Math.min(this.runs.length - 1, this.selectedIndex + 1);
       this.ensureVisible();
       this.cachedWidth = undefined;
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.enter)) {
+    if (matchesKey(data, "enter") || matchesKey(data, Key.enter) || data === "\r" || data === "\n") {
       const run = this.runs[this.selectedIndex];
       if (run) {
+        this.dispose();
         this.onSelect(run);
       }
-      return;
-    }
-    if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
-      if (typeof this.done === "function") this.done();
       return;
     }
   }
@@ -230,7 +302,7 @@ export class SubagentHistoryComponent {
 }
 
 /**
- * Interactive TUI Component for inspecting a full subagent run transcript with scrolling.
+ * Interactive TUI Component for inspecting a full subagent run transcript with scrolling and live updates.
  * Keys: ↑↓ / j k / PgUp / PgDn scroll · q / Esc / Enter close
  */
 export class SubagentPeekComponent {
@@ -238,15 +310,45 @@ export class SubagentPeekComponent {
   private cachedWidth?: number;
   private cachedLines?: string[];
   private rawLines: string[] = [];
+  private readonly timer?: NodeJS.Timeout;
 
   constructor(
     private readonly theme: any,
     private readonly done: () => void,
     private readonly requestRender: () => void,
     private readonly run: RunRecord,
-    private readonly content: string
+    private readonly getLatestContent?: () => string,
+    private readonly getLatestRun?: () => RunRecord
   ) {
-    this.rawLines = content.split("\n");
+    this.refreshContent();
+    // Auto-refresh while modal is open to stream live tool output/turns
+    this.timer = setInterval(() => {
+      const changed = this.refreshContent();
+      if (changed) {
+        this.cachedWidth = undefined;
+        this.cachedLines = undefined;
+        this.requestRender();
+      }
+    }, 500);
+    this.timer.unref?.();
+  }
+
+  private refreshContent(): boolean {
+    const text = this.getLatestContent ? this.getLatestContent() : formatPeekContent(this.run);
+    const newLines = text.split("\n");
+    if (newLines.length !== this.rawLines.length || text !== this.rawLines.join("\n")) {
+      const wasAtBottom = this.scrollOffset >= Math.max(0, this.rawLines.length - this.getViewportRows());
+      this.rawLines = newLines;
+      if (wasAtBottom) {
+        this.scrollOffset = Math.max(0, this.rawLines.length - this.getViewportRows());
+      }
+      return true;
+    }
+    return false;
+  }
+
+  dispose(): void {
+    if (this.timer) clearInterval(this.timer);
   }
 
   private getViewportRows(): number {
@@ -254,38 +356,51 @@ export class SubagentPeekComponent {
     return Math.max(6, rows - 10);
   }
 
+  /** Live record when a resolver is available, otherwise the opened snapshot. */
+  private get current(): RunRecord {
+    return this.getLatestRun?.() ?? this.run;
+  }
+
   handleInput(data: string): void {
     if (
+      matchesKey(data, "enter") ||
       matchesKey(data, Key.enter) ||
+      matchesKey(data, "escape") ||
       matchesKey(data, Key.escape) ||
+      matchesKey(data, "ctrl+c") ||
       data === "q" ||
-      data === "Q"
+      data === "Q" ||
+      data === "\r" ||
+      data === "\n" ||
+      data === "\x1b" ||
+      data === "\x03"
     ) {
+      this.dispose();
       if (typeof this.done === "function") this.done();
       return;
     }
     const viewport = this.getViewportRows();
     const maxOffset = Math.max(0, this.rawLines.length - viewport);
 
-    if (matchesKey(data, Key.up) || data === "k") {
+    if (matchesKey(data, "up") || matchesKey(data, Key.up) || data === "k" || data === "\x1b[A") {
       this.scrollOffset = Math.max(0, this.scrollOffset - 1);
       this.cachedWidth = undefined;
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.down) || data === "j") {
+    if (matchesKey(data, "down") || matchesKey(data, Key.down) || data === "j" || data === "\x1b[B") {
       this.scrollOffset = Math.min(maxOffset, this.scrollOffset + 1);
       this.cachedWidth = undefined;
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.pageUp)) {
+    if (matchesKey(data, "pageUp") || matchesKey(data, Key.pageUp) || data === "\x1b[5~") {
       this.scrollOffset = Math.max(0, this.scrollOffset - viewport);
       this.cachedWidth = undefined;
       this.requestRender();
       return;
     }
-    if (matchesKey(data, Key.pageDown)) {
+    if (matchesKey(data, "pageDown") || matchesKey(data, Key.pageDown) || data === "\x1b[6~") {
       this.scrollOffset = Math.min(maxOffset, this.scrollOffset + viewport);
       this.cachedWidth = undefined;
       this.requestRender();
@@ -315,8 +430,10 @@ export class SubagentPeekComponent {
           )}/${this.rawLines.length}`
         : "0/0";
 
-    const title = `Subagent: ${this.run.agent} [${this.run.id.slice(0, 10)}] (${this.run.status})`;
-    const subtitle = `Turns: ${this.run.turns}/${this.run.turnBudget} · Tokens: ${this.run.tokens?.total ?? 0} · Runtime: ${this.run.runtime}`;
+    const current = this.current;
+    const toolCount = current.toolCalls?.length ?? 0;
+    const title = `Subagent: ${current.agent} [${current.id.slice(0, 10)}] (${current.status})`;
+    const subtitle = `Turns: ${current.turns}/${current.turnBudget} · Tokens: ${current.tokens?.total ?? 0} · Tools: ${toolCount} · Runtime: ${current.runtime}`;
 
     const lines: string[] = [panelBorder(this.theme, panelWidth, "╭", "╮")];
     lines.push(panelRow(this.theme, ` ${this.theme.bold(title)}`, panelWidth));
@@ -354,26 +471,29 @@ export class SubagentPeekComponent {
  */
 export async function openPeekModal(
   run: RunRecord,
-  ctx: { hasUI?: boolean; ui?: any }
+  ctx: { hasUI?: boolean; ui?: any },
+  getLiveRun?: (id: string) => RunRecord | undefined
 ): Promise<void> {
-  const content = formatPeekContent(run);
-
   if (ctx.hasUI && ctx.ui?.custom) {
     await ctx.ui.custom(
-      (tui: any, theme: any, done: () => void) => {
+      (tui: any, theme: any, _keybindings: any, done: () => void) => {
+        const resolveDone = typeof done === "function" ? done : typeof _keybindings === "function" ? _keybindings : () => {};
         return new SubagentPeekComponent(
           theme || tui?.theme,
-          done || (() => {}),
+          resolveDone,
           () => tui?.requestRender?.(),
           run,
-          content
+          () => formatPeekContent((getLiveRun && getLiveRun(run.id)) || run),
+          () => (getLiveRun && getLiveRun(run.id)) || run
         );
       },
       { overlay: true }
     );
   } else if (ctx.hasUI && ctx.ui?.editor) {
+    const content = formatPeekContent(run);
     await ctx.ui.editor(`Subagent Peek: ${run.agent} [${run.id}]`, content);
   } else {
+    const content = formatPeekContent(run);
     process.stdout.write(`\n${content}\n`);
   }
 }
@@ -383,7 +503,8 @@ export async function openPeekModal(
  */
 export async function openHistoryModal(
   runs: RunRecord[],
-  ctx: { hasUI?: boolean; ui?: any }
+  ctx: { hasUI?: boolean; ui?: any },
+  getLiveRun?: (id: string) => RunRecord | undefined
 ): Promise<void> {
   if (runs.length === 0) {
     ctx.ui?.notify?.("No subagent runs recorded yet.", "info");
@@ -392,16 +513,17 @@ export async function openHistoryModal(
 
   if (ctx.hasUI && ctx.ui?.custom) {
     await ctx.ui.custom(
-      (tui: any, theme: any, done: () => void) => {
+      (tui: any, theme: any, _keybindings: any, done: () => void) => {
+        const resolveDone = typeof done === "function" ? done : typeof _keybindings === "function" ? _keybindings : () => {};
         return new SubagentHistoryComponent(
           theme || tui?.theme,
-          done || (() => {}),
+          resolveDone,
           () => tui?.requestRender?.(),
           runs,
           (selectedRun: RunRecord) => {
-            if (typeof done === "function") done();
+            if (typeof resolveDone === "function") resolveDone();
             setTimeout(() => {
-              void openPeekModal(selectedRun, ctx);
+              void openPeekModal(selectedRun, ctx, getLiveRun);
             }, 50);
           }
         );
@@ -418,7 +540,7 @@ export async function openHistoryModal(
     );
     if (chosen) {
       const r = runs.find((item) => item.id === chosen);
-      if (r) await openPeekModal(r, ctx);
+      if (r) await openPeekModal(r, ctx, getLiveRun);
     }
   }
 }

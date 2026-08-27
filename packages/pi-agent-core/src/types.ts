@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 export const MAX_RECURSION_DEPTH = 10;
 export const DEFAULT_TURN_BUDGET = 20;
 export const DEFAULT_MAX_CONCURRENT_RUNS = 4;
-export const DEFAULT_SUBAGENT_TIMEOUT_MS = 300_000; // 5 minutes
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 1_200_000; // 20 minutes (prevents early timeout on large multi-turn tasks)
 
 export const SUPPORTED_RUNTIMES = [
   "pi-inprocess",
@@ -128,6 +128,25 @@ export interface RunUpdate {
 }
 
 /**
+ * Progress chunk a runner may push through its `onUpdate` callback.
+ * A plain string is treated as a free-form activity line.
+ */
+export interface ProgressPayload {
+  lastMessage?: string;
+  thought?: string;
+  turns?: number;
+  tokens?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    total?: number;
+  };
+  toolCall?: { tool: string; args?: unknown; result?: unknown };
+  output?: string;
+}
+
+/**
  * Complete record of a single subagent execution
  */
 export interface RunRecord {
@@ -157,6 +176,14 @@ export interface RunRecord {
   artifacts?: string[];
   toolCalls?: ToolCallRecord[];
   replayKey?: string;
+  /** Name of the most recently started tool, for live status rendering. */
+  lastToolName?: string;
+  /** Most recent single-line activity summary from the runner. */
+  lastLine?: string;
+  /** Most recent reasoning/thought preview from the runner. */
+  thought?: string;
+  /** Timestamp of the last progress update; drives idle detection. */
+  lastActivityAt?: number;
 }
 
 /**

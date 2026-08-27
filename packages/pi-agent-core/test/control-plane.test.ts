@@ -576,4 +576,110 @@ describe("Control Plane & State Machine", () => {
       expect(result.error).toContain("timed out after 20ms");
     });
   });
+
+  describe("Live Activity Visibility", () => {
+    it("records streamed tool calls on the tracked record while running", async () => {
+      let trackedDuringRun: RunRecord | undefined;
+
+      const streamingRunner: AgentRunner = {
+        runtime: "pi-inprocess",
+        async execute(_agent, options, _signal, onUpdate) {
+          onUpdate?.({ turns: 1, toolCall: { tool: "read", args: { path: "a.ts" } } });
+          onUpdate?.({ toolCall: { tool: "read", result: "file body" } });
+          onUpdate?.({ turns: 2, toolCall: { tool: "grep", args: { pattern: "foo" } } });
+          onUpdate?.("scanning matches\n");
+
+          trackedDuringRun = cp.getActiveRuns()[0];
+
+          const rec = createRunRecord({
+            agent: "explorer",
+            prompt: options.prompt,
+            runtime: "pi-inprocess",
+          });
+          rec.status = "completed";
+          rec.state = "DONE";
+          rec.output = "done";
+          return rec;
+        },
+      };
+
+      const cp = new ControlPlane({ runnerResolver: () => streamingRunner });
+      const run = await cp.dispatch({ agent: "explorer", prompt: "inspect repo" });
+
+      // Visible mid-flight, not just after completion.
+      expect(trackedDuringRun?.toolCalls?.length).toBe(2);
+      expect(trackedDuringRun?.lastToolName).toBe("grep");
+      expect(trackedDuringRun?.lastLine).toBe("scanning matches");
+
+      // The tool end update fills the open call instead of appending a duplicate.
+      expect(run.toolCalls?.length).toBe(2);
+      expect(run.toolCalls?.[0].tool).toBe("read");
+      expect(run.toolCalls?.[0].result).toBe("file body");
+      expect(run.toolCalls?.[1].tool).toBe("grep");
+      expect(run.toolCalls?.[1].result).toBeUndefined();
+      expect(run.turns).toBe(2);
+      expect(run.lastActivityAt).toBeGreaterThan(0);
+    });
+
+    it("adopts tool calls from runners that only report them at the end", async () => {
+      const batchRunner: AgentRunner = {
+        runtime: "pi-subprocess",
+        async execute(_agent, options) {
+          const rec = createRunRecord({
+            agent: "coder",
+            prompt: options.prompt,
+            runtime: "pi-subprocess",
+          });
+          rec.status = "failed";
+          rec.state = "DONE";
+          rec.error = "exited non-zero";
+          rec.toolCalls = [
+            { tool: "bash", args: { cmd: "npm test" }, result: "1 failing", timestamp: Date.now() },
+          ];
+          return rec;
+        },
+      };
+
+      const cp = new ControlPlane({ runnerResolver: () => batchRunner });
+      const run = await cp.dispatch({ agent: "coder", prompt: "run tests" });
+
+      // Failure must not discard the transcript.
+      expect(run.status).toBe("failed");
+      expect(run.toolCalls?.length).toBe(1);
+      expect(run.toolCalls?.[0].tool).toBe("bash");
+      expect(run.lastToolName).toBe("bash");
+    });
+
+    it("forwards tool calls and thoughts to the caller onUpdate", async () => {
+      const updates: Array<{ tool?: string; thought?: string }> = [];
+
+      const runner: AgentRunner = {
+        runtime: "pi-inprocess",
+        async execute(_agent, options, _signal, onUpdate) {
+          onUpdate?.({ thought: "planning the search" });
+          onUpdate?.({ toolCall: { tool: "ls", args: {} } });
+          const rec = createRunRecord({
+            agent: "explorer",
+            prompt: options.prompt,
+            runtime: "pi-inprocess",
+          });
+          rec.status = "completed";
+          rec.state = "DONE";
+          rec.output = "ok";
+          return rec;
+        },
+      };
+
+      const cp = new ControlPlane({ runnerResolver: () => runner });
+      const run = await cp.dispatch({
+        agent: "explorer",
+        prompt: "list files",
+        onUpdate: (u) => updates.push({ tool: u.toolCall?.tool, thought: u.thought }),
+      });
+
+      expect(updates.some((u) => u.thought === "planning the search")).toBe(true);
+      expect(updates.some((u) => u.tool === "ls")).toBe(true);
+      expect(run.thought).toBe("planning the search");
+    });
+  });
 });

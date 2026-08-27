@@ -99,6 +99,7 @@ export class RunLifecycle extends EventEmitter {
     toolCall?: ToolCallRecord;
     thought?: string;
     output?: string;
+    lastLine?: string;
   }): RunRecord {
     if (update.turns !== undefined) {
       this.record.turns = update.turns;
@@ -109,12 +110,35 @@ export class RunLifecycle extends EventEmitter {
     if (update.output !== undefined) {
       this.record.output = update.output;
     }
+    if (update.thought !== undefined) {
+      this.record.thought = update.thought;
+    }
+    if (update.lastLine !== undefined) {
+      this.record.lastLine = update.lastLine;
+    }
     if (update.toolCall) {
       if (!this.record.toolCalls) {
         this.record.toolCalls = [];
       }
-      this.record.toolCalls.push(update.toolCall);
+      const calls = this.record.toolCalls;
+      const open = calls.length > 0 ? calls[calls.length - 1] : undefined;
+      // A runner reports tool start and tool end as two updates for the same
+      // call; the end carries the result and must fill the open entry rather
+      // than append a duplicate.
+      if (
+        update.toolCall.result !== undefined &&
+        open !== undefined &&
+        open.result === undefined &&
+        open.tool === update.toolCall.tool
+      ) {
+        open.result = update.toolCall.result;
+      } else {
+        calls.push(update.toolCall);
+      }
+      this.record.lastToolName = update.toolCall.tool;
     }
+
+    this.record.lastActivityAt = Date.now();
 
     this.emit("update", {
       runId: this.record.id,
@@ -125,6 +149,17 @@ export class RunLifecycle extends EventEmitter {
     } satisfies ProgressUpdateEvent);
 
     return this.record;
+  }
+
+  /**
+   * Adopt tool calls reported by a runner that only surfaces them at the end
+   * of execution. Keeps whatever was already streamed live if it is richer.
+   */
+  public mergeToolCalls(toolCalls?: ToolCallRecord[]): void {
+    if (!toolCalls || toolCalls.length === 0) return;
+    if ((this.record.toolCalls?.length ?? 0) >= toolCalls.length) return;
+    this.record.toolCalls = toolCalls;
+    this.record.lastToolName = toolCalls[toolCalls.length - 1]?.tool;
   }
 
   /**
