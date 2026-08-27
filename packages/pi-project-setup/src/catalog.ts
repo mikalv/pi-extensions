@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
     type ExtensionCategoryId,
     type ExtensionItem,
@@ -270,6 +271,100 @@ export interface LoadCatalogOptions {
     packageJsonPath?: string;
     extensionsList?: string[];
     activeExtensions?: string[];
+    /** Path to the pi-extensions repo that owns the catalog. */
+    repoPath?: string;
+    /** Project directory being configured; searched last. */
+    cwd?: string;
+}
+
+/** How far up the directory tree to look for a catalog package.json. */
+const MAX_UPWARD_DEPTH = 8;
+
+/**
+ * Read `pi.extensions` from a package.json, or undefined when it declares none.
+ */
+async function readExtensionPaths(
+    packageJsonPath: string,
+): Promise<string[] | undefined> {
+    try {
+        const content = await readFile(packageJsonPath, "utf-8");
+        const pkg = JSON.parse(content);
+        if (!Array.isArray(pkg?.pi?.extensions)) return undefined;
+        const paths = pkg.pi.extensions.filter(
+            (p: unknown): p is string => typeof p === "string",
+        );
+        return paths.length > 0 ? paths : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function isRepoRoot(dir: string): Promise<boolean> {
+    try {
+        await stat(join(dir, ".git"));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Walk up from a directory collecting package.json files that declare
+ * extensions, stopping at the repository root.
+ *
+ * The outermost match wins: an individual package declares only itself, while
+ * the repo root aggregates the whole catalog.
+ */
+async function findCatalogUpwards(
+    startDir: string,
+): Promise<string[] | undefined> {
+    let dir = resolve(startDir);
+    let outermost: string[] | undefined;
+
+    for (let depth = 0; depth < MAX_UPWARD_DEPTH; depth++) {
+        const paths = await readExtensionPaths(join(dir, "package.json"));
+        if (paths) outermost = paths;
+        if (await isRepoRoot(dir)) break;
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+
+    return outermost;
+}
+
+/**
+ * Locate the extension catalog.
+ *
+ * The catalog is declared by the pi-extensions repo, which is normally not the
+ * project being configured, so the project cwd alone cannot find it.
+ */
+async function resolveCatalogPaths(
+    options: LoadCatalogOptions,
+): Promise<string[] | undefined> {
+    const explicit: string[] = [];
+    if (options.packageJsonPath) explicit.push(options.packageJsonPath);
+    if (options.repoPath) explicit.push(join(options.repoPath, "package.json"));
+    const envRepo = process.env.PI_EXTENSIONS_PATH?.trim();
+    if (envRepo) explicit.push(join(envRepo, "package.json"));
+
+    for (const candidate of explicit) {
+        const paths = await readExtensionPaths(candidate);
+        if (paths) return paths;
+    }
+
+    // This module ships inside the pi-extensions repo, so walking up from its
+    // own location finds the catalog whatever the project cwd happens to be.
+    try {
+        const fromModule = await findCatalogUpwards(
+            dirname(fileURLToPath(import.meta.url)),
+        );
+        if (fromModule) return fromModule;
+    } catch {
+        // import.meta.url unavailable (e.g. bundled to CJS)
+    }
+
+    return findCatalogUpwards(options.cwd ?? process.cwd());
 }
 
 /**
@@ -283,19 +378,7 @@ export async function loadExtensionCatalog(
     if (options.extensionsList && options.extensionsList.length > 0) {
         rawPaths = [...options.extensionsList];
     } else {
-        const pkgPath =
-            options.packageJsonPath || join(process.cwd(), "package.json");
-        try {
-            const content = await readFile(pkgPath, "utf-8");
-            const pkg = JSON.parse(content);
-            if (pkg?.pi?.extensions && Array.isArray(pkg.pi.extensions)) {
-                rawPaths = pkg.pi.extensions.filter(
-                    (p: unknown) => typeof p === "string",
-                );
-            }
-        } catch {
-            // package.json unreadable, fallback to empty
-        }
+        rawPaths = (await resolveCatalogPaths(options)) ?? [];
     }
 
     const activeSet = new Set(

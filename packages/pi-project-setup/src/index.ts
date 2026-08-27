@@ -140,6 +140,8 @@ export async function handleSetupCommand(
 
   const catalog = await loadExtensionCatalog({
     packageJsonPath: options?.packageJsonPath,
+    repoPath,
+    cwd,
   });
   const allPaths = catalog.map((c) => c.path);
   const currentSettings = await readProjectSettings(cwd, allPaths);

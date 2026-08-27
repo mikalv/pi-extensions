@@ -259,8 +259,11 @@ describe("Extension Catalog & Preset Engine (`pi-project-setup`)", () => {
   });
 
   describe("Extension Catalog Loading (`loadExtensionCatalog`)", () => {
+    // The aggregate catalog lives at the repo root, not in this package.
+    const repoRoot = join(import.meta.dir, "..", "..", "..");
+    const rootPackageJsonPath = join(repoRoot, "package.json");
+
     it("loads catalog from a package.json path and categorizes all items", async () => {
-      const rootPackageJsonPath = join(process.cwd(), "package.json");
       const catalog = await loadExtensionCatalog({
         packageJsonPath: rootPackageJsonPath,
       });
@@ -302,7 +305,6 @@ describe("Extension Catalog & Preset Engine (`pi-project-setup`)", () => {
     });
 
     it("marks items as enabled based on an active extension paths list", async () => {
-      const rootPackageJsonPath = join(process.cwd(), "package.json");
       const active = [
         "./packages/pi-agent-core/src/index.ts",
         "./packages/clipboard/index.ts",
