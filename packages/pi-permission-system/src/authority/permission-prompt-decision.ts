@@ -15,17 +15,18 @@ import {
  * forwards keystrokes to {@link reducePrompt} and renders the returned state.
  */
 
-/** The four decision hotkeys, in display order. */
-export type PromptKey = "y" | "s" | "n" | "r";
+/** The decision hotkeys, in display order. */
+export type PromptKey = "y" | "s" | "p" | "n" | "r";
 
 /** Which sub-view the dialog is showing. */
 export type PromptStep = "decision" | "reason" | "scope";
 
-const OPTION_ORDER: readonly PromptKey[] = ["y", "s", "n", "r"];
+const OPTION_ORDER: readonly PromptKey[] = ["y", "s", "p", "n", "r"];
 
 const OPTION_VERBS: Record<PromptKey, string> = {
   y: "approve",
   s: "approve for this session",
+  p: "approve always in this project",
   n: "deny",
   r: "deny with a reason",
 };
@@ -36,6 +37,8 @@ export interface PromptModelConfig {
   doublePressToConfirm: boolean;
   /** Label shown beside the approve-for-session option. */
   sessionLabel: string;
+  /** Label shown beside the approve-for-project option. */
+  projectLabel?: string;
   /**
    * Forwarded asks only: when set, confirming `s` opens a second step choosing
    * whether the grant applies to the requesting subagent only (least-privilege
@@ -160,6 +163,11 @@ function commit(
       };
     case "n":
       return { kind: "decision", decision: createDeniedPermissionDecision() };
+    case "p":
+      return {
+        kind: "decision",
+        decision: { approved: true, state: "approved_for_project" },
+      };
     case "r":
       return render({
         ...state,

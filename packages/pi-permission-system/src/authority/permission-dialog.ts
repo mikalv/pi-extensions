@@ -3,6 +3,7 @@ import type { DecisionSource } from "../authority/decision-source";
 export type PermissionDecisionState =
   | "approved"
   | "approved_for_session"
+  | "approved_for_project"
   | "approved_for_serving_session"
   | "denied"
   | "denied_with_reason";
@@ -56,6 +57,7 @@ export interface PermissionDecisionUi {
 
 const APPROVE_OPTION = "Yes";
 const APPROVE_FOR_SESSION_OPTION = "Yes, for this session";
+const APPROVE_FOR_PROJECT_OPTION = "Yes, always in this project";
 const DENY_OPTION = "No";
 const DENY_WITH_REASON_OPTION = "No, provide reason";
 
@@ -92,6 +94,7 @@ export function isPermissionDecisionState(
   return (
     value === "approved" ||
     value === "approved_for_session" ||
+    value === "approved_for_project" ||
     value === "approved_for_serving_session" ||
     value === "denied" ||
     value === "denied_with_reason"
@@ -101,6 +104,8 @@ export function isPermissionDecisionState(
 export interface RequestPermissionOptions {
   /** Override the "for this session" option label (e.g. to show the suggested pattern). */
   sessionLabel?: string;
+  /** Override the "always in this project" option label. */
+  projectLabel?: string;
   /**
    * Forwarded asks only: when set, choosing the "for this session" option opens
    * a second select asking whether the grant applies to the requesting subagent
@@ -119,9 +124,11 @@ export async function requestPermissionDecisionFromUi(
   options?: RequestPermissionOptions,
 ): Promise<UnattributedDecision> {
   const sessionOption = options?.sessionLabel ?? APPROVE_FOR_SESSION_OPTION;
+  const projectOption = options?.projectLabel ?? APPROVE_FOR_PROJECT_OPTION;
   const decisionOptions = [
     APPROVE_OPTION,
     sessionOption,
+    projectOption,
     DENY_OPTION,
     DENY_WITH_REASON_OPTION,
   ] as const;
@@ -134,6 +141,13 @@ export async function requestPermissionDecisionFromUi(
     return {
       approved: true,
       state: "approved",
+    };
+  }
+
+  if (selected === projectOption) {
+    return {
+      approved: true,
+      state: "approved_for_project",
     };
   }
 

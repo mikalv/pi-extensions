@@ -123,15 +123,17 @@ interface PromptTheme {
 }
 
 const DEFAULT_SESSION_LABEL = "Yes, for this session";
+const DEFAULT_PROJECT_LABEL = "Yes, always in this project";
 
 const OPTION_LABELS: Record<PromptKey, string> = {
   y: "Yes",
   s: DEFAULT_SESSION_LABEL,
+  p: DEFAULT_PROJECT_LABEL,
   n: "No",
   r: "No, provide reason",
 };
 
-const OPTION_ORDER: readonly PromptKey[] = ["y", "s", "n", "r"];
+const OPTION_ORDER: readonly PromptKey[] = ["y", "s", "p", "n", "r"];
 
 export function presentInlinePermissionPrompt(
   view: PermissionPromptView,
@@ -142,6 +144,7 @@ export function presentInlinePermissionPrompt(
   const config: PromptModelConfig = {
     doublePressToConfirm: view.doublePressToConfirm,
     sessionLabel: options?.sessionLabel ?? DEFAULT_SESSION_LABEL,
+    projectLabel: options?.projectLabel ?? DEFAULT_PROJECT_LABEL,
     sessionScope: options?.sessionScope,
   };
   return view.ui.custom<UnattributedDecision>(
@@ -355,7 +358,12 @@ class PermissionPromptComponent implements Component {
     const ask = this.renderAsk(width);
     const lines = [this.theme.fg("accent", this.title), ...ask.lines, ""];
     for (const key of OPTION_ORDER) {
-      const label = key === "s" ? this.config.sessionLabel : OPTION_LABELS[key];
+      const label =
+        key === "s"
+          ? this.config.sessionLabel
+          : key === "p"
+          ? this.config.projectLabel ?? DEFAULT_PROJECT_LABEL
+          : OPTION_LABELS[key];
       const selected = this.state.highlightedKey === key;
       const marker = selected ? "▶" : " ";
       const row = `${marker} (${key}) ${label}`;

@@ -23,6 +23,7 @@ import {
   deriveResolution,
   resolveYoloGrant,
 } from "./helpers";
+import { recordProjectApproval } from "../../project-approval-writer";
 import type { GateOutcome } from "./types";
 
 // ── GateRunner class ───────────────────────────────────────────────────────
@@ -225,9 +226,13 @@ export class GateRunner {
       messages,
     });
 
-    // 4. Determine whether session approval was granted
+    // 4. Determine whether session or project approval was granted
     const hasSessionApproval =
-      gateResult.action === "allow" && gateResult.sessionApproval !== undefined;
+      gateResult.action === "allow" &&
+      (gateResult.sessionApproval !== undefined ||
+        gateResult.projectApproval !== undefined);
+    const isProjectApproval =
+      gateResult.action === "allow" && gateResult.projectApproval !== undefined;
 
     // 5. Emit decision event
     this.emitDecision(
@@ -251,6 +256,15 @@ export class GateRunner {
     // hasSessionApproval already implies gateResult.action === "allow"
     if (hasSessionApproval && descriptor.sessionApproval) {
       this.recorder.recordSessionApproval(descriptor.sessionApproval);
+    }
+
+    // 7. Record project approval to .pi/extensions/pi-permission-system/config.json
+    if (isProjectApproval && descriptor.sessionApproval) {
+      recordProjectApproval(
+        process.cwd(),
+        descriptor.sessionApproval.surface,
+        descriptor.sessionApproval.patterns,
+      );
     }
 
     if (gateResult.action === "block") {

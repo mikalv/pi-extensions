@@ -3,7 +3,7 @@ import type { PermissionPromptDecision } from "./authority/permission-dialog";
 
 /** Result of applying the permission gate. */
 export type PermissionGateResult =
-  | { action: "allow"; sessionApproval?: { surface: string; pattern: string } }
+  | { action: "allow"; sessionApproval?: { surface: string; pattern: string }; projectApproval?: { surface: string; pattern: string } }
   | { action: "block"; reason: string };
 
 /** Everything the gate needs — no direct dependency on ExtensionContext. */
@@ -82,6 +82,9 @@ export async function applyPermissionGate(
     }
     if (decision.state === "approved_for_session" && params.sessionApproval) {
       return { action: "allow", sessionApproval: params.sessionApproval };
+    }
+    if (decision.state === "approved_for_project" && params.sessionApproval) {
+      return { action: "allow", projectApproval: params.sessionApproval };
     }
   }
 
