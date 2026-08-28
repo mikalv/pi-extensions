@@ -265,9 +265,15 @@ async function runObserverStage(
 	});
 	if (!observations || observations.length === 0) {
 		debugLog("observer.empty", { coversUpToId });
+		// Advance coverage marker even if no observations were extracted
+		// so the consolidation loop does not re-process the exact same chunk forever
+		const emptyData = buildObservationsRecordedData([], coversUpToId);
+		if (emptyData) {
+			appendEntry(pi, OM_OBSERVATIONS_RECORDED, emptyData);
+		}
 		if (ctx.hasUI) ctx.ui?.notify(
-			"Observational memory: observer returned no observations",
-			"warning",
+			"Observational memory: observer processed chunk (no new observations)",
+			"info",
 		);
 		return "continue";
 	}
