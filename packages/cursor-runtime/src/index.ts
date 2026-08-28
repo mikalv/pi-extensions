@@ -11,6 +11,7 @@ import AiService from "./api/ai-service.ts";
 import Auth from "./api/auth.ts";
 import { resolveToolResult } from "./bridge/cursor-to-pi/tool-bridge.ts";
 import AuthManager from "./lib/auth.ts";
+import { installNetworkCrashGuard } from "./lib/network-crash-guard.ts";
 import {
   CURSOR_API_URL,
   CURSOR_CLIENT_VERSION,
@@ -75,6 +76,10 @@ export default (pi: ExtensionAPI) => {
   let lastCtx: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   const getCtx = () => lastCtx;
+
+  // Suppress orphaned transport rejections (dead network) so Pi does not exit.
+  // The same failure already reaches the session stream as a cursor-error.
+  installNetworkCrashGuard();
 
   const registerCursorProvider = () => {
     pi.registerProvider("cursor", {
