@@ -258,10 +258,23 @@ export function buildRunRequest(
   const systemPromptId = getBlobId(systemPromptBytes);
   void params.blobStore.setBlob(null, systemPromptId, systemPromptBytes);
 
-  const lastMessage = params.context.messages.at(-1);
-  const userText = lastMessage ? extractUserMessageText(lastMessage) : "";
+  // Find the last user message in the context messages, or fallback to an empty-handling message
+  let userText = "";
+  for (let i = params.context.messages.length - 1; i >= 0; i--) {
+    const msg = params.context.messages[i];
+    if (msg?.role === "user") {
+      const extracted = extractUserMessageText(msg);
+      if (extracted) {
+        userText = extracted;
+        break;
+      }
+    }
+  }
+
+  // If no user message was found (e.g. initial turn with only tool results or system prompt,
+  // or empty string after stripping), provide a sensible fallback so the Cursor API doesn't throw.
   if (!userText) {
-    throw new Error("Cannot send empty user message to Cursor API");
+    userText = "Continue";
   }
 
   const userMessage = new UserMessage({
