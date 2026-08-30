@@ -310,6 +310,51 @@ describe("Pluggable Runtime Adapters", () => {
       expect(args).toContain("Review PR");
       expect(args).toContain("--output-format");
       expect(args).toContain("json");
+      // Headless default: no interactive permission dialog
+      const pmIndex = args.indexOf("--permission-mode");
+      expect(pmIndex).toBeGreaterThan(-1);
+      expect(args[pmIndex + 1]).toBe("acceptEdits");
+    });
+
+    it("ClaudeRunner honours agent.params.permissionMode override", () => {
+      const runner = new ClaudeRunner();
+      const args = runner.buildArgs(
+        { ...baseAgent, params: { permissionMode: "default" } },
+        { ...baseOptions, prompt: "x" }
+      );
+      const pmIndex = args.indexOf("--permission-mode");
+      expect(args[pmIndex + 1]).toBe("default");
+    });
+
+    it("ClaudeRunner summarises JSON envelope without a final report instead of dumping raw JSON", async () => {
+      const runner = new ClaudeRunner({
+        spawnFn: async () => ({
+          stdout: JSON.stringify({
+            subtype: "success",
+            is_error: false,
+            num_turns: 1,
+            session_id: "abc",
+            permission_denials: [
+              { tool: "Bash", reason: "denied" },
+              { tool: "Bash", reason: "denied" },
+            ],
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+          stderr: "",
+          exitCode: 0,
+        }),
+      });
+
+      const record = await runner.execute(
+        { ...baseAgent, runtime: "claude" },
+        baseOptions
+      );
+      expect(record.status).toBe("completed");
+      expect(record.output).toContain("without a final report");
+      expect(record.output).toContain("2 tool call(s) denied");
+      expect(record.output).not.toContain("session_id");
+      expect(record.tokens.input).toBe(10);
+      expect(record.tokens.output).toBe(5);
     });
 
     it("ClaudeRunner executes via spawn adapter", async () => {

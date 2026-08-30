@@ -28,7 +28,7 @@ describe("pi-agent-core types & validation", () => {
       expect(MAX_RECURSION_DEPTH).toBe(10);
       expect(DEFAULT_TURN_BUDGET).toBe(20);
       expect(DEFAULT_MAX_CONCURRENT_RUNS).toBe(4);
-      expect(DEFAULT_SUBAGENT_TIMEOUT_MS).toBe(300_000);
+      expect(DEFAULT_SUBAGENT_TIMEOUT_MS).toBe(1_200_000);
     });
 
     it("supports all supported runtime types", () => {

@@ -7,6 +7,30 @@ import {
 } from "../types.js";
 import type { AgentRunner, SpawnFunction, SpawnResult } from "./runner-interface.js";
 
+/** Count tool_permission_denial signals anywhere in the JSON envelope. */
+export function countPermissionDenials(json: unknown): number {
+  let count = 0;
+  const visit = (node: unknown, depth: number) => {
+    if (depth > 12 || node === null || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (
+        (key === "tool_permission_denials" || key === "permission_denials") &&
+        Array.isArray(value)
+      ) {
+        count += value.length;
+      } else {
+        visit(value, depth + 1);
+      }
+    }
+  };
+  visit(json, 0);
+  return count;
+}
+
 export interface ClaudeRunnerOptions {
   binaryPath?: string;
   spawnFn?: SpawnFunction;
@@ -36,6 +60,15 @@ export class ClaudeRunner implements AgentRunner {
     if (agent.systemPrompt) {
       args.push("--append-system-prompt", agent.systemPrompt);
     }
+
+    // Headless runs have no interactive permission dialog; default to
+    // acceptEdits (allow reads, auto-accept edits) unless the agent opts out
+    // via params.permissionMode (e.g. "default" or "plan").
+    const permissionMode =
+      (agent.params?.permissionMode as string | undefined) ??
+      (options.env?.CLAUDE_PERMISSION_MODE as string | undefined) ??
+      "acceptEdits";
+    args.push("--permission-mode", permissionMode);
 
     return args;
   }
@@ -147,14 +180,32 @@ export class ClaudeRunner implements AgentRunner {
 
       record.exitCode = spawnRes.exitCode;
 
-      let output = spawnRes.stdout.trim();
+      let output = "";
       let inputTokens = 0;
       let outputTokens = 0;
+      let parsedJson = false;
 
       try {
         const json = JSON.parse(spawnRes.stdout) as Record<string, unknown>;
-        if (typeof json.result === "string") {
+        parsedJson = true;
+        if (typeof json.result === "string" && json.result.trim().length > 0) {
           output = json.result;
+        } else {
+          // JSON envelope without a usable result field: derive a readable
+          // summary instead of dumping the raw session JSON as the report.
+          const parts: string[] = [];
+          if (typeof json.subtype === "string") parts.push(`subtype: ${json.subtype}`);
+          if (typeof json.is_error === "boolean" && json.is_error) {
+            parts.push("claude reported an error");
+          }
+          const denials = countPermissionDenials(json);
+          if (denials > 0) {
+            parts.push(`${denials} tool call(s) denied by permission mode`);
+          }
+          output =
+            parts.length > 0
+              ? `Claude run finished without a final report. ${parts.join("; ")}.`
+              : "Claude run finished without a final report.";
         }
         if (json.usage && typeof json.usage === "object") {
           const u = json.usage as Record<string, unknown>;
@@ -162,7 +213,10 @@ export class ClaudeRunner implements AgentRunner {
           outputTokens = typeof u.output_tokens === "number" ? u.output_tokens : 0;
         }
       } catch {
-        // use raw output
+        output = spawnRes.stdout.trim();
+      }
+      if (spawnRes.exitCode !== 0 && !parsedJson) {
+        output = spawnRes.stdout.trim();
       }
 
       record.output = output;
